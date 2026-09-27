@@ -3,6 +3,7 @@ package com.nuvio.app
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
@@ -12,6 +13,7 @@ import com.nuvio.app.features.player.ExternalPlayerPlatform
 import com.nuvio.app.features.player.PlayerLaunch
 import com.nuvio.app.features.player.PlayerLaunchStore
 import com.nuvio.app.features.player.PlayerScreen
+import com.nuvio.app.features.player.TempPlaybackCache
 import com.nuvio.app.features.watchprogress.ResumePromptRepository
 import com.nuvio.app.navigation.NuvioNavigator
 import com.nuvio.app.navigation.PlayerRoute
@@ -38,6 +40,20 @@ internal fun PlayerDestination(
     }
     LaunchedEffect(launch.videoId) {
         launch.videoId?.let { ResumePromptRepository.markPlayerEntered(it) }
+    }
+    // Samin temp cache: play instantly from remote while mirroring to Caches.
+    // Deleted on close (here + disposeRouteResources).
+    LaunchedEffect(route.launchId, launch.sourceUrl) {
+        TempPlaybackCache.start(
+            launchId = route.launchId,
+            sourceUrl = launch.sourceUrl,
+            headers = launch.sourceHeaders,
+        )
+    }
+    DisposableEffect(route.launchId) {
+        onDispose {
+            TempPlaybackCache.cancelAndDelete(route.launchId)
+        }
     }
     PlayerScreen(
         profileId = launch.profileId,

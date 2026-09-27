@@ -1,0 +1,181 @@
+name: Nuvio Samin sync and build
+
+# Private "Nuvio Samin" SideStore source: pulls official Nuvio updates,
+# keeps the Samin temp-playback-cache patch, rebuilds the IPA and
+# prepends it to store-samin.json.
+#
+# SideStore source URL (add in SideStore -> Settings -> Sources):
+#   https://raw.githubusercontent.com/Saminahmed7/NuvioMobile/samin-temp-cache/store-samin.json
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip_build:
+        description: Sync upstream only, skip IPA build
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: 0 3 * * *
+
+permissions:
+  contents: write
+
+concurrency:
+  group: samin-sync-and-build
+  cancel-in-progress: false
+
+jobs:
+  sync-build-publish:
+    name: Sync upstream, build Samin IPA, update source
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      GRADLE_OPTS: -Dfile.encoding=UTF-8
+      IOS_CONFIGURATION: Release
+      KOTLIN_DAEMON_JVMARGS: -Xmx2048M
+      NUVIO_GRADLE_JVMARGS: -Xmx4608M -Dfile.encoding=UTF-8 -XX:MaxMetaspaceSize=768M
+      NUVIO_KOTLIN_NATIVE_JVMARGS: -Xmx4608M
+      RELEASE_PROPERTIES_BASE64: ${{ secrets.NUVIO_LOCAL_PROPERTIES_BASE64 }}
+      BRANCH: samin-temp-cache
+
+    steps:
+      - name: Check out Samin branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Merge upstream cmp-rewrite
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/NuvioMedia/NuvioMobile.git 2>/dev/null || true
+          git fetch upstream cmp-rewrite
+          UPSTREAM_SHA="$(git rev-parse upstream/cmp-rewrite)"
+          echo "UPSTREAM_SHA=${UPSTREAM_SHA}" >> "${GITHUB_ENV}"
+          if git merge-base --is-ancestor "${UPSTREAM_SHA}" HEAD; then
+            echo "Already up to date with upstream ${UPSTREAM_SHA}."
+          else
+            git merge --no-edit upstream/cmp-rewrite || {
+              echo "::error::Upstream merge has conflicts. Resolve them locally on branch ${BRANCH}."
+              exit 1
+            }
+            git push origin "HEAD:${BRANCH}"
+          fi
+
+      - name: Set up Java
+        if: ${{ !inputs.skip_build }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        if: ${{ !inputs.skip_build }}
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Cache Kotlin Native
+        if: ${{ !inputs.skip_build }}
+        uses: actions/cache@v5
+        with:
+          path: ~/.konan
+          key: konan-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('gradle/libs.versions.toml') }}
+          restore-keys: |
+            konan-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Verify Apple toolchain
+        if: ${{ !inputs.skip_build }}
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Configure runtime properties
+        if: ${{ env.RELEASE_PROPERTIES_BASE64 != '' && !inputs.skip_build }}
+        run: |
+          printf '%s' "${RELEASE_PROPERTIES_BASE64}" | base64 --decode > local.properties
+          sed -i '' -E '/^[[:space:]]*(sdk\.dir|NUVIO_RELEASE_STORE_FILE)[[:space:]]*=/d' local.properties
+
+      - name: Bump custom build number (ephemeral, not committed)
+        if: ${{ !inputs.skip_build }}
+        run: |
+          VERSION_FILE="iosApp/Configuration/Version.xcconfig"
+          MARKETING="$(sed -nE 's/^[[:space:]]*MARKETING_VERSION[[:space:]]*=[[:space:]]*([^[:space:]#]+).*$/\1/p' "${VERSION_FILE}" | head -n 1)"
+          BUILD="$(sed -nE 's/^[[:space:]]*CURRENT_PROJECT_VERSION[[:space:]]*=[[:space:]]*([^[:space:]#]+).*$/\1/p' "${VERSION_FILE}" | head -n 1)"
+          if [[ -z "${MARKETING}" || -z "${BUILD}" ]]; then
+            echo "Could not read version info." >&2
+            exit 1
+          fi
+          # +100000 keeps Samin builds above official builds in SideStore.
+          SAMIN_BUILD="$((BUILD + 100000))"
+          sed -i '' -E "s/^(CURRENT_PROJECT_VERSION=).*/\1${SAMIN_BUILD}/" "${VERSION_FILE}"
+          echo "MARKETING_VERSION=${MARKETING}" >> "${GITHUB_ENV}"
+          echo "SAMIN_BUILD=${SAMIN_BUILD}" >> "${GITHUB_ENV}"
+          echo "Building Nuvio Samin ${MARKETING} (${SAMIN_BUILD}) from upstream ${UPSTREAM_SHA}."
+
+      - name: Prepare iOS dependencies
+        if: ${{ !inputs.skip_build }}
+        run: ./scripts/prepare-ios-dependencies.sh
+
+      - name: Build unsigned Samin IPA
+        if: ${{ !inputs.skip_build }}
+        run: ./scripts/build-ios-ipa.sh
+
+      - name: Publish release and update store-samin.json
+        if: ${{ !inputs.skip_build }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          IPA_PATH="$(find build/ios-ipa -maxdepth 1 -type f -name "*-full-release.ipa" -print -quit)"
+          if [[ -z "${IPA_PATH}" ]]; then
+            echo "No IPA was produced." >&2
+            exit 1
+          fi
+          IPA_NAME="nuvio-samin-${MARKETING_VERSION}-full-release.ipa"
+          cp "${IPA_PATH}" "${IPA_NAME}"
+          TAG="samin-v${MARKETING_VERSION}-${SAMIN_BUILD}"
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; skipping publish."
+            exit 0
+          fi
+          DATE_NOW="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          NOTES_FILE="${RUNNER_TEMP}/samin-notes.md"
+          {
+            echo "Nuvio Samin ${MARKETING_VERSION} (${SAMIN_BUILD})"
+            echo
+            echo "Official upstream: NuvioMedia/NuvioMobile@${UPSTREAM_SHA}"
+            echo
+            echo "Samin changes on top of official:"
+            echo "- Temp playback cache: progressive HTTP streams are mirrored to"
+            echo "  app Caches while playing (instant start on slow connections)"
+            echo "  and deleted when the player closes."
+            echo "- MPV disk-backed readahead cache for slow connections."
+          } > "${NOTES_FILE}"
+          gh release create "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "Nuvio Samin ${MARKETING_VERSION} (${SAMIN_BUILD})" \
+            --notes-file "${NOTES_FILE}" \
+            "${IPA_NAME}"
+          DOWNLOAD_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${IPA_NAME}"
+          python3 scripts/update-store-source.py \
+            --source store-samin.json \
+            --ipa "${IPA_NAME}" \
+            --release-notes "${NOTES_FILE}" \
+            --release-version "${MARKETING_VERSION}" \
+            --release-date "${DATE_NOW}" \
+            --download-url "${DOWNLOAD_URL}"
+          git checkout -- iosApp/Configuration/Version.xcconfig
+          git add store-samin.json
+          git commit -m "chore(samin): publish ${MARKETING_VERSION} (${SAMIN_BUILD})" || exit 0
+          git push origin "HEAD:${BRANCH}"
+
+      - name: Summarize
+        if: ${{ !inputs.skip_build }}
+        run: |
+          echo "## Nuvio Samin" >> "${GITHUB_STEP_SUMMARY}"
+          echo >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Upstream: ${UPSTREAM_SHA}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Version: ${MARKETING_VERSION} (${SAMIN_BUILD})" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Source URL: https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/samin-temp-cache/store-samin.json" >> "${GITHUB_STEP_SUMMARY}"

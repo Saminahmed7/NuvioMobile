@@ -12,6 +12,7 @@ import com.nuvio.app.features.library.LibraryItem
 import com.nuvio.app.features.player.ExternalPlayerPlaybackRequest
 import com.nuvio.app.features.player.PlayerLaunch
 import com.nuvio.app.features.player.PlayerLaunchStore
+import com.nuvio.app.features.player.TempPlaybackCache
 import com.nuvio.app.features.player.externalPlaybackSession
 import com.nuvio.app.features.streams.StreamLaunchStore
 import com.nuvio.app.features.streams.StreamsRepository
@@ -60,6 +61,8 @@ internal fun disposeRouteResources(route: AppRoute) {
 
         is PlayerRoute -> {
             ResumePromptRepository.markPlayerExitedNormally()
+            // Samin temp cache: delete the mirrored file when the stream closes.
+            TempPlaybackCache.cancelAndDelete(route.launchId)
             PlayerLaunchStore.remove(route.launchId)
         }
 

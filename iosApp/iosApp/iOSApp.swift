@@ -5,6 +5,11 @@ import ComposeApp
 struct iOSApp: App {
     @UIApplicationDelegateAdaptor(OrientationLockAppDelegate.self) private var appDelegate
 
+    init() {
+        // Samin temp cache: clear orphaned mirrors from crashed sessions.
+        TempPlaybackCache.shared.sweepOnColdStart()
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView()
