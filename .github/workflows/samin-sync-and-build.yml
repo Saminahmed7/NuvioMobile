@@ -182,15 +182,7 @@ jobs:
           # store-samin.json forbids two entries with the same version:
           # drop the official entry this custom build replaces (official
           # store.json is untouched; older versions stay as fallback).
-          python3 -c "
-import json
-p = 'store-samin.json'
-d = json.load(open(p))
-app = next(a for a in d['apps'] if a.get('bundleIdentifier') == 'com.nuvio.media')
-app['versions'] = [v for v in app['versions'] if v.get('version') != '${MARKETING_VERSION}']
-json.dump(d, open(p, 'w'), ensure_ascii=False, indent=2)
-open(p, 'a').write(chr(10))
-"
+          jq --arg v "${MARKETING_VERSION}" '( .apps[] | select(.bundleIdentifier == "com.nuvio.media") | .versions ) |= map(select(.version != $v))' store-samin.json > store-samin.json.tmp && mv store-samin.json.tmp store-samin.json
           python3 scripts/update-store-source.py \
             --source store-samin.json \
             --ipa "${IPA_PATH}" \
