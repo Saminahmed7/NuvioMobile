@@ -105,6 +105,8 @@ jobs:
 
       - name: Bump custom build number (ephemeral, not committed)
         if: ${{ !inputs.skip_build }}
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           VERSION_FILE="iosApp/Configuration/Version.xcconfig"
           MARKETING="$(sed -nE 's/^[[:space:]]*MARKETING_VERSION[[:space:]]*=[[:space:]]*([^[:space:]#]+).*$/\1/p' "${VERSION_FILE}" | head -n 1)"
@@ -113,8 +115,12 @@ jobs:
             echo "Could not read version info." >&2
             exit 1
           fi
-          # +100000 keeps Samin builds above official builds in SideStore.
-          SAMIN_BUILD="$((BUILD + 100000))"
+          # Unique, ordered Samin builds: upstream_build * 1000 + samin_rev.
+          # Same upstream version rebuilt with new code gets a new rev
+          # (e.g. 135001, 135002), newer upstream versions always sort above.
+          EXISTING_COUNT="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq "[.[] | select(.tag_name | startswith(\"samin-v${MARKETING}-\"))] | length")"
+          SAMIN_REV="$((EXISTING_COUNT + 1))"
+          SAMIN_BUILD="$((BUILD * 1000 + SAMIN_REV))"
           sed -i '' -E "s/^(CURRENT_PROJECT_VERSION=).*/\1${SAMIN_BUILD}/" "${VERSION_FILE}"
           echo "MARKETING_VERSION=${MARKETING}" >> "${GITHUB_ENV}"
           echo "SAMIN_BUILD=${SAMIN_BUILD}" >> "${GITHUB_ENV}"
