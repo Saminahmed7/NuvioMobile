@@ -141,32 +141,59 @@ jobs:
           IPA_NAME="nuvio-samin-${MARKETING_VERSION}-full-release.ipa"
           cp "${IPA_PATH}" "${IPA_NAME}"
           TAG="samin-v${MARKETING_VERSION}-${SAMIN_BUILD}"
+          RELEASE_EXISTS="false"
           if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            echo "Release ${TAG} already exists; skipping publish."
-            exit 0
+            echo "Release ${TAG} already exists; reusing its IPA for the source update."
+            RELEASE_EXISTS="true"
+            mkdir -p samin-ipa
+            gh release download "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --pattern "${IPA_NAME}" \
+              --dir samin-ipa \
+              --clobber
+            IPA_PATH="samin-ipa/${IPA_NAME}"
+          else
+            DATE_NOW="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            NOTES_FILE="${RUNNER_TEMP}/samin-notes.md"
+            {
+              echo "Nuvio Samin ${MARKETING_VERSION} (${SAMIN_BUILD})"
+              echo
+              echo "Official upstream: NuvioMedia/NuvioMobile@${UPSTREAM_SHA}"
+              echo
+              echo "Samin changes on top of official:"
+              echo "- Temp playback cache: progressive HTTP streams are mirrored to"
+              echo "  app Caches while playing (instant start on slow connections)"
+              echo "  and deleted when the player closes."
+              echo "- MPV disk-backed readahead cache for slow connections."
+            } > "${NOTES_FILE}"
+            gh release create "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "Nuvio Samin ${MARKETING_VERSION} (${SAMIN_BUILD})" \
+              --notes-file "${NOTES_FILE}" \
+              "${IPA_NAME}"
           fi
-          DATE_NOW="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-          NOTES_FILE="${RUNNER_TEMP}/samin-notes.md"
-          {
-            echo "Nuvio Samin ${MARKETING_VERSION} (${SAMIN_BUILD})"
-            echo
-            echo "Official upstream: NuvioMedia/NuvioMobile@${UPSTREAM_SHA}"
-            echo
-            echo "Samin changes on top of official:"
-            echo "- Temp playback cache: progressive HTTP streams are mirrored to"
-            echo "  app Caches while playing (instant start on slow connections)"
-            echo "  and deleted when the player closes."
-            echo "- MPV disk-backed readahead cache for slow connections."
-          } > "${NOTES_FILE}"
-          gh release create "${TAG}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "Nuvio Samin ${MARKETING_VERSION} (${SAMIN_BUILD})" \
-            --notes-file "${NOTES_FILE}" \
-            "${IPA_NAME}"
+          if [[ "${RELEASE_EXISTS}" == "true" ]]; then
+            DATE_NOW="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq '.published_at')"
+            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq '.body // ""' > "${RUNNER_TEMP}/samin-notes.md"
+            NOTES_FILE="${RUNNER_TEMP}/samin-notes.md"
+            IPA_PATH="samin-ipa/${IPA_NAME}"
+          fi
           DOWNLOAD_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${IPA_NAME}"
+          # store-samin.json forbids two entries with the same version:
+          # drop the official entry this custom build replaces (official
+          # store.json is untouched; older versions stay as fallback).
+          python3 -c "
+import json
+p = 'store-samin.json'
+d = json.load(open(p))
+app = next(a for a in d['apps'] if a.get('bundleIdentifier') == 'com.nuvio.media')
+app['versions'] = [v for v in app['versions'] if v.get('version') != '${MARKETING_VERSION}']
+json.dump(d, open(p, 'w'), ensure_ascii=False, indent=2)
+open(p, 'a').write(chr(10))
+"
           python3 scripts/update-store-source.py \
             --source store-samin.json \
-            --ipa "${IPA_NAME}" \
+            --ipa "${IPA_PATH}" \
             --release-notes "${NOTES_FILE}" \
             --release-version "${MARKETING_VERSION}" \
             --release-date "${DATE_NOW}" \

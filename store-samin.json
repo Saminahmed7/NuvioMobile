@@ -21,12 +21,12 @@
       "versions": [
         {
           "version": "0.5.3",
-          "buildVersion": "135",
-          "date": "2026-09-27T01:18:47Z",
-          "localizedDescription": "- 0b7ab892 feat(poster): support addon landscape posters @tapframe  \r\n- 60a0f4b3 feat(library): move downloads to library\r\n- 5ebb8ee5 feat(spinner): change indicator @tapframe  \r\n- [i18n(ur): add Urdu localization (#2067)](https://github.com/NuvioMedia/NuvioMobile/pull/2067) @muzii9  \r\n- 23b048c3 feat(player): add episode shuffle @tapframe  \r\n",
-          "downloadURL": "https://github.com/NuvioMedia/NuvioMobile/releases/download/0.5.3-beta/nuvio-0.5.3-full-release.ipa",
-          "size": 66299682,
-          "sha256": "7ee79b969d904893f3656ab99de0f9611fb9b70141c72f8094d4c04d74f4a72a",
+          "buildVersion": "100135",
+          "date": "2026-09-27T15:17:12Z",
+          "localizedDescription": "﻿Nuvio Samin 0.5.3 (100135)\r\n\r\nOfficial upstream: NuvioMedia/NuvioMobile@0ff64da2ad5d36090b88b41d1a9eeba9ffa28bf4\r\n\r\nSamin changes on top of official:\r\n- Temp playback cache: progressive HTTP streams are mirrored to\r\n  app Caches while playing (instant start on slow connections)\r\n  and deleted when the player closes.\r\n- MPV disk-backed readahead cache for slow connections.\r\n",
+          "downloadURL": "https://github.com/Saminahmed7/NuvioMobile/releases/download/samin-v0.5.3-100135/nuvio-samin-0.5.3-full-release.ipa",
+          "size": 66376724,
+          "sha256": "e1f8ea3cce8430886bc7dcd3966309ae56bc3751a2b145171be24c86f1f89c09",
           "minOSVersion": "16.1"
         },
         {
