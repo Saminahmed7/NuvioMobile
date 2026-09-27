@@ -501,7 +501,6 @@ final class MPVPlayerViewController: UIViewController {
         checkError(mpv_set_option_string(mpv, "subs-match-os-language", "yes"))
         checkError(mpv_set_option_string(mpv, "subs-fallback", "yes"))
         configureBundledSubtitleFont()
-        configureSaminStreamingCache()
         checkError(mpv_set_option_string(mpv, "keep-open", "yes"))
         checkError(mpv_set_option_string(mpv, "target-colorspace-hint", "yes"))
         checkError(mpv_set_option_string(mpv, "tone-mapping", "auto"))
@@ -523,26 +522,6 @@ final class MPVPlayerViewController: UIViewController {
             let vc = unsafeBitCast(ctx, to: MPVPlayerViewController.self)
             vc.readEvents()
         }, UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque()))
-    }
-
-    private func configureSaminStreamingCache() {
-        // Samin: larger disk-backed readahead so slow connections stall less.
-        // Full-file mirror is handled in Kotlin (TempPlaybackCache, Caches/
-        // nuvio_temp_playback) and deleted on player close; this is MPV's own
-        // sliding-window cache for instant start + short drops.
-        if let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first {
-            let dir = caches.appendingPathComponent("nuvio_mpv_cache")
-            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            dir.path.withCString { path in
-                checkError(mpv_set_option_string(mpv, "cache-dir", path))
-            }
-        }
-        checkError(mpv_set_option_string(mpv, "cache", "yes"))
-        checkError(mpv_set_option_string(mpv, "cache-on-disk", "yes"))
-        checkError(mpv_set_option_string(mpv, "demuxer-max-bytes", "536870912"))
-        checkError(mpv_set_option_string(mpv, "demuxer-max-back-bytes", "134217728"))
-        checkError(mpv_set_option_string(mpv, "demuxer-readahead-secs", "600"))
-        checkError(mpv_set_option_string(mpv, "cache-secs", "600"))
     }
 
     private func configureBundledSubtitleFont() {

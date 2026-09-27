@@ -164,8 +164,11 @@ internal fun PlayerTimeline(
                                 cornerRadius = radius,
                             )
                             if (savedFraction != null) {
+                                // Samin saved-to-disk stretch: solid neutral gray so it
+                                // reads differently from the translucent accent
+                                // buffered tint, while staying monochrome.
                                 drawRoundRect(
-                                    color = Color.White.copy(alpha = 0.5f),
+                                    color = Color(0.62f, 0.62f, 0.64f),
                                     topLeft = trackOrigin,
                                     size = Size(size.width * savedFraction, trackHeight),
                                     cornerRadius = radius,
