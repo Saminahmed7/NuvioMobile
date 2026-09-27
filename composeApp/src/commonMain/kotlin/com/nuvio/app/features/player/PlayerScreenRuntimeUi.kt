@@ -9,11 +9,13 @@ import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.nuvio.app.features.p2p.P2pStreamingState
 import com.nuvio.app.features.p2p.formatP2pMegabytes
 import com.nuvio.app.features.p2p.formatP2pSpeed
@@ -258,6 +260,15 @@ private fun PlayerScreenRuntime.currentInitialPositionRequestKey(): String? {
 @Composable
 private fun PlayerScreenRuntime.RenderPlayerControls(displayedPositionMs: Long, isEpisode: Boolean) {
     val isInPip = rememberIsInPictureInPicture()
+    // Samin: temp-cache saved fraction for the gray timeline segment.
+    val tempCacheStatuses by TempPlaybackCache.status.collectAsStateWithLifecycle()
+    val saminCachedFraction = remember(tempCacheStatuses) {
+        val lid = args.launchId ?: return@remember null
+        val entry = tempCacheStatuses[lid] ?: return@remember null
+        val total = entry.totalBytes?.takeIf { it > 0L } ?: return@remember null
+        if (entry.downloadedBytes <= 0L) return@remember null
+        (entry.downloadedBytes.toFloat() / total.toFloat()).coerceIn(0f, 1f)
+    }
     AnimatedVisibility(
         visible = (controlsVisible || showParentalGuide) && !playerControlsLocked && !isInPip,
         enter = fadeIn(),
@@ -372,6 +383,7 @@ private fun PlayerScreenRuntime.RenderPlayerControls(displayedPositionMs: Long, 
             },
             horizontalSafePadding = horizontalSafePadding,
             modifier = Modifier.fillMaxSize(),
+            cachedFraction = saminCachedFraction,
         )
     }
 }
