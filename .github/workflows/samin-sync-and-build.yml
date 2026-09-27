@@ -118,10 +118,13 @@ jobs:
           # Each Samin rebuild gets its own version string (e.g. 0.5.3-samin1)
           # because SideStore only offers an Update button when the version
           # string differs — build-number-only changes are ignored.
+          # The build number is always max(existing)+1 so it also sorts above
+          # anything already installed (a lower build can read as "older").
           # Newer upstream versions always sort above older ones.
           SAMIN_REV="$(( $(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq "[.[] | select(.tag_name | startswith(\"samin-v${BASE_VERSION}-samin\"))] | length") + 1 ))"
           SAMIN_VERSION="${BASE_VERSION}-samin${SAMIN_REV}"
-          SAMIN_BUILD="$((BASE_BUILD * 1000 + SAMIN_REV))"
+          MAX_BUILD="$(jq -r '[.apps[] | select(.bundleIdentifier == "com.nuvio.media") | .versions[].buildVersion | tonumber] | max // 0' store-samin.json)"
+          SAMIN_BUILD="$((MAX_BUILD + 1))"
           sed -i '' -E "s/^(MARKETING_VERSION=).*/\1${SAMIN_VERSION}/" "${VERSION_FILE}"
           sed -i '' -E "s/^(CURRENT_PROJECT_VERSION=).*/\1${SAMIN_BUILD}/" "${VERSION_FILE}"
           echo "MARKETING_VERSION=${SAMIN_VERSION}" >> "${GITHUB_ENV}"
