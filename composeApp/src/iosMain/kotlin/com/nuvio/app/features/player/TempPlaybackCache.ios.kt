@@ -13,6 +13,7 @@ import kotlinx.coroutines.launch
 import platform.Foundation.NSData
 import platform.Foundation.NSFileManager
 import platform.Foundation.NSHomeDirectory
+import platform.Foundation.NSLock
 import platform.Foundation.NSHTTPURLResponse
 import platform.Foundation.NSMutableURLRequest
 import platform.Foundation.NSOperationQueue
@@ -37,6 +38,17 @@ import kotlinx.cinterop.CPointer
 private const val TEMP_REQUEST_TIMEOUT = 60.0
 private const val TEMP_RESOURCE_TIMEOUT = 24.0 * 60.0 * 60.0
 
+private val jobsLock = NSLock()
+
+private inline fun <T> locked(block: () -> T): T {
+    jobsLock.lock()
+    try {
+        return block()
+    } finally {
+        jobsLock.unlock()
+    }
+}
+
 @OptIn(ExperimentalForeignApi::class)
 internal actual object TempPlaybackCachePlatform {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -51,7 +63,7 @@ internal actual object TempPlaybackCachePlatform {
         onProgress: (downloadedBytes: Long, totalBytes: Long?) -> Unit,
         onComplete: () -> Unit,
     ) {
-        synchronized(jobs) {
+        locked {
             if (jobs.containsKey(launchId)) return
         }
         val job = scope.launch {
@@ -66,20 +78,20 @@ internal actual object TempPlaybackCachePlatform {
                 // Silent: playback already runs from remote URL; mirror is best-effort.
                 removeIfExists(dest)
             } finally {
-                synchronized(jobs) {
+                locked {
                     jobs.remove(launchId)
                     tasks.remove(launchId)?.let { runCatching { it.cancel() } }
                     sessions.remove(launchId)?.let { runCatching { it.invalidateAndCancel() } }
                 }
             }
         }
-        synchronized(jobs) {
+        locked {
             jobs[launchId] = job
         }
     }
 
     actual fun cancelAndDelete(launchId: Long) {
-        synchronized(jobs) {
+        locked {
             jobs.remove(launchId)?.cancel()
             tasks.remove(launchId)?.let { runCatching { it.cancel() } }
             sessions.remove(launchId)?.let { runCatching { it.invalidateAndCancel() } }
@@ -88,7 +100,7 @@ internal actual object TempPlaybackCachePlatform {
     }
 
     actual fun deleteAllTemp() {
-        synchronized(jobs) {
+        locked {
             jobs.values.toList().forEach { runCatching { it.cancel() } }
             jobs.clear()
             tasks.values.toList().forEach { runCatching { it.cancel() } }
@@ -151,7 +163,7 @@ internal actual object TempPlaybackCachePlatform {
             delegate = delegate,
             delegateQueue = NSOperationQueue().apply { maxConcurrentOperationCount = 1 },
         )
-        synchronized(jobs) {
+        locked {
             // Only track if still wanted; otherwise abort immediately.
             if (!jobs.containsKey(launchId)) {
                 session.invalidateAndCancel()
@@ -160,7 +172,7 @@ internal actual object TempPlaybackCachePlatform {
             sessions[launchId] = session
         }
         val task = session.dataTaskWithRequest(request)
-        synchronized(jobs) {
+        locked {
             if (!jobs.containsKey(launchId)) {
                 session.invalidateAndCancel()
                 throw CancellationException()

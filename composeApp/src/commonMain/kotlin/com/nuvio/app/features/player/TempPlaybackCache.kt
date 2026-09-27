@@ -92,7 +92,7 @@ object TempPlaybackCache {
  * Platform mirror. Files live under the app Caches directory
  * (never Documents: no iCloud backup, OS may reclaim if needed).
  */
-expect object TempPlaybackCachePlatform {
+internal expect object TempPlaybackCachePlatform {
     fun startMirror(
         launchId: Long,
         sourceUrl: String,
