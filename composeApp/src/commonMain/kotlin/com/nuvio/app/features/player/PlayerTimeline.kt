@@ -173,7 +173,7 @@ internal fun PlayerTimeline(
                                 size = Size(size.width, trackHeight),
                                 cornerRadius = radius,
                             )
-                            savedSpans.forEach { (start, end) {
+                            savedSpans.forEach { (start, end) ->
                                 // Samin saved-to-disk stretch: solid neutral gray.
                                 val startX = size.width * start
                                 val endX = size.width * end
