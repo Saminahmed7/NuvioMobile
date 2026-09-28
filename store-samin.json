@@ -20,6 +20,16 @@
       "category": "entertainment",
       "versions": [
         {
+          "version": "0.5.4009",
+          "buildVersion": "4009",
+          "date": "2026-09-28T17:42:35Z",
+          "localizedDescription": "Nuvio Samin 0.5.4009 (4009)\n\nOfficial upstream: NuvioMedia/NuvioMobile@fc4608d2928c805fdf368399bff39f17bb55b4da\n\nSamin changes on top of official:\n- Temp playback cache: progressive HTTP streams are mirrored to\n  app Caches while playing (instant start on slow connections)\n  and deleted when the player closes.\n- MPV disk-backed readahead cache for slow connections.\n",
+          "downloadURL": "https://github.com/Saminahmed7/NuvioMobile/releases/download/samin-v0.5.4009-4009/nuvio-samin-0.5.4009-full-release.ipa",
+          "size": 66513674,
+          "sha256": "406b893a1230cd3e8efee3adda6b816cfbe2e1d320b800f7ff39be767b84cef7",
+          "minOSVersion": "16.1"
+        },
+        {
           "version": "0.5.4008",
           "buildVersion": "4008",
           "date": "2026-09-28T15:46:24Z",
