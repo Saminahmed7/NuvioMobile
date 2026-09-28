@@ -83,7 +83,7 @@ internal actual object TempPlaybackCachePlatform {
                     0L
                 }
                 // 3. Download (ranged when possible) while reporting true totals.
-                downloadToFile(sourceUrl, headers, dest, launchId, startByte, onProgress, isHead = false)
+                downloadToFile(sourceUrl, headers, dest, launchId, realLaunchId = launchId, startByte, onProgress, isHead = false)
                 onComplete()
             } catch (_: Throwable) {
                 // Silent: playback already runs from remote URL; mirror is best-effort.
