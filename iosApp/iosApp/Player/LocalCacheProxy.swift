@@ -148,7 +148,7 @@ final class LocalCacheProxyServer {
                     baseDir: cacheBaseDir().appendingPathComponent(key, isDirectory: true),
                     server: self
                 )
-                url = http://127.0.0.1:\(port)/s/\(key)/file
+                url = "http://127.0.0.1:\(port)/s/\(key)/file"
             }
             if !url.isEmpty { return url }
             Thread.sleep(forTimeInterval: 0.05)
