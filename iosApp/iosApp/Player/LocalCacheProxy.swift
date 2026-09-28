@@ -242,6 +242,9 @@ final class ProxySession {
     var totalSize: Int64?
     var contentType: String?
     var playheadMs: (Int64, Int64)?
+    /// Set false when the session is torn down; in-flight fetches stop
+    /// instead of recreating deleted files.
+    var valid = true
     private(set) var cachedChunks: Set<Int64> = []
     private var servedOrder: [Int64] = []
     private var pinnedChunks: Set<Int64> = []
@@ -256,6 +259,7 @@ final class ProxySession {
     }
 
     func invalidate() {
+        valid = false
         try? FileManager.default.removeItem(at: dir)
     }
 
@@ -654,7 +658,10 @@ final class ProxyConnection {
             return nil
         }
         defer { try? handle.close() }
-        guard (try? handle.seek(toOffset: UInt64(cursor.offset))) != nil,
+        // Chunk files start at byte 0; convert the absolute offset.
+        let fileOffset = cursor.offset - cursor.index * saminProxyChunkBytes
+        guard fileOffset >= 0,
+              (try? handle.seek(toOffset: UInt64(fileOffset))) != nil,
               let data = try? handle.read(upToCount: 1024 * 1024),
               !data.isEmpty else {
             diskCursor = nil
@@ -757,6 +764,7 @@ final class UpstreamFetch: NSObject, URLSessionDataDelegate {
     private var urlSession: URLSession?
     private var fileHandles: [Int64: FileHandle] = [:]
     private var streamOffset: Int64 = -1 // absolute file offset of the next byte
+    private var lastMarkedChunk: Int64 = -1
     private var finished = false
 
     init(session: ProxySession, range: ProxyRange?, owner: ProxyConnection) {
@@ -804,6 +812,7 @@ final class UpstreamFetch: NSObject, URLSessionDataDelegate {
     }
 
     func setSuspended(_ suspended: Bool) {
+        guard !finished else { return }
         if suspended {
             task?.suspend()
         } else {
@@ -841,6 +850,9 @@ final class UpstreamFetch: NSObject, URLSessionDataDelegate {
             self.session.contentType = type
         }
         // Answer the player NOW so playback starts while bytes stream in.
+        // An upstream 206 always gets a 206 reply (MPV asked for a range);
+        // lengths are included whenever known, otherwise the body is
+        // close-delimited.
         let total = self.session.totalSize
         let start = range?.start ?? 0
         let end: Int64? = range?.end ?? total.map { $0 - 1 }
@@ -850,10 +862,13 @@ final class UpstreamFetch: NSObject, URLSessionDataDelegate {
             ("Connection", "close"),
         ]
         let status: Int
-        if range != nil, let total, let end, end >= start {
+        if range != nil {
             status = 206
-            headers.append(("Content-Range", "bytes \(start)-\(end)/\(total)"))
-            headers.append(("Content-Length", "\(max(0, end - start + 1))"))
+            let totalToken = total.map(String.init) ?? "*"
+            if let end, end >= start {
+                headers.append(("Content-Range", "bytes \(start)-\(end)/\(totalToken)"))
+                headers.append(("Content-Length", "\(end - start + 1)"))
+            }
         } else if let total {
             status = 200
             headers.append(("Content-Length", "\(total)"))
@@ -866,6 +881,10 @@ final class UpstreamFetch: NSObject, URLSessionDataDelegate {
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         guard !data.isEmpty else { return }
+        guard self.session.valid else {
+            finish(failed: true)
+            return
+        }
         if streamOffset < 0 {
             // First bytes: absolute offset = requested start (a 200 after a
             // Range request means the full body from 0).
@@ -903,7 +922,10 @@ final class UpstreamFetch: NSObject, URLSessionDataDelegate {
                 // these bytes to the player, just don't keep them.
                 out.append(Data(piece))
             }
-            session.markServed(idx)
+            if idx != lastMarkedChunk {
+                lastMarkedChunk = idx
+                session.markServed(idx)
+            }
             cursor += take
             remaining = remaining.dropFirst(Int(take))
         }
