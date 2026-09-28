@@ -36,7 +36,7 @@ jobs:
       IOS_CONFIGURATION: Release
       KOTLIN_DAEMON_JVMARGS: -Xmx2048M
       NUVIO_GRADLE_JVMARGS: -Xmx4608M -Dfile.encoding=UTF-8 -XX:MaxMetaspaceSize=768M
-      NUVIO_KOTLIN_NATIVE_JVMARGS: -Xmx4608M
+      NUVIO_KOTLIN_NATIVE_JVMARGS: -Xmx8192M
       RELEASE_PROPERTIES_BASE64: ${{ secrets.NUVIO_LOCAL_PROPERTIES_BASE64 }}
       BRANCH: samin-temp-cache
 
@@ -85,6 +85,17 @@ jobs:
           key: konan-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('gradle/libs.versions.toml') }}
           restore-keys: |
             konan-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Cache Xcode DerivedData & SwiftPM
+        if: ${{ !inputs.skip_build }}
+        uses: actions/cache@v5
+        with:
+          path: |
+            build/ios-derived-full-release
+            ~/Library/Caches/org.swift.swiftpm
+          key: xcode-derived-${{ runner.os }}-${{ hashFiles('iosApp/**', 'MPVKit/**') }}
+          restore-keys: |
+            xcode-derived-${{ runner.os }}-
 
       - name: Verify Apple toolchain
         if: ${{ !inputs.skip_build }}
@@ -138,6 +149,14 @@ jobs:
       - name: Prepare iOS dependencies
         if: ${{ !inputs.skip_build }}
         run: ./scripts/prepare-ios-dependencies.sh
+
+      - name: Fast pre-flight verification
+        if: ${{ !inputs.skip_build }}
+        run: |
+          echo "--> Validating Swift syntax..."
+          xcrun --sdk iphoneos swiftc -parse iosApp/iosApp/Player/LocalCacheProxy.swift
+          echo "--> Validating Kotlin compilation..."
+          ./gradlew :composeApp:compileKotlinIosArm64 --parallel
 
       - name: Build unsigned Samin IPA
         if: ${{ !inputs.skip_build }}

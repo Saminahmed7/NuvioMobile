@@ -200,7 +200,16 @@ final class LocalCacheProxyServer {
     }
 
     fileprivate func freeSpaceBytes() -> Int64 {
-        guard let attrs = try? FileManager.default.attributesOfFileSystem(forPath: cacheBaseDir().path),
+        let dir = cacheBaseDir()
+        if let vals = try? dir.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+           let cap = vals.volumeAvailableCapacityForImportantUsage {
+            return cap
+        }
+        if let vals = try? dir.resourceValues(forKeys: [.volumeAvailableCapacityKey]),
+           let cap = vals.volumeAvailableCapacity {
+            return Int64(cap)
+        }
+        guard let attrs = try? FileManager.default.attributesOfFileSystem(forPath: dir.path),
               let free = attrs[.systemFreeSize] as? NSNumber else {
             return Int64.max
         }
@@ -241,13 +250,19 @@ final class ProxySession {
 
     var totalSize: Int64?
     var contentType: String?
-    var playheadMs: (Int64, Int64)?
+    var playheadMs: (Int64, Int64)? {
+        didSet {
+            onPlayheadUpdated()
+        }
+    }
     /// Set false when the session is torn down; in-flight fetches stop
     /// instead of recreating deleted files.
     var valid = true
     private(set) var cachedChunks: Set<Int64> = []
+    var inFlightChunks: Set<Int64> = []
     private var servedOrder: [Int64] = []
     private var pinnedChunks: Set<Int64> = []
+    private var prefetcher: SessionChunkPrefetcher?
 
     init(key: String, sourceUrl: String, headers: [String: String], baseDir: URL, server: LocalCacheProxyServer) {
         self.key = key
@@ -256,10 +271,14 @@ final class ProxySession {
         self.dir = baseDir
         self.server = server
         try? FileManager.default.createDirectory(at: baseDir, withIntermediateDirectories: true)
+        self.prefetcher = SessionChunkPrefetcher(session: self)
+        probeTotalSizeIfNeeded()
     }
 
     func invalidate() {
         valid = false
+        prefetcher?.cancel()
+        prefetcher = nil
         try? FileManager.default.removeItem(at: dir)
     }
 
@@ -292,24 +311,15 @@ final class ProxySession {
         indices.forEach { pinnedChunks.remove($0) }
     }
 
-    /// Makes room for one more chunk. Watched (behind-playhead) chunks go
-    /// first; the unwatched forward part is always kept. Returns false when
-    /// nothing safe could be evicted (caller then serves without caching).
+    /// Makes room for one more chunk. Only watched (strictly behind-playhead)
+    /// chunks are evicted, and only when storage is actually below the safety threshold.
+    /// Unwatched forward chunks are NEVER evicted.
     func makeRoomForChunk(excluding: Int64) -> Bool {
         guard server.freeSpaceBytes() < saminProxyLowSpaceBytes else { return true }
-        let playheadChunk: Int64? = playheadByte.map { $0 / saminProxyChunkBytes }
-        // Prefer chunks strictly behind the playhead (already watched).
-        var watched: [Int64] = []
-        if let ph = playheadChunk {
-            watched = cachedChunks.filter { $0 != excluding && $0 < ph }.sorted()
-        }
-        for victim in watched {
-            removeChunk(victim)
-            if server.freeSpaceBytes() >= saminProxyLowSpaceBytes { return true }
-        }
-        // Fall back to least-recently-served (never the chunk being written
-        // or chunks pinned by an in-flight disk response).
-        for victim in servedOrder where victim != excluding && !pinnedChunks.contains(victim) && cachedChunks.contains(victim) {
+        let playheadChunk = playheadByte.map { $0 / saminProxyChunkBytes } ?? 0
+        // Strictly evict chunks behind the playhead (already watched).
+        let backwardWatched = cachedChunks.filter { $0 != excluding && $0 < playheadChunk && !pinnedChunks.contains($0) }.sorted()
+        for victim in backwardWatched {
             removeChunk(victim)
             if server.freeSpaceBytes() >= saminProxyLowSpaceBytes { return true }
         }
@@ -318,8 +328,86 @@ final class ProxySession {
 
     private func removeChunk(_ index: Int64) {
         cachedChunks.remove(index)
+        inFlightChunks.remove(index)
         servedOrder.removeAll(where: { $0 == index })
         try? FileManager.default.removeItem(at: chunkURL(index))
+    }
+
+    private func onPlayheadUpdated() {
+        guard valid else { return }
+        let playheadChunk = playheadByte.map { $0 / saminProxyChunkBytes } ?? 0
+        if let p = prefetcher, p.isRunning, p.chunkIndex < playheadChunk {
+            // User sought ahead; cancel any backward fill so forward prefetch takes priority.
+            p.cancel()
+        }
+        triggerPrefetch()
+    }
+
+    func probeTotalSizeIfNeeded() {
+        guard totalSize == nil, let url = URL(string: sourceUrl) else { return }
+        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
+        req.httpMethod = "HEAD"
+        headers.forEach { req.setValue($1, forHTTPHeaderField: $0) }
+        URLSession.shared.dataTask(with: req) { [weak self] _, response, _ in
+            guard let self else { return }
+            let total = (response as? HTTPURLResponse)
+                .flatMap { $0.value(forHTTPHeaderField: "Content-Length") }
+                .flatMap(Int64.init)
+            let type = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type")
+            if let total, total > 0 {
+                self.server.queue.async { [weak self] in
+                    guard let self, self.valid else { return }
+                    if self.totalSize == nil {
+                        self.totalSize = total
+                        if let type, self.contentType == nil {
+                            self.contentType = type
+                        }
+                        self.triggerPrefetch()
+                    }
+                }
+            }
+        }.resume()
+    }
+
+    /// Prefetches the video into disk cache:
+    /// 1. Entire forward span from playhead to end of file is cached first.
+    /// 2. Backward span (before playhead) is cached only after forward finishes and storage has plenty of room.
+    func triggerPrefetch() {
+        guard valid, let total = totalSize, total > 0 else { return }
+        guard let prefetcher = prefetcher, !prefetcher.isRunning else { return }
+
+        let totalChunks = (total + saminProxyChunkBytes - 1) / saminProxyChunkBytes
+        let playheadChunk = playheadByte.map { $0 / saminProxyChunkBytes } ?? 0
+
+        var targetChunk: Int64? = nil
+        // 1. Forward chunks from playhead to end
+        for idx in playheadChunk..<totalChunks {
+            if !cachedChunks.contains(idx) && !inFlightChunks.contains(idx) {
+                targetChunk = idx
+                break
+            }
+        }
+
+        // 2. Backward chunks from 0 to playhead, ONLY IF storage has plenty of space
+        if targetChunk == nil {
+            if server.freeSpaceBytes() >= saminProxyLowSpaceBytes {
+                for idx in 0..<playheadChunk {
+                    if !cachedChunks.contains(idx) && !inFlightChunks.contains(idx) {
+                        targetChunk = idx
+                        break
+                    }
+                }
+            }
+        }
+
+        guard let chunkToFetch = targetChunk else { return }
+        // Ensure space before fetching (evicts backward watched chunks if storage is low)
+        guard makeRoomForChunk(excluding: chunkToFetch) else { return }
+
+        let startByte = chunkToFetch * saminProxyChunkBytes
+        let endByte = min(startByte + saminProxyChunkBytes - 1, total - 1)
+        guard endByte >= startByte else { return }
+        prefetcher.fetch(chunkIndex: chunkToFetch, startByte: startByte, endByte: endByte)
     }
 
     func cachedRangesJson() -> String {
@@ -342,6 +430,112 @@ final class ProxySession {
     }
 }
 
+// MARK: - Dedicated Chunk Prefetcher
+
+final class SessionChunkPrefetcher: NSObject, URLSessionDataDelegate {
+    unowned let session: ProxySession
+    private var urlSession: URLSession?
+    private var task: URLSessionDataTask?
+    private var handle: FileHandle?
+    private(set) var chunkIndex: Int64 = -1
+    private var expectedBytes: Int64 = 0
+    private var receivedBytes: Int64 = 0
+
+    init(session: ProxySession) {
+        self.session = session
+        super.init()
+        let config = URLSessionConfiguration.default
+        config.urlCache = nil
+        config.timeoutIntervalForRequest = 60
+        config.timeoutIntervalForResource = 3600
+        config.waitsForConnectivity = true
+        self.urlSession = URLSession(configuration: config, delegate: self, delegateQueue: session.server.makeDelegateQueue())
+    }
+
+    func cancel() {
+        task?.cancel()
+        task = nil
+        cleanup()
+    }
+
+    var isRunning: Bool {
+        task != nil
+    }
+
+    func fetch(chunkIndex: Int64, startByte: Int64, endByte: Int64) {
+        cancel()
+        guard session.valid, let url = URL(string: session.sourceUrl) else { return }
+
+        let fileUrl = session.chunkURL(chunkIndex)
+        if !FileManager.default.fileExists(atPath: fileUrl.path) {
+            FileManager.default.createFile(atPath: fileUrl.path, contents: nil)
+        }
+        guard let h = try? FileHandle(forWritingTo: fileUrl) else { return }
+        try? h.truncate(atOffset: 0)
+
+        self.chunkIndex = chunkIndex
+        self.handle = h
+        self.expectedBytes = endByte - startByte + 1
+        self.receivedBytes = 0
+
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 60)
+        request.httpMethod = "GET"
+        session.headers.forEach { request.setValue($1, forHTTPHeaderField: $0) }
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        request.setValue("bytes=\(startByte)-\(endByte)", forHTTPHeaderField: "Range")
+
+        session.inFlightChunks.insert(chunkIndex)
+        let t = urlSession?.dataTask(with: request)
+        self.task = t
+        t?.resume()
+    }
+
+    private func cleanup() {
+        if chunkIndex >= 0 {
+            session.inFlightChunks.remove(chunkIndex)
+        }
+        try? handle?.close()
+        handle = nil
+        chunkIndex = -1
+        expectedBytes = 0
+        receivedBytes = 0
+    }
+
+    // MARK: - URLSessionDataDelegate
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        guard let http = response as? HTTPURLResponse, (http.statusCode == 200 || http.statusCode == 206) else {
+            completionHandler(.cancel)
+            return
+        }
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard !data.isEmpty, let h = handle else { return }
+        do {
+            try h.write(contentsOf: data)
+            receivedBytes += Int64(data.count)
+        } catch {
+            dataTask.cancel()
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        let finishedChunk = chunkIndex
+        let success = (error == nil) && (receivedBytes >= expectedBytes)
+        cleanup()
+        self.task = nil
+        self.session.server.queue.async { [weak self] in
+            guard let self, self.session.valid else { return }
+            if success && finishedChunk >= 0 {
+                self.session.markCached(finishedChunk)
+            }
+            self.session.triggerPrefetch()
+        }
+    }
+}
+
 // MARK: - Connection (one HTTP request, streamed)
 
 final class ProxyConnection {
@@ -358,7 +552,6 @@ final class ProxyConnection {
     private var headersSent = false
     private var upstreamDone = false
     private var upstreamFailed = false
-    private var suspendedUpstream = false
 
     init(server: LocalCacheProxyServer, connection: NWConnection) {
         self.server = server
@@ -559,10 +752,6 @@ final class ProxyConnection {
     private func enqueue(_ data: Data) {
         sendQueue.append(data)
         unsentBytes += data.count
-        if unsentBytes > saminProxyMaxUnsentBytes {
-            suspendedUpstream = true
-            fetch?.setSuspended(true)
-        }
         pump()
     }
 
@@ -587,10 +776,6 @@ final class ProxyConnection {
         sending = true
         let chunk = sendQueue.removeFirst()
         unsentBytes -= chunk.count
-        if suspendedUpstream && unsentBytes < saminProxyResumeUnsentBytes {
-            suspendedUpstream = false
-            fetch?.setSuspended(false)
-        }
         connection.send(content: chunk, completion: .contentProcessed { [weak self] _ in
             guard let self else { return }
             self.sending = false
@@ -841,8 +1026,10 @@ final class UpstreamFetch: NSObject, URLSessionDataDelegate {
         if self.session.totalSize == nil {
             if code == 206, let cr = lowered["content-range"], let total = ProxyConnectionTotal.parse(cr) {
                 self.session.totalSize = total
+                self.session.triggerPrefetch()
             } else if let len = lowered["content-length"].flatMap(Int64.init), len > 0 {
                 self.session.totalSize = (code == 206 ? (self.range?.start ?? 0) : 0) + len
+                self.session.triggerPrefetch()
             }
         }
         if self.session.contentType == nil,
@@ -905,6 +1092,8 @@ final class UpstreamFetch: NSObject, URLSessionDataDelegate {
 
     // MARK: - Cache + forward
 
+    private var chunkBytesWritten: [Int64: Int64] = [:]
+
     private func writeThrough(offset: Int64, data: Data) {
         var cursor = offset
         var remaining = data
@@ -941,12 +1130,24 @@ final class UpstreamFetch: NSObject, URLSessionDataDelegate {
             if !FileManager.default.fileExists(atPath: url.path) {
                 FileManager.default.createFile(atPath: url.path, contents: nil)
             }
-            session.markCached(index)
+            session.inFlightChunks.insert(index)
         }
         guard let handle = openHandle(index) else { return false }
         do {
             try handle.seek(toOffset: UInt64(offset))
             try handle.write(contentsOf: data)
+            let written = (chunkBytesWritten[index] ?? 0) + Int64(data.count)
+            chunkBytesWritten[index] = written
+            if let total = session.totalSize {
+                let startByte = index * saminProxyChunkBytes
+                let endByte = min(startByte + saminProxyChunkBytes - 1, total - 1)
+                let expected = endByte - startByte + 1
+                if written >= expected {
+                    session.markCached(index)
+                    session.inFlightChunks.remove(index)
+                    session.triggerPrefetch()
+                }
+            }
             return true
         } catch {
             return false
@@ -967,6 +1168,7 @@ final class UpstreamFetch: NSObject, URLSessionDataDelegate {
         fileHandles.removeAll()
         urlSession?.finishTasksAndInvalidate()
         owner?.fetchDidFinish(failed: failed)
+        session.triggerPrefetch()
     }
 }
 
