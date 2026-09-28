@@ -1,5 +1,6 @@
 package com.nuvio.app.features.player
 
+import com.nuvio.app.core.ui.NuvioToastController
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -95,6 +96,8 @@ object TempPlaybackCache {
     ) {
         if (!shouldMirror(sourceUrl)) return
         if (!started.add(launchId)) return
+        // Samin debug proof-of-life: visible the moment the mirror begins.
+        NuvioToastController.show("Temp save on")
         _status.update { current ->
             if (current.containsKey(launchId)) current
             else current + (launchId to TempCacheStatus(launchId = launchId))
@@ -121,6 +124,10 @@ object TempPlaybackCache {
                     val prev = current[launchId] ?: TempCacheStatus(launchId = launchId)
                     current + (launchId to prev.copy(isComplete = true))
                 }
+                val done = _status.value[launchId]
+                val mb = ((done?.startBytes ?: 0L) + (done?.downloadedBytes ?: 0L)) / (1024L * 1024L)
+                // Samin debug proof-of-life: visible when the forward save ends.
+                NuvioToastController.show("Temp saved ${mb} MB")
                 if (tailDone.add(launchId)) {
                     maybeFetchHead(launchId, sourceUrl, headers)
                 }
