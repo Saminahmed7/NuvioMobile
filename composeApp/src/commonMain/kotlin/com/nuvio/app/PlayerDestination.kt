@@ -41,9 +41,18 @@ internal fun PlayerDestination(
     LaunchedEffect(launch.videoId) {
         launch.videoId?.let { ResumePromptRepository.markPlayerEntered(it) }
     }
-    // Samin temp cache: the mirror starts from the player runtime once
-    // playback runs smoothly (see BindPlayerRuntimeEffects) so it never
-    // steals bandwidth during startup stalls; it is deleted here on close.
+    // Samin cache proxy: on platforms with a loopback proxy the player loads
+    // a localhost URL and reads from the on-disk cache (instant replays,
+    // offline survival inside cached ranges). Everywhere else the remote URL
+    // is used with the legacy background mirror. Headers move to the proxy;
+    // the player itself gets none for localhost. External players below keep
+    // using the original remote launch. Everything is deleted here on close.
+    val playUrl = remember(launch) {
+        TempPlaybackCache.resolvePlayUrl(route.launchId, launch.sourceUrl, launch.sourceHeaders)
+    }
+    val playHeaders = remember(launch, playUrl) {
+        if (playUrl != launch.sourceUrl) emptyMap() else launch.sourceHeaders
+    }
     DisposableEffect(route.launchId) {
         onDispose {
             TempPlaybackCache.cancelAndDelete(route.launchId)
@@ -52,9 +61,9 @@ internal fun PlayerDestination(
     PlayerScreen(
         profileId = launch.profileId,
         title = launch.title,
-        sourceUrl = launch.sourceUrl,
+        sourceUrl = playUrl,
         sourceAudioUrl = launch.sourceAudioUrl,
-        sourceHeaders = launch.sourceHeaders,
+        sourceHeaders = playHeaders,
         sourceResponseHeaders = launch.sourceResponseHeaders,
         externalSubtitles = launch.externalSubtitles,
         streamType = launch.streamType,

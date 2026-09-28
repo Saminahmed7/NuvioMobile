@@ -260,19 +260,11 @@ private fun PlayerScreenRuntime.currentInitialPositionRequestKey(): String? {
 @Composable
 private fun PlayerScreenRuntime.RenderPlayerControls(displayedPositionMs: Long, isEpisode: Boolean) {
     val isInPip = rememberIsInPictureInPicture()
-    // Samin: temp-cache saved region for the gray timeline segment.
+    // Samin: temp-cache saved spans for the gray timeline stretches.
     val tempCacheStatuses by TempPlaybackCache.status.collectAsStateWithLifecycle()
-    val saminCachedStartFraction = remember(tempCacheStatuses) {
-        val lid = args.launchId ?: return@remember 0f
-        tempCacheStatuses[lid]?.startFraction ?: 0f
-    }
-    val saminCachedFraction = remember(tempCacheStatuses) {
-        val lid = args.launchId ?: return@remember null
-        tempCacheStatuses[lid]?.endFraction
-    }
-    val saminCachedHeadFraction = remember(tempCacheStatuses) {
-        val lid = args.launchId ?: return@remember 0f
-        tempCacheStatuses[lid]?.headEndFraction ?: 0f
+    val saminCachedRanges = remember(tempCacheStatuses) {
+        val lid = args.launchId ?: return@remember emptyList<TempCacheRange>()
+        tempCacheStatuses[lid]?.ranges ?: emptyList()
     }
     AnimatedVisibility(
         visible = (controlsVisible || showParentalGuide) && !playerControlsLocked && !isInPip,
@@ -388,9 +380,7 @@ private fun PlayerScreenRuntime.RenderPlayerControls(displayedPositionMs: Long, 
             },
             horizontalSafePadding = horizontalSafePadding,
             modifier = Modifier.fillMaxSize(),
-            cachedFraction = saminCachedFraction,
-            cachedStartFraction = saminCachedStartFraction,
-            cachedHeadFraction = saminCachedHeadFraction,
+            cachedRanges = saminCachedRanges,
         )
     }
 }

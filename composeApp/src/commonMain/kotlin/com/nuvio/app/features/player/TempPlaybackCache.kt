@@ -5,6 +5,14 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+
+/** One saved span on the timeline, as fractions of the file. */
+data class TempCacheRange(
+    val start: Float,
+    val end: Float,
+)
 
 /**
  * Samin temp playback cache.
@@ -31,6 +39,7 @@ data class TempCacheStatus(
     val headDownloadedBytes: Long = 0L,
     val headComplete: Boolean = false,
     val isComplete: Boolean = false,
+    val ranges: List<TempCacheRange> = emptyList(),
 ) {
     /** Fraction of the file where the forward saved region starts. */
     val startFraction: Float?
@@ -71,6 +80,94 @@ object TempPlaybackCache {
     // Touched from the main thread (Compose effects / navigation dispose).
     private val started = mutableSetOf<Long>()
     private val tailDone = mutableSetOf<Long>()
+    private val proxied = mutableSetOf<Long>()
+
+    /** True when this playback runs through the loopback proxy (iOS). */
+    fun isProxied(launchId: Long): Boolean = proxied.contains(launchId)
+
+    /**
+     * Returns the URL the player should load. On platforms with a cache
+     * proxy this starts a session and returns a localhost URL, so the
+     * player reads from the on-disk cache; everywhere else (or when the
+     * proxy is unavailable) it returns the remote URL unchanged and the
+     * legacy background mirror is used instead.
+     */
+    fun resolvePlayUrl(
+        launchId: Long,
+        sourceUrl: String,
+        headers: Map<String, String> = emptyMap(),
+    ): String {
+        if (!shouldMirror(sourceUrl)) return sourceUrl
+        val bridge = NuvioCacheProxyBridgeFactory.create() ?: return sourceUrl
+        val local = runCatching {
+            bridge.startSession(
+                sessionKey = sessionKey(launchId),
+                sourceUrl = sourceUrl,
+                headersJson = encodeHeaders(headers),
+            )
+        }.getOrNull().orEmpty()
+        if (local.isBlank()) return sourceUrl
+        proxied.add(launchId)
+        _status.update { current ->
+            if (current.containsKey(launchId)) current
+            else current + (launchId to TempCacheStatus(launchId = launchId))
+        }
+        return local
+    }
+
+    fun pushPlayhead(launchId: Long, positionMs: Long, durationMs: Long) {
+        if (!isProxied(launchId)) return
+        runCatching {
+            NuvioCacheProxyBridgeFactory.create()
+                ?.setPlayhead(sessionKey(launchId), positionMs, durationMs)
+        }
+    }
+
+    fun refreshRanges(launchId: Long) {
+        if (!isProxied(launchId)) return
+        val json = runCatching {
+            NuvioCacheProxyBridgeFactory.create()?.cachedRangesJson(sessionKey(launchId))
+        }.getOrNull().orEmpty()
+        val ranges = parseRangesJson(json)
+        _status.update { current ->
+            val prev = current[launchId] ?: return@update current
+            current + (launchId to prev.copy(ranges = ranges))
+        }
+    }
+
+    private fun sessionKey(launchId: Long): String = "p$launchId"
+
+    private fun encodeHeaders(headers: Map<String, String>): String? {
+        val sanitized = headers.mapNotNull { (k, v) ->
+            val key = k.trim()
+            val value = v.trim()
+            if (key.isBlank() || value.isBlank() || key.equals("Range", ignoreCase = true)) null
+            else key to value
+        }.toMap()
+        if (sanitized.isEmpty()) return null
+        return runCatching { Json.encodeToString(sanitized) }.getOrNull()
+    }
+
+    internal fun parseRangesJson(json: String): List<TempCacheRange> {
+        val trimmed = json.trim()
+        if (trimmed.isEmpty() || trimmed == "[]") return emptyList()
+        return runCatching {
+            trimmed.removePrefix("[").removeSuffix("]")
+                .split("],[")
+                .mapNotNull { pair ->
+                    val parts = pair.replace("[", "").replace("]", "").split(",")
+                    if (parts.size != 2) return@mapNotNull null
+                    val start = parts[0].trim().toFloatOrNull() ?: return@mapNotNull null
+                    val end = parts[1].trim().toFloatOrNull() ?: return@mapNotNull null
+                    if (end <= start) return@mapNotNull null
+                    TempCacheRange(
+                        start = start.coerceIn(0f, 1f),
+                        end = end.coerceIn(0f, 1f),
+                    )
+                }
+                .take(32)
+        }.getOrDefault(emptyList())
+    }
 
     fun shouldMirror(url: String?): Boolean {
         val normalized = url?.trim().orEmpty()
@@ -112,10 +209,14 @@ object TempPlaybackCache {
             onProgress = { downloaded, total, startBytes ->
                 _status.update { current ->
                     val prev = current[launchId] ?: TempCacheStatus(launchId = launchId)
+                    val cleanTotal = total?.takeIf { it > 0L }
+                    val cleanStart = startBytes.coerceAtLeast(0L)
+                    val cleanDownloaded = downloaded.coerceAtLeast(0L)
                     current + (launchId to prev.copy(
-                        downloadedBytes = downloaded.coerceAtLeast(0L),
-                        totalBytes = total?.takeIf { it > 0L },
-                        startBytes = startBytes.coerceAtLeast(0L),
+                        downloadedBytes = cleanDownloaded,
+                        totalBytes = cleanTotal,
+                        startBytes = cleanStart,
+                        ranges = singleRange(cleanStart, cleanDownloaded, cleanTotal),
                     ))
                 }
             },
@@ -133,6 +234,16 @@ object TempPlaybackCache {
                 }
             },
         )
+    }
+
+    private fun singleRange(startBytes: Long, downloadedBytes: Long, totalBytes: Long?): List<TempCacheRange> {
+        val total = totalBytes?.takeIf { it > 0L } ?: return emptyList()
+        val end = startBytes + downloadedBytes
+        if (end <= 0L) return emptyList()
+        val start = (startBytes.toFloat() / total.toFloat()).coerceIn(0f, 1f)
+        val finish = (end.toFloat() / total.toFloat()).coerceIn(0f, 1f)
+        if (finish <= start) return emptyList()
+        return listOf(TempCacheRange(start, finish))
     }
 
     private fun maybeFetchHead(launchId: Long, sourceUrl: String, headers: Map<String, String>) {
@@ -166,6 +277,10 @@ object TempPlaybackCache {
     fun cancelAndDelete(launchId: Long) {
         started.remove(launchId)
         tailDone.remove(launchId)
+        proxied.remove(launchId)
+        runCatching {
+            NuvioCacheProxyBridgeFactory.create()?.stopSession(sessionKey(launchId))
+        }
         runCatching { TempPlaybackCachePlatform.cancelAndDelete(launchId) }
         _status.update { current -> current - launchId }
     }
@@ -174,6 +289,16 @@ object TempPlaybackCache {
         // Only call at app cold start when no playback is active.
         started.clear()
         tailDone.clear()
+        val keys = proxied.toList()
+        proxied.clear()
+        keys.forEach { key ->
+            runCatching {
+                NuvioCacheProxyBridgeFactory.create()?.stopSession(sessionKey(key))
+            }
+        }
+        runCatching {
+            NuvioCacheProxyBridgeFactory.create()?.stopAllSessions()
+        }
         runCatching { TempPlaybackCachePlatform.deleteAllTemp() }
         _status.value = emptyMap()
     }

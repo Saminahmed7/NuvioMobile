@@ -13,6 +13,7 @@ private let nuvioBackgroundColor = UIColor(
 private enum NuvioComposeHost {
     static let registerPlayerBridge: Void = {
         NuvioPlayerRegistration.register()
+        NuvioCacheProxyRegistration.register()
     }()
 
     static func wrap(

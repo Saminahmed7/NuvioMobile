@@ -118,10 +118,8 @@ internal fun PlayerControlsShell(
     onScrubFinished: (Long) -> Unit,
     horizontalSafePadding: androidx.compose.ui.unit.Dp,
     modifier: Modifier = Modifier,
-    // Samin: temp-cache saved region, drawn as subtle gray on the timeline.
-    cachedFraction: Float? = null,
-    cachedStartFraction: Float = 0f,
-    cachedHeadFraction: Float = 0f,
+    // Samin: temp-cache saved spans, drawn as subtle gray on the timeline.
+    cachedRanges: List<TempCacheRange> = emptyList(),
 ) {
     val density = LocalDensity.current
     var timelineHeight by remember { mutableStateOf(0.dp) }
@@ -293,9 +291,7 @@ internal fun PlayerControlsShell(
                             onInteraction()
                             onScrubFinished(it)
                         },
-                        cachedFraction = cachedFraction,
-                        cachedStartFraction = cachedStartFraction,
-                        cachedHeadFraction = cachedHeadFraction,
+                        cachedRanges = cachedRanges,
                     )
                     PlayerControlActions(
                         playbackSnapshot = playbackSnapshot,

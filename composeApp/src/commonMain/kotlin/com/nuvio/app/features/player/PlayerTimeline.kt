@@ -113,23 +113,22 @@ internal fun PlayerTimeline(
     onScrubFinished: (Long) -> Unit,
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
-    // Samin: fraction of the file saved to disk by the temp playback cache.
-    // Drawn as a subtle brighter-gray stretch (PotPlayer-style).
-    cachedFraction: Float? = null,
-    // Samin: where the forward saved region starts (mirror resumes here).
-    cachedStartFraction: Float = 0f,
-    // Samin: end of the backward saved region (before the playhead,
-    // fetched after the forward part completes). 0 = none.
-    cachedHeadFraction: Float = 0f,
+    // Samin: saved-to-disk spans (loopback proxy cache or temp mirror),
+    // drawn as solid neutral-gray stretches (PotPlayer-style).
+    cachedRanges: List<TempCacheRange> = emptyList(),
 ) {
     val durationMs = snapshot.durationMs.coerceAtLeast(0L)
     val rangeEnd = durationMs.coerceAtLeast(1L).toFloat()
-    // Samin: official buffered tint removed — with the saved-to-disk segment
+    // Samin: official buffered tint removed — with the saved-to-disk spans
     // it was visual noise answering nothing useful. Track shows base,
     // saved (solid gray) and played only.
-    val savedFraction = cachedFraction?.coerceIn(0f, 1f).takeIf { it != null && it > 0f }
-    val savedStart = cachedStartFraction.coerceIn(0f, 1f)
-    val headEnd = cachedHeadFraction.coerceIn(0f, 1f).takeIf { it > 0f }
+    val savedSpans = remember(cachedRanges) {
+        cachedRanges.mapNotNull { span ->
+            val start = span.start.coerceIn(0f, 1f)
+            val end = span.end.coerceIn(0f, 1f)
+            if (end > start) start to end else null
+        }.take(8)
+    }
     val accentBrush = MaterialTheme.themePalette.accentBrush()
     val description = stringResource(Res.string.player_seek_position)
     var scrubPosition by remember { mutableStateOf<Long?>(null) }
@@ -174,23 +173,10 @@ internal fun PlayerTimeline(
                                 size = Size(size.width, trackHeight),
                                 cornerRadius = radius,
                             )
-                            if (headEnd != null) {
-                                // Samin backward saved region (watched history).
-                                val headX = size.width * minOf(headEnd, 1f)
-                                if (headX > 0f) {
-                                    drawRoundRect(
-                                        color = SavedTrackGray,
-                                        topLeft = trackOrigin,
-                                        size = Size(headX, trackHeight),
-                                        cornerRadius = radius,
-                                    )
-                                }
-                            }
-                            if (savedFraction != null) {
-                                // Samin saved-to-disk stretch: solid neutral gray,
-                                // growing forward from where the mirror resumed.
-                                val startX = size.width * minOf(savedStart, savedFraction)
-                                val endX = size.width * savedFraction
+                            savedSpans.forEach { (start, end) {
+                                // Samin saved-to-disk stretch: solid neutral gray.
+                                val startX = size.width * start
+                                val endX = size.width * end
                                 if (endX > startX) {
                                     drawRoundRect(
                                         color = SavedTrackGray,
@@ -199,7 +185,7 @@ internal fun PlayerTimeline(
                                         cornerRadius = radius,
                                     )
                                 }
-                            }
+                            }}
                             drawRoundRect(
                                 brush = accentBrush,
                                 topLeft = trackOrigin,

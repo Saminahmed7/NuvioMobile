@@ -34,6 +34,7 @@ import com.nuvio.app.features.watchprogress.buildPlaybackVideoId
 import com.nuvio.app.features.watching.application.WatchingState
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import nuvio.composeapp.generated.resources.*
 import org.jetbrains.compose.resources.getString
@@ -118,21 +119,42 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
 
     // Samin temp mirror: starts only once playback runs smoothly (never
     // during startup stalls, so it can't steal bandwidth from first frames),
-    // resuming from the current playhead. Deleted on player close.
+    // resuming from the current playhead. Skipped for proxied playbacks
+    // (iOS reads from the loopback cache instead). Deleted on player close.
     // TempPlaybackCache.start is idempotent per launchId.
     LaunchedEffect(activeSourceUrl, playbackSnapshot.isLoading, playbackSnapshot.durationMs) {
         val url = activeSourceUrl
         if (!TempPlaybackCache.shouldMirror(url)) return@LaunchedEffect
+        val lid = args.launchId
+        if (lid != null && TempPlaybackCache.isProxied(lid)) return@LaunchedEffect
         if (playbackSnapshot.isLoading) return@LaunchedEffect
         val duration = playbackSnapshot.durationMs.takeIf { it > 0L } ?: return@LaunchedEffect
-        val launchId = args.launchId ?: return@LaunchedEffect
+        if (lid == null) return@LaunchedEffect
         TempPlaybackCache.start(
-            launchId = launchId,
+            launchId = lid,
             sourceUrl = url,
             headers = activeSourceHeaders,
             startPositionMs = playbackSnapshot.positionMs.coerceAtLeast(0L),
             durationMs = duration,
         )
+    }
+
+    // Samin proxy ranges: poll cached spans for the gray bar and report the
+    // playhead (throttled) so storage pressure evicts watched data first.
+    LaunchedEffect(activeSourceUrl) {
+        val lid = args.launchId ?: return@LaunchedEffect
+        if (!TempPlaybackCache.isProxied(lid)) return@LaunchedEffect
+        var lastPushedMs = -1L
+        while (isActive) {
+            delay(2000L)
+            TempPlaybackCache.refreshRanges(lid)
+            val pos = playbackSnapshot.positionMs.coerceAtLeast(0L)
+            val dur = playbackSnapshot.durationMs
+            if (dur > 0L && (lastPushedMs < 0L || kotlin.math.abs(pos - lastPushedMs) > 30_000L)) {
+                lastPushedMs = pos
+                TempPlaybackCache.pushPlayhead(lid, pos, dur)
+            }
+        }
     }
 
     LaunchedEffect(
