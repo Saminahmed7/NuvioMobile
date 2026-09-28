@@ -106,9 +106,11 @@ final class LocalCacheProxyServer {
     @discardableResult
     private func ensureListener() -> Bool {
         if listener != nil, port != 0 { return true }
+        // NOTE: NWListener(using:on:) only takes a port (all interfaces).
+        // Loopback-only is enforced per-connection in accept() below, so no
+        // local-network prompt and no LAN exposure.
         guard let wirePort = NWEndpoint.Port(rawValue: 0) else { return false }
-        let endpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: wirePort)
-        let created = NWListener(using: .tcp, on: endpoint)
+        let created = NWListener(using: .tcp, on: wirePort)
         listener = created
         created.stateUpdateHandler = { [weak self] state in
             self?.queue.async { self?.handleListenerState(state, listener: created) }
@@ -206,6 +208,15 @@ final class LocalCacheProxyServer {
     }
 
     private func accept(_ connection: NWConnection) {
+        // The listener binds all interfaces (API limitation); only serve
+        // loopback peers so nothing on the LAN can reach this server.
+        if case .hostPort(let host, _) = connection.endpoint {
+            let peer = "\(host)"
+            if peer != "127.0.0.1" && peer != "::1" {
+                connection.cancel()
+                return
+            }
+        }
         connection.start(queue: queue)
         ProxyConnection(server: self, connection: connection).begin()
     }
@@ -265,6 +276,10 @@ final class ProxySession {
         }
     }
 
+    func markCached(_ index: Int64) {
+        cachedChunks.insert(index)
+    }
+
     func pin(_ indices: [Int64]) {
         indices.forEach { pinnedChunks.insert($0) }
     }
@@ -280,9 +295,10 @@ final class ProxySession {
         guard server.freeSpaceBytes() < saminProxyLowSpaceBytes else { return true }
         let playheadChunk: Int64? = playheadByte.map { $0 / saminProxyChunkBytes }
         // Prefer chunks strictly behind the playhead (already watched).
-        let watched = cachedChunks
-            .filter { $0 != excluding && !pinnedChunks.contains($0) && (playheadChunk.map { $0 < $1 } ?? false) }
-            .sorted()
+        var watched: [Int64] = []
+        if let ph = playheadChunk {
+            watched = cachedChunks.filter { $0 != excluding && $0 < ph }.sorted()
+        }
         for victim in watched {
             removeChunk(victim)
             if server.freeSpaceBytes() >= saminProxyLowSpaceBytes { return true }
@@ -903,7 +919,7 @@ final class UpstreamFetch: NSObject, URLSessionDataDelegate {
             if !FileManager.default.fileExists(atPath: url.path) {
                 FileManager.default.createFile(atPath: url.path, contents: nil)
             }
-            session.cachedChunks.insert(index)
+            session.markCached(index)
         }
         guard let handle = openHandle(index) else { return false }
         do {
