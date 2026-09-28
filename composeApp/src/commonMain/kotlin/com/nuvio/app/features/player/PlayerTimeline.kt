@@ -185,7 +185,7 @@ internal fun PlayerTimeline(
                                         cornerRadius = radius,
                                     )
                                 }
-                            }}
+                            }
                             drawRoundRect(
                                 brush = accentBrush,
                                 topLeft = trackOrigin,
