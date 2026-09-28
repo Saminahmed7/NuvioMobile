@@ -271,9 +271,17 @@ internal fun PlayerScreenRuntime.switchToSource(stream: StreamItem) {
         saveDirectStreamForReuse(stream, url, currentVideoId, activeSeasonNumber, activeEpisodeNumber)
     }
     externalSubtitles = stream.externalSubtitles
-    activeSourceUrl = url
+    // Samin: route remote streams through the loopback cache proxy so the
+    // player reads from disk (instant replays, offline survival). Without
+    // this, every stream switch silently bypasses the proxy session.
+    val (playUrl, playHeaders) = TempPlaybackCache.resolveProxiedSource(
+        launchId = args.launchId,
+        sourceUrl = url,
+        headers = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request),
+    )
+    activeSourceUrl = playUrl
     activeSourceAudioUrl = null
-    activeSourceHeaders = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request)
+    activeSourceHeaders = playHeaders
     activeSourceResponseHeaders = sanitizePlaybackResponseHeaders(stream.behaviorHints.proxyHeaders?.response)
     activeStreamType = stream.streamType
     activeSourceIdentityKey = sourceIdentityKey
@@ -322,9 +330,15 @@ internal fun PlayerScreenRuntime.switchToEpisodeStream(stream: StreamItem, episo
         saveDirectStreamForReuse(stream, url, epVideoId, episode.season, episode.episode)
     }
     externalSubtitles = stream.externalSubtitles
-    activeSourceUrl = url
+    // Samin: same proxy routing as switchToSource (see above).
+    val (playUrl, playHeaders) = TempPlaybackCache.resolveProxiedSource(
+        launchId = args.launchId,
+        sourceUrl = url,
+        headers = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request),
+    )
+    activeSourceUrl = playUrl
     activeSourceAudioUrl = null
-    activeSourceHeaders = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request)
+    activeSourceHeaders = playHeaders
     activeSourceResponseHeaders = sanitizePlaybackResponseHeaders(stream.behaviorHints.proxyHeaders?.response)
     activeStreamType = stream.streamType
     applyEpisodeStreamMetadata(stream, episode, resume)

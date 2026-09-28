@@ -96,23 +96,35 @@ object TempPlaybackCache {
         launchId: Long,
         sourceUrl: String,
         headers: Map<String, String> = emptyMap(),
-    ): String {
-        if (!shouldMirror(sourceUrl)) return sourceUrl
-        val bridge = NuvioCacheProxyBridgeFactory.create() ?: return sourceUrl
+    ): String = resolveProxiedSource(launchId, sourceUrl, headers).first
+
+    /**
+     * Same as [resolvePlayUrl] but also returns the headers the player
+     * itself should use (empty for localhost: the proxy holds the real
+     * upstream headers). Use this everywhere activeSourceUrl is assigned
+     * from a remote stream, otherwise the proxy is silently bypassed.
+     */
+    fun resolveProxiedSource(
+        launchId: Long?,
+        sourceUrl: String,
+        headers: Map<String, String> = emptyMap(),
+    ): Pair<String, Map<String, String>> {
+        if (launchId == null || !shouldMirror(sourceUrl)) return sourceUrl to headers
+        val bridge = NuvioCacheProxyBridgeFactory.create() ?: return sourceUrl to headers
+        val key = sessionKey(launchId)
+        // Replace any previous session for this playback (e.g. stream switch
+        // or debrid re-resolve) so its files never leak until close.
+        runCatching { bridge.stopSession(key) }
         val local = runCatching {
-            bridge.startSession(
-                sessionKey = sessionKey(launchId),
-                sourceUrl = sourceUrl,
-                headersJson = encodeHeaders(headers),
-            )
+            bridge.startSession(key, sourceUrl, encodeHeaders(headers))
         }.getOrNull().orEmpty()
-        if (local.isBlank()) return sourceUrl
+        if (local.isBlank()) return sourceUrl to headers
         proxied.add(launchId)
         _status.update { current ->
             if (current.containsKey(launchId)) current
             else current + (launchId to TempCacheStatus(launchId = launchId))
         }
-        return local
+        return local to emptyMap()
     }
 
     fun pushPlayhead(launchId: Long, positionMs: Long, durationMs: Long) {

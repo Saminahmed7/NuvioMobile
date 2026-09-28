@@ -830,9 +830,16 @@ internal fun PlayerScreenRuntime.tryRefreshCredentialedSourceAfterError(message:
 
             flushWatchProgress()
             stopActiveP2pStream()
-            activeSourceUrl = refreshedUrl
+            // Samin: refreshed debrid links must also go through the proxy,
+            // otherwise playback silently leaves the on-disk cache.
+            val (playUrl, playHeaders) = TempPlaybackCache.resolveProxiedSource(
+                launchId = args.launchId,
+                sourceUrl = refreshedUrl,
+                headers = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request),
+            )
+            activeSourceUrl = playUrl
             activeSourceAudioUrl = null
-            activeSourceHeaders = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request)
+            activeSourceHeaders = playHeaders
             activeSourceResponseHeaders = sanitizePlaybackResponseHeaders(stream.behaviorHints.proxyHeaders?.response)
             activeStreamType = stream.streamType
             activeStreamTitle = stream.streamLabel
