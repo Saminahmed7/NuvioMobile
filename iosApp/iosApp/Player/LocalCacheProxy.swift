@@ -109,8 +109,8 @@ final class LocalCacheProxyServer {
         // NOTE: NWListener(using:on:) only takes a port (all interfaces).
         // Loopback-only is enforced per-connection in accept() below, so no
         // local-network prompt and no LAN exposure.
-        guard let wirePort = NWEndpoint.Port(rawValue: 0) else { return false }
-        let created = NWListener(using: .tcp, on: wirePort)
+        guard let wirePort = NWEndpoint.Port(rawValue: 0),
+              let created = try? NWListener(using: .tcp, on: wirePort) else { return false }
         listener = created
         created.stateUpdateHandler = { [weak self] state in
             self?.queue.async { self?.handleListenerState(state, listener: created) }
