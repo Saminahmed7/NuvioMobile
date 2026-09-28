@@ -13,7 +13,7 @@ import ComposeApp
 //
 // All session state lives on `queue`; Kotlin entry points hop onto it.
 
-private let saminProxyChunkBytes: Int64 = 16 * 1024 * 1024
+private let saminProxyChunkBytes: Int64 = 32 * 1024 * 1024
 private let saminProxyLowSpaceBytes: Int64 = 500 * 1024 * 1024
 private let saminProxyMaxRanges = 24
 private let saminProxyMaxUnsentBytes = 32 * 1024 * 1024
@@ -348,6 +348,9 @@ final class ProxySession {
         var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
         req.httpMethod = "HEAD"
         headers.forEach { req.setValue($1, forHTTPHeaderField: $0) }
+        if req.value(forHTTPHeaderField: "User-Agent") == nil {
+            req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
+        }
         URLSession.shared.dataTask(with: req) { [weak self] _, response, _ in
             guard let self else { return }
             let total = (response as? HTTPURLResponse)
@@ -434,12 +437,20 @@ final class ProxySession {
 
 final class SessionChunkPrefetcher: NSObject, URLSessionDataDelegate {
     unowned let session: ProxySession
+    private static let prefetchQueue: OperationQueue = {
+        let q = OperationQueue()
+        q.maxConcurrentOperationCount = 2
+        q.qualityOfService = .userInitiated
+        return q
+    }()
+
     private var urlSession: URLSession?
     private var task: URLSessionDataTask?
     private var handle: FileHandle?
     private(set) var chunkIndex: Int64 = -1
     private var expectedBytes: Int64 = 0
     private var receivedBytes: Int64 = 0
+    private var writeBuffer = Data()
 
     init(session: ProxySession) {
         self.session = session
@@ -449,7 +460,8 @@ final class SessionChunkPrefetcher: NSObject, URLSessionDataDelegate {
         config.timeoutIntervalForRequest = 60
         config.timeoutIntervalForResource = 3600
         config.waitsForConnectivity = true
-        self.urlSession = URLSession(configuration: config, delegate: self, delegateQueue: session.server.makeDelegateQueue())
+        config.httpMaximumConnectionsPerHost = 4
+        self.urlSession = URLSession(configuration: config, delegate: self, delegateQueue: SessionChunkPrefetcher.prefetchQueue)
     }
 
     func cancel() {
@@ -477,10 +489,14 @@ final class SessionChunkPrefetcher: NSObject, URLSessionDataDelegate {
         self.handle = h
         self.expectedBytes = endByte - startByte + 1
         self.receivedBytes = 0
+        self.writeBuffer.removeAll(keepingCapacity: true)
 
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 60)
         request.httpMethod = "GET"
         session.headers.forEach { request.setValue($1, forHTTPHeaderField: $0) }
+        if request.value(forHTTPHeaderField: "User-Agent") == nil {
+            request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
+        }
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         request.setValue("bytes=\(startByte)-\(endByte)", forHTTPHeaderField: "Range")
 
@@ -490,7 +506,16 @@ final class SessionChunkPrefetcher: NSObject, URLSessionDataDelegate {
         t?.resume()
     }
 
+    private func flushBuffer() {
+        guard !writeBuffer.isEmpty, let h = handle else { return }
+        let dataToFlush = writeBuffer
+        writeBuffer.removeAll(keepingCapacity: true)
+        try? h.write(contentsOf: dataToFlush)
+    }
+
     private func cleanup() {
+        flushBuffer()
+        writeBuffer.removeAll(keepingCapacity: false)
         if chunkIndex >= 0 {
             session.inFlightChunks.remove(chunkIndex)
         }
@@ -512,12 +537,11 @@ final class SessionChunkPrefetcher: NSObject, URLSessionDataDelegate {
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        guard !data.isEmpty, let h = handle else { return }
-        do {
-            try h.write(contentsOf: data)
-            receivedBytes += Int64(data.count)
-        } catch {
-            dataTask.cancel()
+        guard !data.isEmpty, handle != nil else { return }
+        writeBuffer.append(data)
+        receivedBytes += Int64(data.count)
+        if writeBuffer.count >= 512 * 1024 {
+            flushBuffer()
         }
     }
 
@@ -966,6 +990,9 @@ final class UpstreamFetch: NSObject, URLSessionDataDelegate {
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 60)
         request.httpMethod = "GET"
         session.headers.forEach { request.setValue($1, forHTTPHeaderField: $0) }
+        if request.value(forHTTPHeaderField: "User-Agent") == nil {
+            request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
+        }
         // Byte-exact cache: never accept transformed encodings.
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         if let range {
