@@ -113,6 +113,8 @@ internal fun PlayerTimeline(
     // Samin: fraction of the file saved to disk by the temp playback cache.
     // Drawn as a subtle brighter-gray stretch (PotPlayer-style).
     cachedFraction: Float? = null,
+    // Samin: where the saved region starts (mirror resumes at the playhead).
+    cachedStartFraction: Float = 0f,
 ) {
     val durationMs = snapshot.durationMs.coerceAtLeast(0L)
     val rangeEnd = durationMs.coerceAtLeast(1L).toFloat()
@@ -120,6 +122,7 @@ internal fun PlayerTimeline(
     // it was visual noise answering nothing useful. Track shows base,
     // saved (solid gray) and played only.
     val savedFraction = cachedFraction?.coerceIn(0f, 1f).takeIf { it != null && it > 0f }
+    val savedStart = cachedStartFraction.coerceIn(0f, 1f)
     val accentBrush = MaterialTheme.themePalette.accentBrush()
     val description = stringResource(Res.string.player_seek_position)
     var scrubPosition by remember { mutableStateOf<Long?>(null) }
@@ -165,13 +168,18 @@ internal fun PlayerTimeline(
                                 cornerRadius = radius,
                             )
                             if (savedFraction != null) {
-                                // Samin saved-to-disk stretch: solid neutral gray.
-                                drawRoundRect(
-                                    color = Color(0.62f, 0.62f, 0.64f),
-                                    topLeft = trackOrigin,
-                                    size = Size(size.width * savedFraction, trackHeight),
-                                    cornerRadius = radius,
-                                )
+                                // Samin saved-to-disk stretch: solid neutral gray,
+                                // growing forward from where the mirror resumed.
+                                val startX = size.width * minOf(savedStart, savedFraction)
+                                val endX = size.width * savedFraction
+                                if (endX > startX) {
+                                    drawRoundRect(
+                                        color = Color(0.62f, 0.62f, 0.64f),
+                                        topLeft = trackOrigin.copy(x = trackOrigin.x + startX),
+                                        size = Size(endX - startX, trackHeight),
+                                        cornerRadius = radius,
+                                    )
+                                }
                             }
                             drawRoundRect(
                                 brush = accentBrush,

@@ -118,8 +118,9 @@ internal fun PlayerControlsShell(
     onScrubFinished: (Long) -> Unit,
     horizontalSafePadding: androidx.compose.ui.unit.Dp,
     modifier: Modifier = Modifier,
-    // Samin: temp-cache saved fraction, drawn as subtle gray on the timeline.
+    // Samin: temp-cache saved region, drawn as subtle gray on the timeline.
     cachedFraction: Float? = null,
+    cachedStartFraction: Float = 0f,
 ) {
     val density = LocalDensity.current
     var timelineHeight by remember { mutableStateOf(0.dp) }
@@ -292,6 +293,7 @@ internal fun PlayerControlsShell(
                             onScrubFinished(it)
                         },
                         cachedFraction = cachedFraction,
+                        cachedStartFraction = cachedStartFraction,
                     )
                     PlayerControlActions(
                         playbackSnapshot = playbackSnapshot,

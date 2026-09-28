@@ -41,15 +41,9 @@ internal fun PlayerDestination(
     LaunchedEffect(launch.videoId) {
         launch.videoId?.let { ResumePromptRepository.markPlayerEntered(it) }
     }
-    // Samin temp cache: play instantly from remote while mirroring to Caches.
-    // Deleted on close (here + disposeRouteResources).
-    LaunchedEffect(route.launchId, launch.sourceUrl) {
-        TempPlaybackCache.start(
-            launchId = route.launchId,
-            sourceUrl = launch.sourceUrl,
-            headers = launch.sourceHeaders,
-        )
-    }
+    // Samin temp cache: the mirror starts from the player runtime once
+    // playback runs smoothly (see BindPlayerRuntimeEffects) so it never
+    // steals bandwidth during startup stalls; it is deleted here on close.
     DisposableEffect(route.launchId) {
         onDispose {
             TempPlaybackCache.cancelAndDelete(route.launchId)

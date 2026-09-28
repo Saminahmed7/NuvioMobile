@@ -32,7 +32,9 @@ internal actual object TempPlaybackCachePlatform {
         launchId: Long,
         sourceUrl: String,
         headers: Map<String, String>,
-        onProgress: (downloadedBytes: Long, totalBytes: Long?) -> Unit,
+        startPositionMs: Long,
+        durationMs: Long,
+        onProgress: (downloadedBytes: Long, totalBytes: Long?, startBytes: Long) -> Unit,
         onComplete: () -> Unit,
     ) {
         synchronized(jobs) {
@@ -42,43 +44,18 @@ internal actual object TempPlaybackCachePlatform {
             val dest = File(tempDir(), "$launchId.bin")
             runCatching { dest.delete() }
             try {
-                val builder = Request.Builder().url(sourceUrl).get()
-                headers.forEach { (k, v) ->
-                    val key = k.trim()
-                    val value = v.trim()
-                    if (key.isNotEmpty() && value.isNotEmpty() && !key.equals("Range", ignoreCase = true)) {
-                        runCatching { builder.header(key, value) }
-                    }
+                // 1. Learn total size so the resume offset maps to the playhead.
+                val total = probeTotalBytes(sourceUrl, headers, launchId)
+                // 2. Map playback position to a byte offset (0 when unknown).
+                val startByte = if (total != null && total > 0L && durationMs > 0L && startPositionMs > 0L) {
+                    ((startPositionMs.toDouble() / durationMs.toDouble()) * total.toDouble())
+                        .toLong().coerceIn(0L, total)
+                } else {
+                    0L
                 }
-                val call = client.newCall(builder.build())
-                synchronized(jobs) {
-                    if (!jobs.containsKey(launchId)) {
-                        runCatching { call.cancel() }
-                        return@launch
-                    }
-                    calls[launchId] = call
-                }
-                onProgress(0L, null)
-                call.execute().use { response ->
-                    if (!response.isSuccessful) error("http ${response.code}")
-                    val total = response.header("Content-Length")?.toLongOrNull()?.takeIf { it > 0L }
-                    val body = checkNotNull(response.body)
-                    var downloaded = 0L
-                    dest.outputStream().use { out ->
-                        body.byteStream().use { input ->
-                            val buf = ByteArray(256 * 1024)
-                            while (true) {
-                                val n = input.read(buf)
-                                if (n < 0) break
-                                out.write(buf, 0, n)
-                                downloaded += n
-                                onProgress(downloaded, total)
-                            }
-                            out.flush()
-                        }
-                    }
-                    onComplete()
-                }
+                // 3. Download (ranged when possible) while reporting true totals.
+                downloadToFile(sourceUrl, headers, dest, launchId, startByte, onProgress)
+                onComplete()
             } catch (_: Throwable) {
                 runCatching { dest.delete() }
             } finally {
@@ -89,7 +66,6 @@ internal actual object TempPlaybackCachePlatform {
             }
         }
         synchronized(jobs) {
-            // Register before any early-exit check inside the coroutine.
             if (jobs.containsKey(launchId)) {
                 job.cancel()
                 return
@@ -116,6 +92,99 @@ internal actual object TempPlaybackCachePlatform {
         runCatching {
             tempDir().listFiles()?.forEach { runCatching { it.delete() } }
         }
+    }
+
+    private fun baseRequest(sourceUrl: String, headers: Map<String, String>): Request.Builder {
+        val builder = Request.Builder().url(sourceUrl)
+        headers.forEach { (k, v) ->
+            val key = k.trim()
+            val value = v.trim()
+            if (key.isNotEmpty() && value.isNotEmpty() && !key.equals("Range", ignoreCase = true)) {
+                runCatching { builder.header(key, value) }
+            }
+        }
+        // Byte-exact caching: never accept a transformed encoding.
+        runCatching { builder.header("Accept-Encoding", "identity") }
+        return builder
+    }
+
+    private fun trackCall(launchId: Long, call: Call): Boolean {
+        synchronized(jobs) {
+            if (!jobs.containsKey(launchId)) {
+                runCatching { call.cancel() }
+                return false
+            }
+            calls[launchId] = call
+            return true
+        }
+    }
+
+    private fun probeTotalBytes(sourceUrl: String, headers: Map<String, String>, launchId: Long): Long? {
+        val call = client.newCall(baseRequest(sourceUrl, headers).head().build())
+        if (!trackCall(launchId, call)) return null
+        call.execute().use { response ->
+            if (!response.isSuccessful) return null
+            return response.header("Content-Length")?.toLongOrNull()?.takeIf { it > 0L }
+        }
+    }
+
+    private fun downloadToFile(
+        sourceUrl: String,
+        headers: Map<String, String>,
+        dest: File,
+        launchId: Long,
+        startByte: Long,
+        onProgress: (Long, Long?, Long) -> Unit,
+    ) {
+        val builder = baseRequest(sourceUrl, headers).get()
+        if (startByte > 0L) {
+            runCatching { builder.header("Range", "bytes=$startByte-") }
+        }
+        val call = client.newCall(builder.build())
+        if (!trackCall(launchId, call)) return
+        onProgress(0L, null, 0L)
+        call.execute().use { response ->
+            val code = response.code
+            if (code != 200 && code != 206) error("http $code")
+            val effectiveStart: Long
+            val total: Long?
+            if (code == 206 && startByte > 0L) {
+                effectiveStart = startByte
+                total = parseContentRangeTotal(response.header("Content-Range"))
+                    ?: response.header("Content-Length")?.toLongOrNull()
+                        ?.takeIf { it > 0L }?.let { effectiveStart + it }
+            } else {
+                // Server ignored Range (or none requested): full body from byte 0.
+                effectiveStart = 0L
+                total = response.header("Content-Length")?.toLongOrNull()?.takeIf { it > 0L }
+            }
+            val body = checkNotNull(response.body)
+            var downloaded = 0L
+            onProgress(0L, total, effectiveStart)
+            dest.outputStream().use { out ->
+                body.byteStream().use { input ->
+                    val buf = ByteArray(256 * 1024)
+                    while (true) {
+                        val n = input.read(buf)
+                        if (n < 0) break
+                        out.write(buf, 0, n)
+                        downloaded += n
+                        onProgress(downloaded, total, effectiveStart)
+                    }
+                    out.flush()
+                }
+            }
+        }
+    }
+
+    private fun parseContentRangeTotal(headerValue: String?): Long? {
+        val value = headerValue?.trim().orEmpty()
+        if (value.isBlank()) return null
+        val slashIndex = value.lastIndexOf('/')
+        if (slashIndex == -1 || slashIndex == value.lastIndex) return null
+        val totalPart = value.substring(slashIndex + 1).trim()
+        if (totalPart == "*") return null
+        return totalPart.toLongOrNull()?.takeIf { it > 0L }
     }
 
     private fun tempDir(): File {

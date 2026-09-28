@@ -13,8 +13,8 @@ import kotlinx.coroutines.launch
 import platform.Foundation.NSData
 import platform.Foundation.NSFileManager
 import platform.Foundation.NSHomeDirectory
-import platform.Foundation.NSLock
 import platform.Foundation.NSHTTPURLResponse
+import platform.Foundation.NSLock
 import platform.Foundation.NSMutableURLRequest
 import platform.Foundation.NSOperationQueue
 import platform.Foundation.NSURL
@@ -60,7 +60,9 @@ internal actual object TempPlaybackCachePlatform {
         launchId: Long,
         sourceUrl: String,
         headers: Map<String, String>,
-        onProgress: (downloadedBytes: Long, totalBytes: Long?) -> Unit,
+        startPositionMs: Long,
+        durationMs: Long,
+        onProgress: (downloadedBytes: Long, totalBytes: Long?, startBytes: Long) -> Unit,
         onComplete: () -> Unit,
     ) {
         locked {
@@ -72,7 +74,17 @@ internal actual object TempPlaybackCachePlatform {
             // Fresh mirror per playback; stale file from a crashed session is removed.
             removeIfExists(dest)
             try {
-                downloadToFile(sourceUrl, headers, dest, launchId, onProgress)
+                // 1. Learn total size so the resume offset maps to the playhead.
+                val total = probeTotalBytes(sourceUrl, headers, launchId)
+                // 2. Map playback position to a byte offset (0 when unknown).
+                val startByte = if (total != null && total > 0L && durationMs > 0L && startPositionMs > 0L) {
+                    ((startPositionMs.toDouble() / durationMs.toDouble()) * total.toDouble())
+                        .toLong().coerceIn(0L, total)
+                } else {
+                    0L
+                }
+                // 3. Download (ranged when possible) while reporting true totals.
+                downloadToFile(sourceUrl, headers, dest, launchId, startByte, onProgress)
                 onComplete()
             } catch (_: Throwable) {
                 // Silent: playback already runs from remote URL; mirror is best-effort.
@@ -128,20 +140,13 @@ internal actual object TempPlaybackCachePlatform {
         }
     }
 
-    private suspend fun downloadToFile(
-        sourceUrl: String,
-        headers: Map<String, String>,
-        dest: String,
-        launchId: Long,
-        onProgress: (Long, Long?) -> Unit,
-    ) {
+    private fun baseRequest(sourceUrl: String, headers: Map<String, String>): NSMutableURLRequest {
         val url = NSURL(string = sourceUrl)
         val request = NSMutableURLRequest(
             uRL = url,
             cachePolicy = NSURLRequestReloadIgnoringLocalCacheData,
             timeoutInterval = TEMP_REQUEST_TIMEOUT,
         )
-        request.setHTTPMethod("GET")
         headers.forEach { (k, v) ->
             val key = k.trim()
             val value = v.trim()
@@ -149,8 +154,11 @@ internal actual object TempPlaybackCachePlatform {
                 request.setValue(value, forHTTPHeaderField = key)
             }
         }
-        val delegate = TempMirrorDelegate(dest, onProgress)
-        val config = NSURLSessionConfiguration.defaultSessionConfiguration().apply {
+        return request
+    }
+
+    private fun newSession(): NSURLSessionConfiguration =
+        NSURLSessionConfiguration.defaultSessionConfiguration().apply {
             timeoutIntervalForRequest = TEMP_REQUEST_TIMEOUT
             timeoutIntervalForResource = TEMP_RESOURCE_TIMEOUT
             waitsForConnectivity = true
@@ -158,13 +166,21 @@ internal actual object TempPlaybackCachePlatform {
             allowsExpensiveNetworkAccess = true
             allowsConstrainedNetworkAccess = true
         }
+
+    private suspend fun probeTotalBytes(
+        sourceUrl: String,
+        headers: Map<String, String>,
+        launchId: Long,
+    ): Long? {
+        val request = baseRequest(sourceUrl, headers)
+        request.setHTTPMethod("HEAD")
+        val delegate = TempHeadDelegate()
         val session = NSURLSession.sessionWithConfiguration(
-            configuration = config,
+            configuration = newSession(),
             delegate = delegate,
             delegateQueue = NSOperationQueue().apply { maxConcurrentOperationCount = 1 },
         )
         locked {
-            // Only track if still wanted; otherwise abort immediately.
             if (!jobs.containsKey(launchId)) {
                 session.invalidateAndCancel()
                 throw CancellationException()
@@ -179,7 +195,50 @@ internal actual object TempPlaybackCachePlatform {
             }
             tasks[launchId] = task
         }
-        onProgress(0L, null)
+        task.resume()
+        try {
+            return delegate.await()
+        } finally {
+            session.finishTasksAndInvalidate()
+        }
+    }
+
+    private suspend fun downloadToFile(
+        sourceUrl: String,
+        headers: Map<String, String>,
+        dest: String,
+        launchId: Long,
+        startByte: Long,
+        onProgress: (Long, Long?, Long) -> Unit,
+    ) {
+        val request = baseRequest(sourceUrl, headers)
+        request.setHTTPMethod("GET")
+        val ranged = startByte > 0L
+        if (ranged) {
+            request.setValue("bytes=$startByte-", forHTTPHeaderField = "Range")
+        }
+        val delegate = TempMirrorDelegate(dest, startByte, onProgress)
+        val session = NSURLSession.sessionWithConfiguration(
+            configuration = newSession(),
+            delegate = delegate,
+            delegateQueue = NSOperationQueue().apply { maxConcurrentOperationCount = 1 },
+        )
+        locked {
+            if (!jobs.containsKey(launchId)) {
+                session.invalidateAndCancel()
+                throw CancellationException()
+            }
+            sessions[launchId] = session
+        }
+        val task = session.dataTaskWithRequest(request)
+        locked {
+            if (!jobs.containsKey(launchId)) {
+                session.invalidateAndCancel()
+                throw CancellationException()
+            }
+            tasks[launchId] = task
+        }
+        onProgress(0L, null, 0L)
         task.resume()
         try {
             delegate.await()
@@ -190,14 +249,53 @@ internal actual object TempPlaybackCachePlatform {
 }
 
 @OptIn(ExperimentalForeignApi::class)
+private class TempHeadDelegate : NSObject(), NSURLSessionDataDelegateProtocol {
+    private val done = CompletableDeferred<Long?>()
+    private var total: Long? = null
+
+    suspend fun await(): Long? = done.await()
+
+    override fun URLSession(
+        session: NSURLSession,
+        dataTask: NSURLSessionDataTask,
+        didReceiveResponse: NSURLResponse,
+        completionHandler: (Long) -> Unit,
+    ) {
+        val http = didReceiveResponse as? NSHTTPURLResponse
+        val code = http?.statusCode?.toInt() ?: 0
+        total = if (code in 200..299) {
+            http?.valueForHTTPHeaderField("Content-Length")?.toLongOrNull()?.takeIf { it > 0L }
+        } else {
+            null
+        }
+        // Headers only; refuse the body.
+        completionHandler(0L)
+    }
+
+    override fun URLSession(
+        session: NSURLSession,
+        task: NSURLSessionTask,
+        didCompleteWithError: platform.Foundation.NSError?,
+    ) {
+        if (didCompleteWithError != null) {
+            done.complete(null)
+        } else {
+            done.complete(total)
+        }
+    }
+}
+
+@OptIn(ExperimentalForeignApi::class)
 private class TempMirrorDelegate(
     private val dest: String,
-    private val onProgress: (Long, Long?) -> Unit,
+    private val requestedStartByte: Long,
+    private val onProgress: (Long, Long?, Long) -> Unit,
 ) : NSObject(), NSURLSessionDataDelegateProtocol {
     private val done = CompletableDeferred<Unit>()
     private var file: CPointer<FILE>? = null
     private var downloaded = 0L
     private var total: Long? = null
+    private var effectiveStartByte = 0L
     private var failed: Throwable? = null
 
     suspend fun await() = done.await()
@@ -210,17 +308,25 @@ private class TempMirrorDelegate(
     ) {
         val http = didReceiveResponse as? NSHTTPURLResponse
         val code = http?.statusCode?.toInt() ?: 200
-        if (code !in 200..299) {
+        if (code == 206 && requestedStartByte > 0L) {
+            effectiveStartByte = requestedStartByte
+            total = parseContentRangeTotal(http?.valueForHTTPHeaderField("Content-Range"))
+                ?: http?.valueForHTTPHeaderField("Content-Length")?.toLongOrNull()
+                    ?.takeIf { it > 0L }?.let { effectiveStartByte + it }
+        } else if (code in 200..299) {
+            // Server ignored Range (or none requested): full body from byte 0.
+            effectiveStartByte = 0L
+            total = http?.valueForHTTPHeaderField("Content-Length")?.toLongOrNull()?.takeIf { it > 0L }
+        } else {
             failed = IllegalStateException("http $code")
             completionHandler(0L)
             return
         }
-        total = http?.valueForHTTPHeaderField("Content-Length")?.toLongOrNull()?.takeIf { it > 0L }
         file = fopen(dest, "wb")
         if (file == null) {
             failed = IllegalStateException("open temp file failed")
         }
-        onProgress(0L, total)
+        onProgress(0L, total, effectiveStartByte)
         completionHandler(1L)
     }
 
@@ -241,7 +347,7 @@ private class TempMirrorDelegate(
         }
         fflush(out)
         downloaded += n
-        onProgress(downloaded, total)
+        onProgress(downloaded, total, effectiveStartByte)
     }
 
     override fun URLSession(
@@ -258,4 +364,14 @@ private class TempMirrorDelegate(
         failed?.let { done.completeExceptionally(it); return }
         done.complete(Unit)
     }
+}
+
+private fun parseContentRangeTotal(headerValue: String?): Long? {
+    val value = headerValue?.trim().orEmpty()
+    if (value.isBlank()) return null
+    val slashIndex = value.lastIndexOf('/')
+    if (slashIndex == -1 || slashIndex == value.lastIndex) return null
+    val totalPart = value.substring(slashIndex + 1).trim()
+    if (totalPart == "*") return null
+    return totalPart.toLongOrNull()?.takeIf { it > 0L }
 }

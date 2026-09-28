@@ -116,6 +116,25 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         WatchProgressRepository.ensureLoaded()
     }
 
+    // Samin temp mirror: starts only once playback runs smoothly (never
+    // during startup stalls, so it can't steal bandwidth from first frames),
+    // resuming from the current playhead. Deleted on player close.
+    // TempPlaybackCache.start is idempotent per launchId.
+    LaunchedEffect(activeSourceUrl, playbackSnapshot.isLoading, playbackSnapshot.durationMs) {
+        val url = activeSourceUrl
+        if (!TempPlaybackCache.shouldMirror(url)) return@LaunchedEffect
+        if (playbackSnapshot.isLoading) return@LaunchedEffect
+        val duration = playbackSnapshot.durationMs.takeIf { it > 0L } ?: return@LaunchedEffect
+        val launchId = args.launchId ?: return@LaunchedEffect
+        TempPlaybackCache.start(
+            launchId = launchId,
+            sourceUrl = url,
+            headers = activeSourceHeaders,
+            startPositionMs = playbackSnapshot.positionMs.coerceAtLeast(0L),
+            durationMs = duration,
+        )
+    }
+
     LaunchedEffect(
         activeTorrentInfoHash,
         activeTorrentFileIdx,

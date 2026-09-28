@@ -115,14 +115,15 @@ jobs:
             echo "Could not read version info." >&2
             exit 1
           fi
-          # Each Samin rebuild gets its own version string (e.g. 0.5.3-samin1)
-          # because SideStore only offers an Update button when the version
-          # string differs — build-number-only changes are ignored.
-          # The build number is always max(existing)+1 so it also sorts above
-          # anything already installed (a lower build can read as "older").
-          # Newer upstream versions always sort above older ones.
-          SAMIN_REV="$(( $(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq "[.[] | select(.tag_name | startswith(\"samin-v${BASE_VERSION}-samin\"))] | length") + 1 ))"
-          SAMIN_VERSION="${BASE_VERSION}-samin${SAMIN_REV}"
+          # SideStore decides updates by numeric major.minor.patch core only:
+          # "-samin" suffixes parse as pre-releases and rank BELOW the same
+          # stable, and build numbers alone are ignored. So each Samin rebuild
+          # bumps the patch core: upstream 0.5.3 -> 0.5.3001, 0.5.3002, ...;
+          # upstream 0.5.4 -> 0.5.4001, ... Newer upstream always sorts above.
+          SAMIN_REV="$(( $(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq '[.[] | select(.tag_name | startswith("samin-v"))] | length') + 1 ))"
+          PATCH_NUM="$(echo "${BASE_VERSION}" | awk -F. '{print $3 + 0}')"
+          MAJOR_MINOR="$(echo "${BASE_VERSION}" | awk -F. '{print $1 "." $2}')"
+          SAMIN_VERSION="${MAJOR_MINOR}.$((PATCH_NUM * 1000 + SAMIN_REV))"
           MAX_BUILD="$(jq -r '[.apps[] | select(.bundleIdentifier == "com.nuvio.media") | .versions[].buildVersion | tonumber] | max // 0' store-samin.json)"
           SAMIN_BUILD="$((MAX_BUILD + 1))"
           sed -i '' -E "s/^(MARKETING_VERSION=).*/\1${SAMIN_VERSION}/" "${VERSION_FILE}"
