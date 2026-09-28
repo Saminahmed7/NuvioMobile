@@ -1,6 +1,7 @@
 package com.nuvio.app.features.player
 
 import android.content.Context
+import android.os.StatFs
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -41,7 +42,7 @@ internal actual object TempPlaybackCachePlatform {
             if (jobs.containsKey(launchId)) return
         }
         val job = scope.launch {
-            val dest = File(tempDir(), "$launchId.bin")
+            val dest = tailFile(launchId)
             runCatching { dest.delete() }
             try {
                 // 1. Learn total size so the resume offset maps to the playhead.
@@ -54,7 +55,7 @@ internal actual object TempPlaybackCachePlatform {
                     0L
                 }
                 // 3. Download (ranged when possible) while reporting true totals.
-                downloadToFile(sourceUrl, headers, dest, launchId, startByte, onProgress)
+                downloadToFile(sourceUrl, headers, dest, launchId, startByte, onProgress, isHead = false)
                 onComplete()
             } catch (_: Throwable) {
                 runCatching { dest.delete() }
@@ -74,12 +75,64 @@ internal actual object TempPlaybackCachePlatform {
         }
     }
 
+    actual fun fetchHead(
+        launchId: Long,
+        sourceUrl: String,
+        headers: Map<String, String>,
+        headBytes: Long,
+        onProgress: (headDownloadedBytes: Long) -> Unit,
+        onComplete: () -> Unit,
+    ) {
+        if (headBytes <= 0L) return
+        val key = headJobKey(launchId)
+        synchronized(jobs) {
+            if (jobs.containsKey(key)) return
+        }
+        val job = scope.launch {
+            val dest = headFile(launchId)
+            runCatching { dest.delete() }
+            try {
+                downloadToFile(
+                    sourceUrl = sourceUrl,
+                    headers = headers,
+                    dest = dest,
+                    launchId = key,
+                    realLaunchId = launchId,
+                    startByte = 0L,
+                    headCapBytes = headBytes,
+                    onProgress = { downloaded, _, _ -> onProgress(downloaded) },
+                    isHead = true,
+                )
+                onComplete()
+            } catch (_: Throwable) {
+                runCatching { dest.delete() }
+            } finally {
+                synchronized(jobs) {
+                    jobs.remove(key)
+                    calls.remove(key)
+                }
+            }
+        }
+        synchronized(jobs) {
+            if (jobs.containsKey(key)) {
+                job.cancel()
+                return
+            }
+            jobs[key] = job
+        }
+    }
+
     actual fun cancelAndDelete(launchId: Long) {
+        val key = headJobKey(launchId)
         synchronized(jobs) {
             jobs.remove(launchId)?.cancel()
+            jobs.remove(key)?.cancel()
             calls.remove(launchId)?.let { runCatching { it.cancel() } }
+            calls.remove(key)?.let { runCatching { it.cancel() } }
         }
-        runCatching { File(tempDir(), "$launchId.bin").delete() }
+        runCatching { tailFile(launchId).delete() }
+        runCatching { headFile(launchId).delete() }
+        runCatching { legacyFile(launchId).delete() }
     }
 
     actual fun deleteAllTemp() {
@@ -90,9 +143,21 @@ internal actual object TempPlaybackCachePlatform {
             calls.clear()
         }
         runCatching {
-            tempDir().listFiles()?.forEach { runCatching { it.delete() } }
+            tempDir().listFiles()
+                ?.filter { it.isFile && it.name.endsWith(".bin") }
+                ?.forEach { runCatching { it.delete() } }
         }
     }
+
+    actual fun freeSpaceBytes(): Long {
+        val root = runCatching { tempDir() }.getOrNull() ?: return Long.MAX_VALUE
+        return runCatching {
+            val stat = StatFs(root.path)
+            stat.availableBytes
+        }.getOrDefault(Long.MAX_VALUE)
+    }
+
+    private fun headJobKey(launchId: Long): Long = Long.MIN_VALUE xor launchId
 
     private fun baseRequest(sourceUrl: String, headers: Map<String, String>): Request.Builder {
         val builder = Request.Builder().url(sourceUrl)
@@ -133,12 +198,17 @@ internal actual object TempPlaybackCachePlatform {
         headers: Map<String, String>,
         dest: File,
         launchId: Long,
+        realLaunchId: Long = launchId,
         startByte: Long,
+        headCapBytes: Long = 0L,
         onProgress: (Long, Long?, Long) -> Unit,
+        isHead: Boolean,
     ) {
         val builder = baseRequest(sourceUrl, headers).get()
-        if (startByte > 0L) {
+        if (!isHead && startByte > 0L) {
             runCatching { builder.header("Range", "bytes=$startByte-") }
+        } else if (isHead && headCapBytes > 0L) {
+            runCatching { builder.header("Range", "bytes=0-${headCapBytes - 1}") }
         }
         val call = client.newCall(builder.build())
         if (!trackCall(launchId, call)) return
@@ -148,33 +218,63 @@ internal actual object TempPlaybackCachePlatform {
             if (code != 200 && code != 206) error("http $code")
             val effectiveStart: Long
             val total: Long?
-            if (code == 206 && startByte > 0L) {
+            if (code == 206 && !isHead && startByte > 0L) {
                 effectiveStart = startByte
                 total = parseContentRangeTotal(response.header("Content-Range"))
                     ?: response.header("Content-Length")?.toLongOrNull()
                         ?.takeIf { it > 0L }?.let { effectiveStart + it }
             } else {
-                // Server ignored Range (or none requested): full body from byte 0.
+                // Server ignored Range (or none requested): body starts at byte 0.
+                // A capped head fetch keeps only the requested prefix.
                 effectiveStart = 0L
-                total = response.header("Content-Length")?.toLongOrNull()?.takeIf { it > 0L }
+                total = if (isHead && headCapBytes > 0L) {
+                    maxOf(
+                        headCapBytes,
+                        response.header("Content-Length")?.toLongOrNull() ?: 0L,
+                    ).takeIf { it > 0L }
+                } else {
+                    response.header("Content-Length")?.toLongOrNull()?.takeIf { it > 0L }
+                }
             }
             val body = checkNotNull(response.body)
             var downloaded = 0L
+            var sinceSpaceCheck = 0L
             onProgress(0L, total, effectiveStart)
             dest.outputStream().use { out ->
                 body.byteStream().use { input ->
                     val buf = ByteArray(256 * 1024)
                     while (true) {
-                        val n = input.read(buf)
+                        if (isHead && headCapBytes > 0L && downloaded >= headCapBytes) break
+                        var n = input.read(buf)
                         if (n < 0) break
+                        if (isHead && headCapBytes > 0L) {
+                            n = minOf(n.toLong(), headCapBytes - downloaded).toInt()
+                        }
                         out.write(buf, 0, n)
                         downloaded += n
                         onProgress(downloaded, total, effectiveStart)
+                        if (!isHead) {
+                            sinceSpaceCheck += n
+                            if (sinceSpaceCheck >= TempPlaybackCache.SPACE_CHECK_INTERVAL_BYTES) {
+                                sinceSpaceCheck = 0L
+                                if (!enforceSpacePolicy(realLaunchId)) return
+                            }
+                        }
                     }
                     out.flush()
                 }
             }
         }
+    }
+
+    /**
+     * Returns false when the download must stop growing. Watched history is
+     * evicted first; the unwatched forward part is always kept.
+     */
+    private fun enforceSpacePolicy(realLaunchId: Long): Boolean {
+        if (freeSpaceBytes() >= TempPlaybackCache.LOW_SPACE_STOP_BYTES) return true
+        runCatching { headFile(realLaunchId).delete() }
+        return freeSpaceBytes() >= TempPlaybackCache.LOW_SPACE_STOP_BYTES
     }
 
     private fun parseContentRangeTotal(headerValue: String?): Long? {
@@ -191,4 +291,10 @@ internal actual object TempPlaybackCachePlatform {
         val base = appContext?.cacheDir ?: File(System.getProperty("java.io.tmpdir") ?: ".")
         return File(base, "nuvio_temp_playback")
     }
+
+    private fun tailFile(launchId: Long): File = File(tempDir(), "$launchId.tail.bin")
+
+    private fun headFile(launchId: Long): File = File(tempDir(), "$launchId.head.bin")
+
+    private fun legacyFile(launchId: Long): File = File(tempDir(), "$launchId.bin")
 }

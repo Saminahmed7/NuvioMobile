@@ -121,6 +121,7 @@ internal fun PlayerControlsShell(
     // Samin: temp-cache saved region, drawn as subtle gray on the timeline.
     cachedFraction: Float? = null,
     cachedStartFraction: Float = 0f,
+    cachedHeadFraction: Float = 0f,
 ) {
     val density = LocalDensity.current
     var timelineHeight by remember { mutableStateOf(0.dp) }
@@ -294,6 +295,7 @@ internal fun PlayerControlsShell(
                         },
                         cachedFraction = cachedFraction,
                         cachedStartFraction = cachedStartFraction,
+                        cachedHeadFraction = cachedHeadFraction,
                     )
                     PlayerControlActions(
                         playbackSnapshot = playbackSnapshot,

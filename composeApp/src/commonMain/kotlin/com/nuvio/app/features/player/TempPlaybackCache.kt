@@ -10,24 +10,28 @@ import kotlinx.coroutines.flow.update
  *
  * Plays instantly from the remote URL (good for slow connections) while a
  * background mirror writes the same bytes to the app Caches directory.
- * The temp file is deleted when the player closes (see disposeRouteResources
+ * The temp files are deleted when the player closes (see disposeRouteResources
  * for PlayerRoute + PlayerDestination DisposableEffect).
  *
  * Position-aware: the mirror starts at the current playback position
  * (not byte 0), so on a slow link bandwidth serves what is about to be
- * watched instead of the beginning of a large file. The timeline's gray
- * segment therefore grows forward from the playhead. Only progressive
- * http(s) files are mirrored. HLS (.m3u8), DASH (.mpd), torrents and
- * magnet links are skipped.
+ * watched instead of the beginning of a large file. Once the forward part
+ * is fully cached, the backward part (before the playhead) is fetched too —
+ * but only when free storage comfortably fits it. If storage runs low,
+ * the watched (backward) file is evicted first and the unwatched (forward)
+ * part is kept. Only progressive http(s) files are mirrored. HLS (.m3u8),
+ * DASH (.mpd), torrents and magnet links are skipped.
  */
 data class TempCacheStatus(
     val launchId: Long,
     val downloadedBytes: Long = 0L,
     val totalBytes: Long? = null,
     val startBytes: Long = 0L,
+    val headDownloadedBytes: Long = 0L,
+    val headComplete: Boolean = false,
     val isComplete: Boolean = false,
 ) {
-    /** Fraction of the file where the saved region starts. */
+    /** Fraction of the file where the forward saved region starts. */
     val startFraction: Float?
         get() {
             val total = totalBytes?.takeIf { it > 0L } ?: return null
@@ -35,7 +39,7 @@ data class TempCacheStatus(
             return (startBytes.toFloat() / total.toFloat()).coerceIn(0f, 1f)
         }
 
-    /** Fraction of the file saved up to (end of the saved region). */
+    /** Fraction of the file saved up to (end of the forward saved region). */
     val endFraction: Float?
         get() {
             val total = totalBytes?.takeIf { it > 0L } ?: return null
@@ -43,13 +47,29 @@ data class TempCacheStatus(
             if (end <= 0L) return null
             return (end.toFloat() / total.toFloat()).coerceIn(0f, 1f)
         }
+
+    /** Fraction of the file covered by the backward saved region. */
+    val headEndFraction: Float?
+        get() {
+            val total = totalBytes?.takeIf { it > 0L } ?: return null
+            if (headDownloadedBytes <= 0L) return null
+            return (headDownloadedBytes.toFloat() / total.toFloat()).coerceIn(0f, 1f)
+        }
 }
 
 object TempPlaybackCache {
+    // Keep this much free while mirroring; below it the mirror stops growing.
+    const val LOW_SPACE_STOP_BYTES = 300L * 1024L * 1024L
+    // Backward fetch starts only when free space fits it plus this margin.
+    const val HEAD_SPACE_MARGIN_BYTES = 500L * 1024L * 1024L
+    // How often (downloaded bytes) free space is re-checked mid-download.
+    const val SPACE_CHECK_INTERVAL_BYTES = 32L * 1024L * 1024L
+
     private val _status = MutableStateFlow<Map<Long, TempCacheStatus>>(emptyMap())
     val status: StateFlow<Map<Long, TempCacheStatus>> = _status.asStateFlow()
     // Touched from the main thread (Compose effects / navigation dispose).
     private val started = mutableSetOf<Long>()
+    private val tailDone = mutableSetOf<Long>()
 
     fun shouldMirror(url: String?): Boolean {
         val normalized = url?.trim().orEmpty()
@@ -101,12 +121,44 @@ object TempPlaybackCache {
                     val prev = current[launchId] ?: TempCacheStatus(launchId = launchId)
                     current + (launchId to prev.copy(isComplete = true))
                 }
+                if (tailDone.add(launchId)) {
+                    maybeFetchHead(launchId, sourceUrl, headers)
+                }
+            },
+        )
+    }
+
+    private fun maybeFetchHead(launchId: Long, sourceUrl: String, headers: Map<String, String>) {
+        val snapshot = _status.value[launchId] ?: return
+        val behind = snapshot.startBytes
+        if (behind <= 0L || snapshot.headComplete) return
+        val free = runCatching { TempPlaybackCachePlatform.freeSpaceBytes() }.getOrNull() ?: return
+        if (free < behind + HEAD_SPACE_MARGIN_BYTES) return
+        TempPlaybackCachePlatform.fetchHead(
+            launchId = launchId,
+            sourceUrl = sourceUrl,
+            headers = headers,
+            headBytes = behind,
+            onProgress = { headDownloaded ->
+                _status.update { current ->
+                    val prev = current[launchId] ?: return@update current
+                    current + (launchId to prev.copy(
+                        headDownloadedBytes = headDownloaded.coerceAtLeast(0L),
+                    ))
+                }
+            },
+            onComplete = {
+                _status.update { current ->
+                    val prev = current[launchId] ?: return@update current
+                    current + (launchId to prev.copy(headComplete = true))
+                }
             },
         )
     }
 
     fun cancelAndDelete(launchId: Long) {
         started.remove(launchId)
+        tailDone.remove(launchId)
         runCatching { TempPlaybackCachePlatform.cancelAndDelete(launchId) }
         _status.update { current -> current - launchId }
     }
@@ -114,6 +166,7 @@ object TempPlaybackCache {
     fun sweepOnColdStart() {
         // Only call at app cold start when no playback is active.
         started.clear()
+        tailDone.clear()
         runCatching { TempPlaybackCachePlatform.deleteAllTemp() }
         _status.value = emptyMap()
     }
@@ -121,12 +174,17 @@ object TempPlaybackCache {
 
 /**
  * Platform mirror. Files live under the app Caches directory
- * (never Documents: no iCloud backup, OS may reclaim if needed).
+ * (never Documents: no iCloud backup, OS may reclaim if needed):
+ * `<launchId>.tail.bin` (playhead forward) and `<launchId>.head.bin`
+ * (before the playhead, fetched only after the tail completes and only
+ * when storage comfortably fits).
  *
  * Implementations first probe total size, map startPositionMs/durationMs to
  * a byte offset, then download with a Range request from there. Servers
  * without Range support fall back to a full download from byte 0
- * (reported startBytes = 0).
+ * (reported startBytes = 0). While downloading, free space is re-checked;
+ * below [TempPlaybackCache.LOW_SPACE_STOP_BYTES] the watched head file is
+ * evicted first and the download stops growing (already saved bytes kept).
  */
 internal expect object TempPlaybackCachePlatform {
     fun startMirror(
@@ -139,7 +197,18 @@ internal expect object TempPlaybackCachePlatform {
         onComplete: () -> Unit,
     )
 
+    fun fetchHead(
+        launchId: Long,
+        sourceUrl: String,
+        headers: Map<String, String>,
+        headBytes: Long,
+        onProgress: (headDownloadedBytes: Long) -> Unit,
+        onComplete: () -> Unit,
+    )
+
     fun cancelAndDelete(launchId: Long)
 
     fun deleteAllTemp()
+
+    fun freeSpaceBytes(): Long
 }

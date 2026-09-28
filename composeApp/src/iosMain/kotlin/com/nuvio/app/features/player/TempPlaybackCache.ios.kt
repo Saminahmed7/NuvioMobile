@@ -69,8 +69,7 @@ internal actual object TempPlaybackCachePlatform {
             if (jobs.containsKey(launchId)) return
         }
         val job = scope.launch {
-            val dir = tempDir()
-            val dest = "$dir/$launchId.bin"
+            val dest = tailPath(launchId)
             // Fresh mirror per playback; stale file from a crashed session is removed.
             removeIfExists(dest)
             try {
@@ -84,7 +83,7 @@ internal actual object TempPlaybackCachePlatform {
                     0L
                 }
                 // 3. Download (ranged when possible) while reporting true totals.
-                downloadToFile(sourceUrl, headers, dest, launchId, startByte, onProgress)
+                downloadToFile(sourceUrl, headers, dest, launchId, startByte, onProgress, isHead = false)
                 onComplete()
             } catch (_: Throwable) {
                 // Silent: playback already runs from remote URL; mirror is best-effort.
@@ -102,13 +101,62 @@ internal actual object TempPlaybackCachePlatform {
         }
     }
 
+    actual fun fetchHead(
+        launchId: Long,
+        sourceUrl: String,
+        headers: Map<String, String>,
+        headBytes: Long,
+        onProgress: (headDownloadedBytes: Long) -> Unit,
+        onComplete: () -> Unit,
+    ) {
+        if (headBytes <= 0L) return
+        val key = headJobKey(launchId)
+        locked {
+            if (jobs.containsKey(key)) return
+        }
+        val job = scope.launch {
+            val dest = headPath(launchId)
+            removeIfExists(dest)
+            try {
+                downloadToFile(
+                    sourceUrl = sourceUrl,
+                    headers = headers,
+                    dest = dest,
+                    launchId = key,
+                    realLaunchId = launchId,
+                    startByte = 0L,
+                    headCapBytes = headBytes,
+                    onProgress = { downloaded, _, _ -> onProgress(downloaded) },
+                    isHead = true,
+                )
+                onComplete()
+            } catch (_: Throwable) {
+                removeIfExists(dest)
+            } finally {
+                locked {
+                    jobs.remove(key)
+                    tasks.remove(key)?.let { runCatching { it.cancel() } }
+                    sessions.remove(key)?.let { runCatching { it.invalidateAndCancel() } }
+                }
+            }
+        }
+        locked {
+            jobs[key] = job
+        }
+    }
+
     actual fun cancelAndDelete(launchId: Long) {
         locked {
             jobs.remove(launchId)?.cancel()
+            jobs.remove(headJobKey(launchId))?.cancel()
             tasks.remove(launchId)?.let { runCatching { it.cancel() } }
+            tasks.remove(headJobKey(launchId))?.let { runCatching { it.cancel() } }
             sessions.remove(launchId)?.let { runCatching { it.invalidateAndCancel() } }
+            sessions.remove(headJobKey(launchId))?.let { runCatching { it.invalidateAndCancel() } }
         }
-        removeIfExists("${tempDir()}/$launchId.bin")
+        removeIfExists(tailPath(launchId))
+        removeIfExists(headPath(launchId))
+        removeIfExists(legacyPath(launchId))
     }
 
     actual fun deleteAllTemp() {
@@ -124,15 +172,33 @@ internal actual object TempPlaybackCachePlatform {
         val names = NSFileManager.defaultManager.contentsOfDirectoryAtPath(dir, null) as? List<*>
         names?.forEach {
             val name = it as? String ?: return@forEach
-            removeIfExists("$dir/$name")
+            if (name.endsWith(".bin")) removeIfExists("$dir/$name")
         }
     }
+
+    actual fun freeSpaceBytes(): Long {
+        val attrs = NSFileManager.defaultManager.attributesOfFileSystemForPath(tempDir(), null)
+        val value = attrs?.get("NSFileSystemFreeSize")
+        return when (value) {
+            is Long -> value
+            is Number -> value.toLong()
+            else -> Long.MAX_VALUE
+        }
+    }
+
+    private fun headJobKey(launchId: Long): Long = Long.MIN_VALUE xor launchId
 
     private fun tempDir(): String {
         val path = "${NSHomeDirectory().trimEnd('/')}/Library/Caches/nuvio_temp_playback"
         NSFileManager.defaultManager.createDirectoryAtPath(path, true, null, null)
         return path
     }
+
+    private fun tailPath(launchId: Long): String = "${tempDir()}/$launchId.tail.bin"
+
+    private fun headPath(launchId: Long): String = "${tempDir()}/$launchId.head.bin"
+
+    private fun legacyPath(launchId: Long): String = "${tempDir()}/$launchId.bin"
 
     private fun removeIfExists(path: String) {
         if (NSFileManager.defaultManager.fileExistsAtPath(path)) {
@@ -208,16 +274,27 @@ internal actual object TempPlaybackCachePlatform {
         headers: Map<String, String>,
         dest: String,
         launchId: Long,
+        realLaunchId: Long = launchId,
         startByte: Long,
         onProgress: (Long, Long?, Long) -> Unit,
+        isHead: Boolean,
+        headCapBytes: Long = 0L,
     ) {
         val request = baseRequest(sourceUrl, headers)
         request.setHTTPMethod("GET")
-        val ranged = startByte > 0L
-        if (ranged) {
+        if (!isHead && startByte > 0L) {
             request.setValue("bytes=$startByte-", forHTTPHeaderField = "Range")
+        } else if (isHead && headCapBytes > 0L) {
+            request.setValue("bytes=0-${headCapBytes - 1}", forHTTPHeaderField = "Range")
         }
-        val delegate = TempMirrorDelegate(dest, startByte, onProgress)
+        val delegate = TempMirrorDelegate(
+            dest = dest,
+            launchId = realLaunchId,
+            requestedStartByte = if (isHead) 0L else startByte,
+            headCapBytes = if (isHead) headCapBytes else 0L,
+            isHead = isHead,
+            onProgress = onProgress,
+        )
         val session = NSURLSession.sessionWithConfiguration(
             configuration = newSession(),
             delegate = delegate,
@@ -241,10 +318,16 @@ internal actual object TempPlaybackCachePlatform {
         onProgress(0L, null, 0L)
         task.resume()
         try {
-            delegate.await()
+            delegate.await(task)
         } finally {
             session.finishTasksAndInvalidate()
         }
+    }
+
+    internal fun evictHeadFile(launchId: Long) {
+        // Watched history goes first when storage runs low; the unwatched
+        // forward part is always kept.
+        removeIfExists(headPath(launchId))
     }
 }
 
@@ -277,18 +360,19 @@ private class TempHeadDelegate : NSObject(), NSURLSessionDataDelegateProtocol {
         task: NSURLSessionTask,
         didCompleteWithError: platform.Foundation.NSError?,
     ) {
-        if (didCompleteWithError != null) {
-            done.complete(null)
-        } else {
-            done.complete(total)
-        }
+        // A deliberate cancel after headers still lands here; the captured
+        // total is what matters.
+        done.complete(total)
     }
 }
 
 @OptIn(ExperimentalForeignApi::class)
 private class TempMirrorDelegate(
     private val dest: String,
+    private val launchId: Long,
     private val requestedStartByte: Long,
+    private val headCapBytes: Long,
+    private val isHead: Boolean,
     private val onProgress: (Long, Long?, Long) -> Unit,
 ) : NSObject(), NSURLSessionDataDelegateProtocol {
     private val done = CompletableDeferred<Unit>()
@@ -297,8 +381,17 @@ private class TempMirrorDelegate(
     private var total: Long? = null
     private var effectiveStartByte = 0L
     private var failed: Throwable? = null
+    private var sinceSpaceCheck = 0L
 
-    suspend fun await() = done.await()
+    suspend fun await(task: NSURLSessionTask) {
+        try {
+            done.await()
+        } finally {
+            // Ensure the file handle never leaks even on cancellation.
+            file?.let { fflush(it); fclose(it) }
+            file = null
+        }
+    }
 
     override fun URLSession(
         session: NSURLSession,
@@ -308,15 +401,23 @@ private class TempMirrorDelegate(
     ) {
         val http = didReceiveResponse as? NSHTTPURLResponse
         val code = http?.statusCode?.toInt() ?: 200
-        if (code == 206 && requestedStartByte > 0L) {
+        if (code == 206 && !isHead && requestedStartByte > 0L) {
             effectiveStartByte = requestedStartByte
             total = parseContentRangeTotal(http?.valueForHTTPHeaderField("Content-Range"))
                 ?: http?.valueForHTTPHeaderField("Content-Length")?.toLongOrNull()
                     ?.takeIf { it > 0L }?.let { effectiveStartByte + it }
         } else if (code in 200..299) {
-            // Server ignored Range (or none requested): full body from byte 0.
+            // Server ignored Range (or none requested): body starts at byte 0.
+            // For a capped head fetch only the prefix is kept (see below).
             effectiveStartByte = 0L
-            total = http?.valueForHTTPHeaderField("Content-Length")?.toLongOrNull()?.takeIf { it > 0L }
+            total = if (isHead && headCapBytes > 0L) {
+                maxOf(
+                    headCapBytes,
+                    http?.valueForHTTPHeaderField("Content-Length")?.toLongOrNull() ?: 0L,
+                ).takeIf { it > 0L }
+            } else {
+                http?.valueForHTTPHeaderField("Content-Length")?.toLongOrNull()?.takeIf { it > 0L }
+            }
         } else {
             failed = IllegalStateException("http $code")
             completionHandler(0L)
@@ -339,7 +440,15 @@ private class TempMirrorDelegate(
             failed = IllegalStateException("temp file not open")
             return
         }
-        val n = didReceiveData.length.toLong()
+        var n = didReceiveData.length.toLong()
+        if (isHead && headCapBytes > 0L) {
+            val remaining = headCapBytes - downloaded
+            if (remaining <= 0L) {
+                finishEarly(dataTask)
+                return
+            }
+            n = minOf(n, remaining)
+        }
         val wrote = fwrite(didReceiveData.bytes, 1.convert(), n.convert(), out).toLong()
         if (wrote != n) {
             failed = IllegalStateException("write temp file failed")
@@ -348,6 +457,17 @@ private class TempMirrorDelegate(
         fflush(out)
         downloaded += n
         onProgress(downloaded, total, effectiveStartByte)
+        if (isHead && headCapBytes > 0L && downloaded >= headCapBytes) {
+            finishEarly(dataTask)
+            return
+        }
+        if (!isHead) {
+            sinceSpaceCheck += n
+            if (sinceSpaceCheck >= TempPlaybackCache.SPACE_CHECK_INTERVAL_BYTES) {
+                sinceSpaceCheck = 0L
+                enforceSpacePolicy(dataTask)
+            }
+        }
     }
 
     override fun URLSession(
@@ -355,14 +475,37 @@ private class TempMirrorDelegate(
         task: NSURLSessionTask,
         didCompleteWithError: platform.Foundation.NSError?,
     ) {
-        file?.let { fflush(it); fclose(it) }
-        file = null
         if (didCompleteWithError != null) {
-            done.completeExceptionally(IllegalStateException(didCompleteWithError.localizedDescription))
+            // A deliberate early finish (head cap reached) cancels the task;
+            // that is success, not failure.
+            if (failed == null && isHead && headCapBytes > 0L && downloaded >= headCapBytes) {
+                done.complete(Unit)
+            } else {
+                done.completeExceptionally(IllegalStateException(didCompleteWithError.localizedDescription))
+            }
             return
         }
         failed?.let { done.completeExceptionally(it); return }
         done.complete(Unit)
+    }
+
+    private fun finishEarly(task: NSURLSessionTask) {
+        file?.let { fflush(it); fclose(it) }
+        file = null
+        if (!done.isCompleted) done.complete(Unit)
+        task.cancel()
+    }
+
+    private fun enforceSpacePolicy(task: NSURLSessionTask) {
+        if (TempPlaybackCachePlatform.freeSpaceBytes() >= TempPlaybackCache.LOW_SPACE_STOP_BYTES) return
+        if (!isHead) {
+            // Evict watched history first, keep the unwatched forward part.
+            TempPlaybackCachePlatform.evictHeadFile(launchId)
+            if (TempPlaybackCachePlatform.freeSpaceBytes() >= TempPlaybackCache.LOW_SPACE_STOP_BYTES) return
+        }
+        // Still tight: stop growing, keep what is saved so far.
+        if (!done.isCompleted) done.complete(Unit)
+        task.cancel()
     }
 }
 

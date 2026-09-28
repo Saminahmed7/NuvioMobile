@@ -270,6 +270,10 @@ private fun PlayerScreenRuntime.RenderPlayerControls(displayedPositionMs: Long, 
         val lid = args.launchId ?: return@remember null
         tempCacheStatuses[lid]?.endFraction
     }
+    val saminCachedHeadFraction = remember(tempCacheStatuses) {
+        val lid = args.launchId ?: return@remember 0f
+        tempCacheStatuses[lid]?.headEndFraction ?: 0f
+    }
     AnimatedVisibility(
         visible = (controlsVisible || showParentalGuide) && !playerControlsLocked && !isInPip,
         enter = fadeIn(),
@@ -386,6 +390,7 @@ private fun PlayerScreenRuntime.RenderPlayerControls(displayedPositionMs: Long, 
             modifier = Modifier.fillMaxSize(),
             cachedFraction = saminCachedFraction,
             cachedStartFraction = saminCachedStartFraction,
+            cachedHeadFraction = saminCachedHeadFraction,
         )
     }
 }

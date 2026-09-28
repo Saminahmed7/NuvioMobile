@@ -27,7 +27,7 @@ internal actual object TempPlaybackCachePlatform {
             if (jobs.containsKey(launchId)) return
         }
         val job = scope.launch {
-            val dest = File(tempDir(), "$launchId.bin")
+            val dest = tailFile(launchId)
             runCatching { dest.delete() }
             var connection: HttpURLConnection? = null
             try {
@@ -41,36 +41,9 @@ internal actual object TempPlaybackCachePlatform {
                     0L
                 }
                 // 3. Download (ranged when possible) while reporting true totals.
-                connection = openConnection(sourceUrl, headers, launchId, rangeStart = startByte)
+                connection = openConnection(sourceUrl, headers, launchId, rangeStart = startByte, headCap = 0L)
                     ?: return@launch
-                val code = connection.responseCode
-                if (code != 200 && code != 206) error("http $code")
-                val effectiveStart: Long
-                val trueTotal: Long?
-                if (code == 206 && startByte > 0L) {
-                    effectiveStart = startByte
-                    trueTotal = parseContentRangeTotal(connection.getHeaderField("Content-Range"))
-                        ?: connection.getHeaderField("Content-Length")?.toLongOrNull()
-                            ?.takeIf { it > 0L }?.let { effectiveStart + it }
-                } else {
-                    effectiveStart = 0L
-                    trueTotal = connection.getHeaderField("Content-Length")?.toLongOrNull()?.takeIf { it > 0L }
-                }
-                var downloaded = 0L
-                onProgress(0L, trueTotal, effectiveStart)
-                connection.inputStream.use { input ->
-                    dest.outputStream().use { out ->
-                        val buf = ByteArray(256 * 1024)
-                        while (true) {
-                            val n = input.read(buf)
-                            if (n < 0) break
-                            out.write(buf, 0, n)
-                            downloaded += n
-                            onProgress(downloaded, trueTotal, effectiveStart)
-                        }
-                        out.flush()
-                    }
-                }
+                downloadBody(connection, dest, launchId, launchId, startByte, 0L, isHead = false, onProgress)
                 onComplete()
             } catch (_: Throwable) {
                 runCatching { dest.delete() }
@@ -91,12 +64,61 @@ internal actual object TempPlaybackCachePlatform {
         }
     }
 
+    actual fun fetchHead(
+        launchId: Long,
+        sourceUrl: String,
+        headers: Map<String, String>,
+        headBytes: Long,
+        onProgress: (headDownloadedBytes: Long) -> Unit,
+        onComplete: () -> Unit,
+    ) {
+        if (headBytes <= 0L) return
+        val key = headJobKey(launchId)
+        synchronized(jobs) {
+            if (jobs.containsKey(key)) return
+        }
+        val job = scope.launch {
+            val dest = headFile(launchId)
+            runCatching { dest.delete() }
+            var connection: HttpURLConnection? = null
+            try {
+                connection = openConnection(sourceUrl, headers, key, rangeStart = 0L, headCap = headBytes)
+                    ?: return@launch
+                downloadBody(
+                    connection, dest, key, launchId, 0L, headBytes, isHead = true,
+                    onProgress = { downloaded, _, _ -> onProgress(downloaded) },
+                )
+                onComplete()
+            } catch (_: Throwable) {
+                runCatching { dest.delete() }
+            } finally {
+                runCatching { connection?.disconnect() }
+                synchronized(jobs) {
+                    jobs.remove(key)
+                    connections.remove(key)
+                }
+            }
+        }
+        synchronized(jobs) {
+            if (jobs.containsKey(key)) {
+                job.cancel()
+                return
+            }
+            jobs[key] = job
+        }
+    }
+
     actual fun cancelAndDelete(launchId: Long) {
+        val key = headJobKey(launchId)
         synchronized(jobs) {
             jobs.remove(launchId)?.cancel()
+            jobs.remove(key)?.cancel()
             connections.remove(launchId)?.let { runCatching { it.disconnect() } }
+            connections.remove(key)?.let { runCatching { it.disconnect() } }
         }
-        runCatching { File(tempDir(), "$launchId.bin").delete() }
+        runCatching { tailFile(launchId).delete() }
+        runCatching { headFile(launchId).delete() }
+        runCatching { legacyFile(launchId).delete() }
     }
 
     actual fun deleteAllTemp() {
@@ -107,15 +129,23 @@ internal actual object TempPlaybackCachePlatform {
             connections.clear()
         }
         runCatching {
-            tempDir().listFiles()?.forEach { runCatching { it.delete() } }
+            tempDir().listFiles()
+                ?.filter { it.isFile && it.name.endsWith(".bin") }
+                ?.forEach { runCatching { it.delete() } }
         }
     }
+
+    actual fun freeSpaceBytes(): Long =
+        runCatching { tempDir().usableSpace }.getOrDefault(Long.MAX_VALUE)
+
+    private fun headJobKey(launchId: Long): Long = Long.MIN_VALUE xor launchId
 
     private fun openConnection(
         sourceUrl: String,
         headers: Map<String, String>,
         launchId: Long,
         rangeStart: Long?,
+        headCap: Long,
     ): HttpURLConnection? {
         val opened = (URI(sourceUrl).toURL().openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
@@ -132,6 +162,8 @@ internal actual object TempPlaybackCachePlatform {
             runCatching { setRequestProperty("Accept-Encoding", "identity") }
             if (rangeStart != null && rangeStart > 0L) {
                 runCatching { setRequestProperty("Range", "bytes=$rangeStart-") }
+            } else if (headCap > 0L) {
+                runCatching { setRequestProperty("Range", "bytes=0-${headCap - 1}") }
             }
         }
         synchronized(jobs) {
@@ -142,6 +174,77 @@ internal actual object TempPlaybackCachePlatform {
             connections[launchId] = opened
         }
         return opened
+    }
+
+    private fun downloadBody(
+        connection: HttpURLConnection,
+        dest: File,
+        launchId: Long,
+        realLaunchId: Long,
+        startByte: Long,
+        headCap: Long,
+        isHead: Boolean,
+        onProgress: (Long, Long?, Long) -> Unit,
+    ) {
+        val code = connection.responseCode
+        if (code != 200 && code != 206) error("http $code")
+        val effectiveStart: Long
+        val trueTotal: Long?
+        if (code == 206 && !isHead && startByte > 0L) {
+            effectiveStart = startByte
+            trueTotal = parseContentRangeTotal(connection.getHeaderField("Content-Range"))
+                ?: connection.getHeaderField("Content-Length")?.toLongOrNull()
+                    ?.takeIf { it > 0L }?.let { effectiveStart + it }
+        } else {
+            // Server ignored Range (or none requested): body starts at byte 0.
+            // A capped head fetch keeps only the requested prefix.
+            effectiveStart = 0L
+            trueTotal = if (isHead && headCap > 0L) {
+                maxOf(
+                    headCap,
+                    connection.getHeaderField("Content-Length")?.toLongOrNull() ?: 0L,
+                ).takeIf { it > 0L }
+            } else {
+                connection.getHeaderField("Content-Length")?.toLongOrNull()?.takeIf { it > 0L }
+            }
+        }
+        var downloaded = 0L
+        var sinceSpaceCheck = 0L
+        onProgress(0L, trueTotal, effectiveStart)
+        connection.inputStream.use { input ->
+            dest.outputStream().use { out ->
+                val buf = ByteArray(256 * 1024)
+                while (true) {
+                    if (isHead && headCap > 0L && downloaded >= headCap) break
+                    var n = input.read(buf)
+                    if (n < 0) break
+                    if (isHead && headCap > 0L) {
+                        n = minOf(n.toLong(), headCap - downloaded).toInt()
+                    }
+                    out.write(buf, 0, n)
+                    downloaded += n
+                    onProgress(downloaded, trueTotal, effectiveStart)
+                    if (!isHead) {
+                        sinceSpaceCheck += n
+                        if (sinceSpaceCheck >= TempPlaybackCache.SPACE_CHECK_INTERVAL_BYTES) {
+                            sinceSpaceCheck = 0L
+                            if (!enforceSpacePolicy(realLaunchId)) return
+                        }
+                    }
+                }
+                out.flush()
+            }
+        }
+    }
+
+    /**
+     * Returns false when the download must stop growing. Watched history is
+     * evicted first; the unwatched forward part is always kept.
+     */
+    private fun enforceSpacePolicy(realLaunchId: Long): Boolean {
+        if (freeSpaceBytes() >= TempPlaybackCache.LOW_SPACE_STOP_BYTES) return true
+        runCatching { headFile(realLaunchId).delete() }
+        return freeSpaceBytes() >= TempPlaybackCache.LOW_SPACE_STOP_BYTES
     }
 
     private fun probeTotalBytes(sourceUrl: String, headers: Map<String, String>, launchId: Long): Long? {
@@ -188,4 +291,10 @@ internal actual object TempPlaybackCachePlatform {
 
     private fun tempDir(): File =
         File(System.getProperty("java.io.tmpdir") ?: ".", "nuvio_temp_playback").apply { mkdirs() }
+
+    private fun tailFile(launchId: Long): File = File(tempDir(), "$launchId.tail.bin")
+
+    private fun headFile(launchId: Long): File = File(tempDir(), "$launchId.head.bin")
+
+    private fun legacyFile(launchId: Long): File = File(tempDir(), "$launchId.bin")
 }

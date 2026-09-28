@@ -44,6 +44,9 @@ import org.jetbrains.compose.resources.stringResource
 
 internal val PlayerTimelineContentInset = 2.dp
 
+/** Samin: solid neutral gray for saved-to-disk regions (monochrome, subtle). */
+private val SavedTrackGray = Color(0.62f, 0.62f, 0.64f)
+
 @Composable
 internal fun PlayerTimelineDetails(
     title: String,
@@ -113,8 +116,11 @@ internal fun PlayerTimeline(
     // Samin: fraction of the file saved to disk by the temp playback cache.
     // Drawn as a subtle brighter-gray stretch (PotPlayer-style).
     cachedFraction: Float? = null,
-    // Samin: where the saved region starts (mirror resumes at the playhead).
+    // Samin: where the forward saved region starts (mirror resumes here).
     cachedStartFraction: Float = 0f,
+    // Samin: end of the backward saved region (before the playhead,
+    // fetched after the forward part completes). 0 = none.
+    cachedHeadFraction: Float = 0f,
 ) {
     val durationMs = snapshot.durationMs.coerceAtLeast(0L)
     val rangeEnd = durationMs.coerceAtLeast(1L).toFloat()
@@ -123,6 +129,7 @@ internal fun PlayerTimeline(
     // saved (solid gray) and played only.
     val savedFraction = cachedFraction?.coerceIn(0f, 1f).takeIf { it != null && it > 0f }
     val savedStart = cachedStartFraction.coerceIn(0f, 1f)
+    val headEnd = cachedHeadFraction.coerceIn(0f, 1f).takeIf { it > 0f }
     val accentBrush = MaterialTheme.themePalette.accentBrush()
     val description = stringResource(Res.string.player_seek_position)
     var scrubPosition by remember { mutableStateOf<Long?>(null) }
@@ -167,6 +174,18 @@ internal fun PlayerTimeline(
                                 size = Size(size.width, trackHeight),
                                 cornerRadius = radius,
                             )
+                            if (headEnd != null) {
+                                // Samin backward saved region (watched history).
+                                val headX = size.width * minOf(headEnd, 1f)
+                                if (headX > 0f) {
+                                    drawRoundRect(
+                                        color = SavedTrackGray,
+                                        topLeft = trackOrigin,
+                                        size = Size(headX, trackHeight),
+                                        cornerRadius = radius,
+                                    )
+                                }
+                            }
                             if (savedFraction != null) {
                                 // Samin saved-to-disk stretch: solid neutral gray,
                                 // growing forward from where the mirror resumed.
@@ -174,7 +193,7 @@ internal fun PlayerTimeline(
                                 val endX = size.width * savedFraction
                                 if (endX > startX) {
                                     drawRoundRect(
-                                        color = Color(0.62f, 0.62f, 0.64f),
+                                        color = SavedTrackGray,
                                         topLeft = trackOrigin.copy(x = trackOrigin.x + startX),
                                         size = Size(endX - startX, trackHeight),
                                         cornerRadius = radius,
