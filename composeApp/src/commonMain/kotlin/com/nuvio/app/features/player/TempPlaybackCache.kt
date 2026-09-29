@@ -92,12 +92,6 @@ object TempPlaybackCache {
     private val activeSessionKeys = mutableMapOf<Long, String>()
     private var sessionCounter = 0L
 
-    private fun sessionKey(launchId: Long): String {
-        return activeSessionKeys.getOrPut(launchId) {
-            "p${launchId}_${++sessionCounter}"
-        }
-    }
-
     /** True when this playback runs through the loopback proxy (iOS). */
     fun isProxied(launchId: Long): Boolean = proxied.contains(launchId)
 
@@ -167,7 +161,7 @@ object TempPlaybackCache {
             parseStatsAndUpdate(launchId, statsJson)
         } else {
             val json = runCatching {
-                bridge.cachedRangesJson(sessionKey(launchId))
+                bridge.cachedRangesJson(key)
             }.getOrNull().orEmpty()
             val ranges = parseRangesJson(json)
             _status.update { current ->
@@ -200,8 +194,6 @@ object TempPlaybackCache {
             }
         }
     }
-
-    private fun sessionKey(launchId: Long): String = "p$launchId"
 
     private fun encodeHeaders(headers: Map<String, String>): String? {
         val sanitized = headers.mapNotNull { (k, v) ->
