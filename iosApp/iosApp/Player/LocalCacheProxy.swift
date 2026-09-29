@@ -341,41 +341,63 @@ final class ProxySession {
         guard valid else { return }
 
         let chunkIdx = startByte / saminProxyChunkBytes
-        let alignedStart = chunkIdx * saminProxyChunkBytes
 
-        // 1. If this chunk is already fully cached, do not disturb the active download!
-        if cachedChunks.contains(chunkIdx) {
+        // If totalSize is not known yet, start from alignedStart
+        guard let total = totalSize, total > 0 else {
+            let alignedStart = chunkIdx * saminProxyChunkBytes
+            if forwardDownloader == nil {
+                let fd = ForwardDownloader(session: self, startByte: alignedStart)
+                self.forwardDownloader = fd
+                fd.start()
+            }
             return
         }
 
-        // 2. If forward downloader is already downloading this region forward, let it run at line rate
-        if let fd = forwardDownloader, !fd.isFinished {
-            if fd.startByte <= alignedStart && fd.streamOffset >= alignedStart {
-                // Downloader has already passed or is currently streaming inside this chunk
-                return
-            }
-            // If downloader is within 16 MB behind where the player needs bytes,
-            // let it keep running! It will reach this chunk in a couple seconds without reconnect penalty.
-            if fd.streamOffset < alignedStart && (alignedStart - fd.streamOffset) <= 16 * 1024 * 1024 {
-                return
-            }
-        }
-
-        // 3. If requested range is a probe near the end of file (e.g. moov atom)
+        // 1. If requested range is a probe near the end of file (e.g. moov atom)
         // and forwardDownloader is actively running near the beginning/playhead:
-        if let total = totalSize, total > 0, (total - startByte) <= 4 * 1024 * 1024,
+        if (total - startByte) <= 4 * 1024 * 1024,
            let fd = forwardDownloader, !fd.isFinished, fd.streamOffset < (total - 32 * 1024 * 1024) {
             fetchProbeChunk(chunkIndex: chunkIdx)
             return
         }
 
-        // 4. New seek point: cancel existing downloaders so 100% bandwidth serves the current play position
+        // Find the first uncached chunk at or after chunkIdx
+        let totalChunks = (total + saminProxyChunkBytes - 1) / saminProxyChunkBytes
+        var targetChunk = chunkIdx
+        while targetChunk < totalChunks && cachedChunks.contains(targetChunk) {
+            targetChunk += 1
+        }
+
+        if targetChunk >= totalChunks {
+            // Everything forward from startByte to EOF is fully cached!
+            forwardDownloader?.cancel()
+            forwardDownloader = nil
+            onForwardCompleted(startByte: startByte)
+            return
+        }
+
+        let targetStartByte = targetChunk * saminProxyChunkBytes
+
+        // 2. If forward downloader is already downloading this region forward, let it run at line rate
+        if let fd = forwardDownloader, !fd.isFinished {
+            if fd.startByte <= targetStartByte && fd.streamOffset >= targetStartByte && fd.streamOffset < targetStartByte + 32 * 1024 * 1024 {
+                // Downloader has already passed or is currently streaming inside this chunk
+                return
+            }
+            // If downloader is within 16 MB behind where bytes are needed,
+            // let it keep running! It will reach this chunk in a couple seconds without reconnect penalty.
+            if fd.streamOffset < targetStartByte && (targetStartByte - fd.streamOffset) <= 16 * 1024 * 1024 {
+                return
+            }
+        }
+
+        // 3. New seek point / reposition: cancel existing downloaders so 100% bandwidth serves the current play position
         forwardDownloader?.cancel()
         forwardDownloader = nil
         backwardDownloader?.cancel()
         backwardDownloader = nil
 
-        let fd = ForwardDownloader(session: self, startByte: alignedStart)
+        let fd = ForwardDownloader(session: self, startByte: targetStartByte)
         self.forwardDownloader = fd
         fd.start()
     }
@@ -979,10 +1001,7 @@ final class ProxyConnection {
                 self.streamOffset = start
                 self.streamEnd = end
                 sendStreamingHeaders(session: session, start: start, end: end, ranged: hasRangeHeader)
-                let chunkIdx = start / saminProxyChunkBytes
-                if !session.cachedChunks.contains(chunkIdx) {
-                    session.ensureForwardDownloading(from: start)
-                }
+                session.ensureForwardDownloading(from: start)
                 pump()
                 return
             }

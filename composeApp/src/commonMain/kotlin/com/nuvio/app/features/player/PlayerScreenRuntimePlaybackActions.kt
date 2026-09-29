@@ -19,7 +19,8 @@ import kotlin.math.abs
 internal fun PlayerScreenRuntime.finishTimelineScrub(positionMs: Long) {
     lastManualSkipSeekPositions = playbackSnapshot.positionMs to positionMs
     isScrubbingTimeline = false
-    scrubbingPositionMs = positionMs.takeIf { playbackSnapshot.isLoading }
+    scrubbingPositionMs = positionMs
+    pendingSeekPositionMs = positionMs
 }
 
 internal fun PlayerScreenRuntime.updatePlaybackSnapshot(
@@ -33,13 +34,13 @@ internal fun PlayerScreenRuntime.updatePlaybackSnapshot(
         snapshot
     }
     playbackSnapshotKey = playbackKey
-    val targetPositionMs = scrubbingPositionMs ?: return true
-    if (!isScrubbingTimeline && (
-            !snapshot.isLoading || snapshot.isEnded ||
-                abs(snapshot.positionMs - targetPositionMs) <= 1_000L
-            )
+    val targetPositionMs = scrubbingPositionMs ?: pendingSeekPositionMs
+    if (targetPositionMs != null && !isScrubbingTimeline && (
+            abs(snapshot.positionMs - targetPositionMs) <= 1_500L
+        )
     ) {
         scrubbingPositionMs = null
+        pendingSeekPositionMs = null
     }
     return true
 }
@@ -86,7 +87,7 @@ internal val PlayerScreenRuntime.playbackSession: WatchProgressPlaybackSession
     )
 
 internal fun PlayerScreenRuntime.currentLaunch(launch: PlayerLaunch): PlayerLaunch {
-    val positionMs = playbackSnapshot.positionMs.takeIf {
+    val positionMs = effectivePlaybackPositionMs.takeIf {
         it > 0L && initialSeekApplied && playbackSnapshotKey == activePlaybackKey
     }
     return launch.copy(
@@ -154,7 +155,8 @@ internal fun PlayerScreenRuntime.currentPlaybackProgressPercent(
     snapshot: PlayerPlaybackSnapshot = playbackSnapshot,
 ): Float {
     val duration = snapshot.durationMs.takeIf { it > 0L } ?: return 0f
-    return ((snapshot.positionMs.toFloat() / duration.toFloat()) * 100f)
+    val pos = if (snapshot == playbackSnapshot) effectivePlaybackPositionMs else snapshot.positionMs
+    return ((pos.coerceAtLeast(0L).toFloat() / duration.toFloat()) * 100f)
         .coerceIn(0f, 100f)
 }
 
@@ -335,6 +337,12 @@ internal suspend fun PlayerScreenRuntime.resolveParentalGuideImdbId(): String? {
 internal fun PlayerScreenRuntime.flushWatchProgress(
     scrobbleAction: TrackingScrobbleAction = TrackingScrobbleAction.STOP,
 ) {
+    val pos = effectivePlaybackPositionMs.coerceAtLeast(0L)
+    val snapshotToFlush = if (pos != playbackSnapshot.positionMs) {
+        playbackSnapshot.copy(positionMs = pos)
+    } else {
+        playbackSnapshot
+    }
     when (scrobbleAction) {
         TrackingScrobbleAction.PAUSE -> emitTrackingScrobblePause()
         TrackingScrobbleAction.STOP -> emitStopScrobbleForCurrentProgress()
@@ -342,22 +350,29 @@ internal fun PlayerScreenRuntime.flushWatchProgress(
     }
     WatchProgressRepository.flushPlaybackProgress(
         session = playbackSession,
-        snapshot = playbackSnapshot,
+        snapshot = snapshotToFlush,
     )
 }
 
 internal fun PlayerScreenRuntime.scheduleProgressSyncAfterSeek() {
     val shouldRestartScrobbleAfterSeek = shouldPlay || playbackSnapshot.isPlaying
     seekProgressSyncJob?.cancel()
+    val targetPos = pendingSeekPositionMs
     seekProgressSyncJob = scope.launch {
         delay(PlayerSeekProgressSyncDebounceMs)
         if (isShortPlaceholderDuration(playbackSnapshot.durationMs)) return@launch
+        val pos = (targetPos ?: effectivePlaybackPositionMs).coerceAtLeast(0L)
+        val snapshotToSync = if (pos != playbackSnapshot.positionMs) {
+            playbackSnapshot.copy(positionMs = pos)
+        } else {
+            playbackSnapshot
+        }
         WatchProgressRepository.upsertPlaybackProgress(
             session = playbackSession,
-            snapshot = playbackSnapshot,
+            snapshot = snapshotToSync,
         )
 
-        val progressPercent = currentPlaybackProgressPercent()
+        val progressPercent = currentPlaybackProgressPercent(snapshotToSync)
         if (
             !shouldUpdateTrackingScrobbleAfterSeek(
                 hasActiveScrobble = hasRequestedScrobbleStartForCurrentItem,

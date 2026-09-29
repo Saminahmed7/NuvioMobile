@@ -28,7 +28,7 @@ import nuvio.composeapp.generated.resources.*
 internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
     val runtime = this
     val isInPip = rememberIsInPictureInPicture()
-    val displayedPositionMs = scrubbingPositionMs ?: playbackSnapshot.positionMs
+    val displayedPositionMs = effectivePlaybackPositionMs
     val isEpisode = activeSeasonNumber != null && activeEpisodeNumber != null
     val currentGestureFeedback = liveGestureFeedback ?: gestureFeedback
     val isP2pPlaybackActive = activeTorrentInfoHash != null
@@ -375,9 +375,11 @@ private fun PlayerScreenRuntime.RenderPlayerControls(displayedPositionMs: Long, 
             onScrubChange = { positionMs ->
                 isScrubbingTimeline = true
                 scrubbingPositionMs = positionMs
+                pendingSeekPositionMs = positionMs
             },
             onScrubFinished = { positionMs ->
                 finishTimelineScrub(positionMs)
+                pendingSeekPositionMs = positionMs
                 playerController?.seekTo(positionMs)
                 scheduleProgressSyncAfterSeek()
             },
@@ -442,6 +444,7 @@ private fun BoxScope.RenderPlaybackOverlays(
             interval.internalSkipAction(skipIntervals, playbackSnapshot.durationMs)?.let { action ->
                 val durationMs = playbackSnapshot.durationMs
                 val seekMs = if (durationMs > 0L) action.targetMs.coerceAtMost(durationMs - 1) else action.targetMs
+                pendingSeekPositionMs = seekMs
                 playerController?.seekTo(seekMs)
                 scheduleProgressSyncAfterSeek()
                 skipIntervalDismissed = true
