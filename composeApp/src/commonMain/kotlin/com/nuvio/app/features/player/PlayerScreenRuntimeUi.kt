@@ -262,9 +262,12 @@ private fun PlayerScreenRuntime.RenderPlayerControls(displayedPositionMs: Long, 
     val isInPip = rememberIsInPictureInPicture()
     // Samin: temp-cache saved spans for the gray timeline stretches.
     val tempCacheStatuses by TempPlaybackCache.status.collectAsStateWithLifecycle()
-    val saminCachedRanges = remember(tempCacheStatuses) {
-        val lid = args.launchId ?: return@remember emptyList<TempCacheRange>()
-        tempCacheStatuses[lid]?.ranges ?: emptyList()
+    val saminCacheStatus = remember(tempCacheStatuses, args.launchId) {
+        val lid = args.launchId ?: return@remember null
+        tempCacheStatuses[lid]
+    }
+    val saminCachedRanges = remember(saminCacheStatus) {
+        saminCacheStatus?.ranges ?: emptyList()
     }
     AnimatedVisibility(
         visible = (controlsVisible || showParentalGuide) && !playerControlsLocked && !isInPip,
@@ -381,6 +384,7 @@ private fun PlayerScreenRuntime.RenderPlayerControls(displayedPositionMs: Long, 
             horizontalSafePadding = horizontalSafePadding,
             modifier = Modifier.fillMaxSize(),
             cachedRanges = saminCachedRanges,
+            cacheStatus = saminCacheStatus,
         )
     }
 }

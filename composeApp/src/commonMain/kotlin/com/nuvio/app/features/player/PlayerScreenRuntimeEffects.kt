@@ -146,7 +146,7 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         if (!TempPlaybackCache.isProxied(lid)) return@LaunchedEffect
         var lastPushedMs = -1L
         while (isActive) {
-            delay(2000L)
+            delay(1000L)
             TempPlaybackCache.refreshRanges(lid)
             val pos = playbackSnapshot.positionMs.coerceAtLeast(0L)
             val dur = playbackSnapshot.durationMs

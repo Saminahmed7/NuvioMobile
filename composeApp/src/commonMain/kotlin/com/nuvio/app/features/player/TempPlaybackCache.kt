@@ -7,6 +7,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 
 /** One saved span on the timeline, as fractions of the file. */
 data class TempCacheRange(
@@ -40,7 +42,12 @@ data class TempCacheStatus(
     val headComplete: Boolean = false,
     val isComplete: Boolean = false,
     val ranges: List<TempCacheRange> = emptyList(),
+    val cachedBytes: Long = 0L,
+    val downloadSpeedBps: Long = 0L,
 ) {
+    val totalCachedBytes: Long
+        get() = if (cachedBytes > 0L) cachedBytes else (downloadedBytes + headDownloadedBytes)
+
     /** Fraction of the file where the forward saved region starts. */
     val startFraction: Float?
         get() {
@@ -137,13 +144,46 @@ object TempPlaybackCache {
 
     fun refreshRanges(launchId: Long) {
         if (!isProxied(launchId)) return
-        val json = runCatching {
-            NuvioCacheProxyBridgeFactory.create()?.cachedRangesJson(sessionKey(launchId))
+        val bridge = NuvioCacheProxyBridgeFactory.create() ?: return
+        val statsJson = runCatching {
+            bridge.cacheStatsJson(sessionKey(launchId))
         }.getOrNull().orEmpty()
-        val ranges = parseRangesJson(json)
-        _status.update { current ->
-            val prev = current[launchId] ?: return@update current
-            current + (launchId to prev.copy(ranges = ranges))
+
+        if (statsJson.isNotBlank() && statsJson != "{}") {
+            parseStatsAndUpdate(launchId, statsJson)
+        } else {
+            val json = runCatching {
+                bridge.cachedRangesJson(sessionKey(launchId))
+            }.getOrNull().orEmpty()
+            val ranges = parseRangesJson(json)
+            _status.update { current ->
+                val prev = current[launchId] ?: return@update current
+                current + (launchId to prev.copy(ranges = ranges))
+            }
+        }
+    }
+
+    private fun parseStatsAndUpdate(launchId: Long, statsJson: String) {
+        runCatching {
+            val element = Json.parseToJsonElement(statsJson)
+            val obj = element as? JsonObject ?: return
+            val speed = (obj["speedBps"] as? JsonPrimitive)?.content?.toLongOrNull() ?: 0L
+            val cached = (obj["cachedBytes"] as? JsonPrimitive)?.content?.toLongOrNull() ?: 0L
+            val total = (obj["totalBytes"] as? JsonPrimitive)?.content?.toLongOrNull()?.takeIf { it > 0L }
+            val isComplete = (obj["isComplete"] as? JsonPrimitive)?.content?.toBooleanStrictOrNull() ?: false
+            val rangesElement = obj["ranges"]
+            val ranges = if (rangesElement != null) parseRangesJson(rangesElement.toString()) else emptyList()
+
+            _status.update { current ->
+                val prev = current[launchId] ?: TempCacheStatus(launchId = launchId)
+                current + (launchId to prev.copy(
+                    cachedBytes = cached,
+                    downloadSpeedBps = speed,
+                    totalBytes = total ?: prev.totalBytes,
+                    isComplete = isComplete || prev.isComplete,
+                    ranges = if (ranges.isNotEmpty()) ranges else prev.ranges,
+                ))
+            }
         }
     }
 
@@ -226,6 +266,7 @@ object TempPlaybackCache {
                     val cleanDownloaded = downloaded.coerceAtLeast(0L)
                     current + (launchId to prev.copy(
                         downloadedBytes = cleanDownloaded,
+                        cachedBytes = cleanDownloaded + prev.headDownloadedBytes,
                         totalBytes = cleanTotal,
                         startBytes = cleanStart,
                         ranges = singleRange(cleanStart, cleanDownloaded, cleanTotal),
@@ -272,8 +313,10 @@ object TempPlaybackCache {
             onProgress = { headDownloaded ->
                 _status.update { current ->
                     val prev = current[launchId] ?: return@update current
+                    val cleanHead = headDownloaded.coerceAtLeast(0L)
                     current + (launchId to prev.copy(
-                        headDownloadedBytes = headDownloaded.coerceAtLeast(0L),
+                        headDownloadedBytes = cleanHead,
+                        cachedBytes = prev.downloadedBytes + cleanHead,
                     ))
                 }
             },

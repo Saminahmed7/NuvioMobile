@@ -48,6 +48,10 @@ final class LocalCacheProxyBridgeImpl: NSObject, NuvioCacheProxyBridge {
     func cachedRangesJson(sessionKey: String) -> String {
         return LocalCacheProxyServer.shared.cachedRangesJson(key: sessionKey)
     }
+
+    func cacheStatsJson(sessionKey: String) -> String {
+        return LocalCacheProxyServer.shared.cacheStatsJson(key: sessionKey)
+    }
 }
 
 final class LocalCacheProxyCreator: NSObject, NuvioCacheProxyBridgeCreator {
@@ -174,6 +178,12 @@ final class LocalCacheProxyServer {
     func cachedRangesJson(key: String) -> String {
         queue.sync {
             sessions[key]?.cachedRangesJson() ?? "[]"
+        }
+    }
+
+    func cacheStatsJson(key: String) -> String {
+        queue.sync {
+            sessions[key]?.cacheStatsJson() ?? "{}"
         }
     }
 
@@ -465,6 +475,63 @@ final class ProxySession {
         }
         return "[\(parts.joined(separator: ","))]"
     }
+
+    private var speedBytesAccumulator: Int64 = 0
+    private var lastSpeedCheckUptime: TimeInterval = ProcessInfo.processInfo.systemUptime
+    private var lastDataReceivedUptime: TimeInterval = 0
+    private(set) var currentSpeedBps: Int64 = 0
+
+    func recordBytesReceived(_ count: Int) {
+        let now = ProcessInfo.processInfo.systemUptime
+        lastDataReceivedUptime = now
+        speedBytesAccumulator += Int64(count)
+        let elapsed = now - lastSpeedCheckUptime
+        if elapsed >= 0.5 {
+            currentSpeedBps = Int64(Double(speedBytesAccumulator) / elapsed)
+            speedBytesAccumulator = 0
+            lastSpeedCheckUptime = now
+        }
+    }
+
+    func currentSpeed() -> Int64 {
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - lastDataReceivedUptime > 2.0 {
+            return 0
+        }
+        return currentSpeedBps
+    }
+
+    func totalCachedBytes() -> Int64 {
+        var total: Int64 = 0
+        if let fileTotal = totalSize, fileTotal > 0 {
+            for idx in cachedChunks {
+                let cStart = idx * saminProxyChunkBytes
+                let cEnd = min(cStart + saminProxyChunkBytes - 1, fileTotal - 1)
+                total += max(0, cEnd - cStart + 1)
+            }
+        } else {
+            total += Int64(cachedChunks.count) * saminProxyChunkBytes
+        }
+        for (idx, written) in bytesWrittenByChunk {
+            if !cachedChunks.contains(idx) {
+                total += written
+            }
+        }
+        if let fileTotal = totalSize, total > fileTotal {
+            total = fileTotal
+        }
+        return total
+    }
+
+    func cacheStatsJson() -> String {
+        let speed = currentSpeed()
+        let cached = totalCachedBytes()
+        let total = totalSize ?? 0
+        let totalChunks = (total > 0) ? (total + saminProxyChunkBytes - 1) / saminProxyChunkBytes : 0
+        let isComplete = (total > 0 && cachedChunks.count >= totalChunks)
+        let ranges = cachedRangesJson()
+        return "{\"speedBps\":\(speed),\"cachedBytes\":\(cached),\"totalBytes\":\(total),\"isComplete\":\(isComplete),\"ranges\":\(ranges)}"
+    }
 }
 
 // MARK: - Forward Downloader (Single High-Speed Stream)
@@ -586,6 +653,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
     }
 
     private func processIncoming(data: Data) {
+        session.recordBytesReceived(data.count)
         var cursor = streamOffset
         var remaining = data
 
@@ -748,6 +816,7 @@ final class BackwardDownloader: NSObject, URLSessionDataDelegate {
         receivedBytes += Int64(data.count)
         self.session.server.queue.async { [weak self] in
             guard let self, !self.isCancelled else { return }
+            self.session.recordBytesReceived(data.count)
             self.session.bytesWrittenByChunk[self.chunkIndex] = self.receivedBytes
             self.session.notifyDataAvailable(chunkIndex: self.chunkIndex)
         }

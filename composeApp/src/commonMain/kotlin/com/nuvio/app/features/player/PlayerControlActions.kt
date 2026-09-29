@@ -1,5 +1,7 @@
 package com.nuvio.app.features.player
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -13,6 +15,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
@@ -45,10 +48,12 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.text.font.FontWeight
 import com.nuvio.app.core.ui.AppIconResource
 import com.nuvio.app.core.ui.NuvioBackButton
 import com.nuvio.app.core.ui.appIconPainter
 import com.nuvio.app.core.ui.nuvioTypeScale
+import com.nuvio.app.features.p2p.formatP2pSpeed
 import nuvio.composeapp.generated.resources.*
 import org.jetbrains.compose.resources.stringResource
 
@@ -98,6 +103,7 @@ internal fun PlayerControlActions(
     onOpenInExternalPlayer: (() -> Unit)?,
     onSubmitIntroClick: (() -> Unit)?,
     onInteraction: () -> Unit,
+    cacheStatus: TempCacheStatus? = null,
 ) {
     val actions = listOfNotNull(
         onNextEpisodeClick?.let {
@@ -195,6 +201,12 @@ internal fun PlayerControlActions(
                     )
                 }
             }
+            if (cacheStatus != null) {
+                CacheStatsBadge(
+                    cacheStatus = cacheStatus,
+                    metrics = metrics,
+                )
+            }
             Box(
                 modifier = Modifier.height(48.dp).widthIn(min = 48.dp).clickable(
                     role = Role.Button,
@@ -243,3 +255,83 @@ private data class PlayerControlAction(
     val painter: Painter? = null,
     val iconSize: Dp = 24.dp,
 )
+
+@Composable
+private fun CacheStatsBadge(
+    cacheStatus: TempCacheStatus,
+    metrics: PlayerLayoutMetrics,
+) {
+    val speedBps = cacheStatus.downloadSpeedBps
+    val cached = cacheStatus.totalCachedBytes
+    val total = cacheStatus.totalBytes
+    val isComplete = cacheStatus.isComplete || (total != null && total > 0L && cached >= total)
+
+    val text = when {
+        isComplete -> {
+            "✓ ${formatByteSize(cached)} cached"
+        }
+        speedBps > 0L -> {
+            val speedStr = formatP2pSpeed(speedBps)
+            val cachedStr = if (total != null && total > 0L) {
+                "${formatByteSize(cached)} / ${formatByteSize(total)}"
+            } else {
+                formatByteSize(cached)
+            }
+            "↓ $speedStr · $cachedStr"
+        }
+        cached > 0L -> {
+            val cachedStr = if (total != null && total > 0L) {
+                "${formatByteSize(cached)} / ${formatByteSize(total)}"
+            } else {
+                formatByteSize(cached)
+            }
+            "$cachedStr cached"
+        }
+        else -> null
+    } ?: return
+
+    Box(
+        modifier = Modifier
+            .padding(horizontal = 4.dp)
+            .background(
+                color = Color.Black.copy(alpha = 0.45f),
+                shape = RoundedCornerShape(12.dp),
+            )
+            .border(
+                width = 0.5.dp,
+                color = Color.White.copy(alpha = 0.2f),
+                shape = RoundedCornerShape(12.dp),
+            )
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = text,
+            style = MaterialTheme.nuvioTypeScale.labelSm.copy(
+                fontSize = (metrics.timeSize.value).sp,
+                fontWeight = FontWeight.Medium,
+            ),
+            color = if (isComplete) Color(0xFF81C784) else Color.White.copy(alpha = 0.85f),
+            maxLines = 1,
+        )
+    }
+}
+
+internal fun formatByteSize(bytes: Long): String {
+    if (bytes <= 0L) return "0 MB"
+    val mb = 1024.0 * 1024.0
+    val gb = mb * 1024.0
+    val d = bytes.toDouble()
+    return if (d >= gb) {
+        val rounded = kotlin.math.round(d / gb * 10.0) / 10.0
+        val whole = rounded.toLong()
+        val frac = ((rounded - whole) * 10.0).toInt()
+        "$whole.$frac GB"
+    } else {
+        val rounded = kotlin.math.round(d / mb * 10.0) / 10.0
+        val whole = rounded.toLong()
+        val frac = ((rounded - whole) * 10.0).toInt()
+        "$whole.$frac MB"
+    }
+}
+

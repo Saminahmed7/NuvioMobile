@@ -120,6 +120,7 @@ internal fun PlayerControlsShell(
     modifier: Modifier = Modifier,
     // Samin: temp-cache saved spans, drawn as subtle gray on the timeline.
     cachedRanges: List<TempCacheRange> = emptyList(),
+    cacheStatus: TempCacheStatus? = null,
 ) {
     val density = LocalDensity.current
     var timelineHeight by remember { mutableStateOf(0.dp) }
@@ -311,6 +312,7 @@ internal fun PlayerControlsShell(
                         onOpenInExternalPlayer = onOpenInExternalPlayer,
                         onSubmitIntroClick = onSubmitIntroClick,
                         onInteraction = onInteraction,
+                        cacheStatus = cacheStatus,
                     )
                 }
             }
