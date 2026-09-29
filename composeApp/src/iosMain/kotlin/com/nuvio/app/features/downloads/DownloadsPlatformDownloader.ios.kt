@@ -440,7 +440,8 @@ private suspend fun performDownloadRequest(
     request.sourceHeaders.forEach { (key, value) ->
         nativeRequest.setValue(value, forHTTPHeaderField = key)
     }
-    if (nativeRequest.valueForHTTPHeaderField("User-Agent") == null) {
+    val hasUserAgent = request.sourceHeaders.keys.any { it.equals("User-Agent", ignoreCase = true) }
+    if (!hasUserAgent) {
         nativeRequest.setValue(
             "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
             forHTTPHeaderField = "User-Agent"
