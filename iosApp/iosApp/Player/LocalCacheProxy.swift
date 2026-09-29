@@ -256,6 +256,7 @@ final class ProxySession {
 
     private var forwardDownloader: ForwardDownloader?
     private var backwardDownloader: BackwardDownloader?
+    private var probeDownloader: BackwardDownloader?
     private var activeConnections: [ObjectIdentifier: ProxyConnection] = [:]
     private var headWaiters: [ProxyConnection] = []
 
@@ -275,6 +276,8 @@ final class ProxySession {
         forwardDownloader = nil
         backwardDownloader?.cancel()
         backwardDownloader = nil
+        probeDownloader?.cancel()
+        probeDownloader = nil
         headWaiters.removeAll()
         activeConnections.removeAll()
         try? FileManager.default.removeItem(at: dir)
@@ -337,23 +340,51 @@ final class ProxySession {
     func ensureForwardDownloading(from startByte: Int64) {
         guard valid else { return }
 
-        // If forward downloader is already downloading this region forward, let it run at line rate
+        let chunkIdx = startByte / saminProxyChunkBytes
+        let alignedStart = chunkIdx * saminProxyChunkBytes
+
+        // 1. If this chunk is already fully cached, do not disturb the active download!
+        if cachedChunks.contains(chunkIdx) {
+            return
+        }
+
+        // 2. If forward downloader is already downloading this region forward, let it run at line rate
         if let fd = forwardDownloader, !fd.isFinished {
-            if fd.startByte <= startByte && fd.streamOffset >= startByte {
-                // Downloader is already past or at this position, streaming ahead
+            if fd.startByte <= alignedStart && fd.streamOffset >= alignedStart {
+                // Downloader has already passed or is currently streaming inside this chunk
+                return
+            }
+            // If downloader is within 16 MB behind where the player needs bytes,
+            // let it keep running! It will reach this chunk in a couple seconds without reconnect penalty.
+            if fd.streamOffset < alignedStart && (alignedStart - fd.streamOffset) <= 16 * 1024 * 1024 {
                 return
             }
         }
 
-        // New seek point: cancel existing downloaders so 100% bandwidth serves the current play position
+        // 3. If requested range is a probe near the end of file (e.g. moov atom)
+        // and forwardDownloader is actively running near the beginning/playhead:
+        if let total = totalSize, total > 0, (total - startByte) <= 4 * 1024 * 1024,
+           let fd = forwardDownloader, !fd.isFinished, fd.streamOffset < (total - 32 * 1024 * 1024) {
+            fetchProbeChunk(chunkIndex: chunkIdx)
+            return
+        }
+
+        // 4. New seek point: cancel existing downloaders so 100% bandwidth serves the current play position
         forwardDownloader?.cancel()
         forwardDownloader = nil
         backwardDownloader?.cancel()
         backwardDownloader = nil
 
-        let fd = ForwardDownloader(session: self, startByte: startByte)
+        let fd = ForwardDownloader(session: self, startByte: alignedStart)
         self.forwardDownloader = fd
         fd.start()
+    }
+
+    func fetchProbeChunk(chunkIndex: Int64) {
+        guard valid, probeDownloader == nil, !cachedChunks.contains(chunkIndex) else { return }
+        let pd = BackwardDownloader(session: self, chunkIndex: chunkIndex)
+        self.probeDownloader = pd
+        pd.start()
     }
 
     func onForwardCompleted(startByte: Int64) {
@@ -380,10 +411,17 @@ final class ProxySession {
     }
 
     func onBackwardChunkCompleted(chunkIndex: Int64, success: Bool) {
-        backwardDownloader = nil
+        if backwardDownloader?.chunkIndex == chunkIndex {
+            backwardDownloader = nil
+        }
+        if probeDownloader?.chunkIndex == chunkIndex {
+            probeDownloader = nil
+        }
         guard valid, success else { return }
         guard server.freeSpaceBytes() >= saminProxyLowSpaceBytes else { return }
-        startBackwardDownloadIfNeeded()
+        if forwardDownloader == nil || forwardDownloader?.isFinished == true {
+            startBackwardDownloadIfNeeded()
+        }
     }
 
     /// Makes room for one more chunk. Only strictly watched (behind-playhead)
@@ -528,7 +566,7 @@ final class ProxySession {
         let cached = totalCachedBytes()
         let total = totalSize ?? 0
         let totalChunks = (total > 0) ? (total + saminProxyChunkBytes - 1) / saminProxyChunkBytes : 0
-        let isComplete = (total > 0 && cachedChunks.count >= totalChunks)
+        let isComplete = (total > 0 && totalChunks > 0 && cachedChunks.count >= totalChunks)
         let ranges = cachedRangesJson()
         return "{\"speedBps\":\(speed),\"cachedBytes\":\(cached),\"totalBytes\":\(total),\"isComplete\":\(isComplete),\"ranges\":\(ranges)}"
     }
@@ -563,7 +601,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
 
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 60)
         request.httpMethod = "GET"
-        request.networkServiceType = .video
+        request.networkServiceType = .default
         session.headers.forEach { request.setValue($1, forHTTPHeaderField: $0) }
         if request.value(forHTTPHeaderField: "User-Agent") == nil {
             request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
@@ -577,7 +615,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         config.timeoutIntervalForRequest = 60
         config.timeoutIntervalForResource = 60 * 60 * 6
         config.waitsForConnectivity = true
-        config.networkServiceType = .video
+        config.networkServiceType = .default
         config.httpShouldUsePipelining = true
         config.httpMaximumConnectionsPerHost = 6
 
@@ -772,7 +810,7 @@ final class BackwardDownloader: NSObject, URLSessionDataDelegate {
 
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 60)
         request.httpMethod = "GET"
-        request.networkServiceType = .video
+        request.networkServiceType = .default
         session.headers.forEach { request.setValue($1, forHTTPHeaderField: $0) }
         if request.value(forHTTPHeaderField: "User-Agent") == nil {
             request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
@@ -785,7 +823,7 @@ final class BackwardDownloader: NSObject, URLSessionDataDelegate {
         config.timeoutIntervalForRequest = 60
         config.timeoutIntervalForResource = 3600
         config.waitsForConnectivity = true
-        config.networkServiceType = .video
+        config.networkServiceType = .default
 
         let s = URLSession(configuration: config, delegate: self, delegateQueue: nil)
         self.urlSession = s
@@ -941,7 +979,10 @@ final class ProxyConnection {
                 self.streamOffset = start
                 self.streamEnd = end
                 sendStreamingHeaders(session: session, start: start, end: end, ranged: hasRangeHeader)
-                session.ensureForwardDownloading(from: start)
+                let chunkIdx = start / saminProxyChunkBytes
+                if !session.cachedChunks.contains(chunkIdx) {
+                    session.ensureForwardDownloading(from: start)
+                }
                 pump()
                 return
             }

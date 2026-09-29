@@ -264,12 +264,9 @@ private fun CacheStatsBadge(
     val speedBps = cacheStatus.downloadSpeedBps
     val cached = cacheStatus.totalCachedBytes
     val total = cacheStatus.totalBytes
-    val isComplete = cacheStatus.isComplete || (total != null && total > 0L && cached >= total)
+    val isComplete = (cacheStatus.isComplete || (total != null && total > 0L && cached >= total)) && cached > 0L
 
     val text = when {
-        isComplete -> {
-            "✓ ${formatByteSize(cached)} cached"
-        }
         speedBps > 0L -> {
             val speedStr = formatP2pSpeed(speedBps)
             val cachedStr = if (total != null && total > 0L) {
@@ -278,6 +275,9 @@ private fun CacheStatsBadge(
                 formatByteSize(cached)
             }
             "↓ $speedStr · $cachedStr"
+        }
+        isComplete -> {
+            "✓ ${formatByteSize(cached)} cached"
         }
         cached > 0L -> {
             val cachedStr = if (total != null && total > 0L) {
@@ -311,7 +311,7 @@ private fun CacheStatsBadge(
                 fontSize = (metrics.timeSize.value).sp,
                 fontWeight = FontWeight.Medium,
             ),
-            color = if (isComplete) Color(0xFF81C784) else Color.White.copy(alpha = 0.85f),
+            color = if (isComplete && speedBps <= 0L) Color(0xFF81C784) else Color.White.copy(alpha = 0.85f),
             maxLines = 1,
         )
     }

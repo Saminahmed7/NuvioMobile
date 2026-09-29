@@ -128,8 +128,7 @@ object TempPlaybackCache {
         if (local.isBlank()) return sourceUrl to headers
         proxied.add(launchId)
         _status.update { current ->
-            if (current.containsKey(launchId)) current
-            else current + (launchId to TempCacheStatus(launchId = launchId))
+            current + (launchId to TempCacheStatus(launchId = launchId))
         }
         return local to emptyMap()
     }
@@ -180,7 +179,7 @@ object TempPlaybackCache {
                     cachedBytes = cached,
                     downloadSpeedBps = speed,
                     totalBytes = total ?: prev.totalBytes,
-                    isComplete = isComplete || prev.isComplete,
+                    isComplete = isComplete,
                     ranges = if (ranges.isNotEmpty()) ranges else prev.ranges,
                 ))
             }
