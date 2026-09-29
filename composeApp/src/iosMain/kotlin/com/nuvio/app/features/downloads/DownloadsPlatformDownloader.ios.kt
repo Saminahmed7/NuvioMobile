@@ -245,6 +245,7 @@ private class IosDownloadDelegate(
     private var totalBytesForResponse: Long? = null
     private var lastProgressBytes = -1L
     private var lastProgressTimestampSeconds = 0.0
+    private var bytesSinceLastFlush = 0L
 
     suspend fun awaitCompletion(): IosDownloadResult = completion.await()
 
@@ -311,7 +312,11 @@ private class IosDownloadDelegate(
             fileError = IllegalStateException(runBlocking { getString(Res.string.downloads_error_write_partial_file_failed) })
             return
         }
-        fflush(file)
+        bytesSinceLastFlush += bytesToWrite
+        if (bytesSinceLastFlush >= 512L * 1024L) {
+            fflush(file)
+            bytesSinceLastFlush = 0L
+        }
 
         bytesWrittenForResponse += bytesToWrite
         reportProgress(
@@ -354,6 +359,7 @@ private class IosDownloadDelegate(
             fclose(file)
         }
         outputFile = null
+        bytesSinceLastFlush = 0L
     }
 
     private fun reportProgress(
@@ -434,6 +440,13 @@ private suspend fun performDownloadRequest(
     request.sourceHeaders.forEach { (key, value) ->
         nativeRequest.setValue(value, forHTTPHeaderField = key)
     }
+    if (nativeRequest.valueForHTTPHeaderField("User-Agent") == null) {
+        nativeRequest.setValue(
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+            forHTTPHeaderField = "User-Agent"
+        )
+    }
+    nativeRequest.setValue("identity", forHTTPHeaderField = "Accept-Encoding")
     if (rangeStart != null && rangeStart > 0L) {
         nativeRequest.setValue("bytes=$rangeStart-", forHTTPHeaderField = "Range")
     }
@@ -451,6 +464,9 @@ private suspend fun performDownloadRequest(
         allowsCellularAccess = true
         allowsExpensiveNetworkAccess = true
         allowsConstrainedNetworkAccess = true
+        setHTTPShouldUsePipelining(true)
+        setHTTPMaximumConnectionsPerHost(6L)
+        setURLCache(null)
     }
     val session = NSURLSession.sessionWithConfiguration(
         configuration = configuration,

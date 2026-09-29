@@ -629,8 +629,14 @@
     <string name="downloads_open_directory">Open downloads folder</string>
     <string name="downloads_open_directory_failed">Couldn&apos;t open downloads folder</string>
     <string name="downloads_section_active">Active</string>
+    <string name="downloads_section_downloading">Downloading</string>
+    <string name="downloads_section_all">All</string>
     <string name="downloads_section_movies">Movies</string>
     <string name="downloads_section_shows">Shows</string>
+    <string name="downloads_filter_all">All</string>
+    <string name="downloads_filter_empty">No matching downloads found</string>
+    <string name="downloads_empty_message">Downloaded movies and episodes will appear here so you can watch them offline.</string>
+    <string name="downloads_find_something">Find something to watch</string>
     <string name="downloads_show_downloads">Show Downloads</string>
     <string name="downloads_status_completed">Completed • %1$s</string>
     <string name="downloads_status_downloading">Downloading • %1$s</string>
