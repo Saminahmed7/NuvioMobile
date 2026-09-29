@@ -292,10 +292,6 @@ actual fun PlatformPlayerSurface(
             headersJson = encodePlaybackHeadersForBridge(sourceHeaders),
             subtitlesJson = encodeExternalSubtitlesForBridge(externalSubtitles),
         )
-        val startPos = initialPositionMs?.takeIf { it > 0L }
-        if (startPos != null) {
-            bridge.seekTo(startPos)
-        }
         if (playWhenReady) {
             bridge.play()
         } else {

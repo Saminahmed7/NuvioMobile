@@ -83,6 +83,9 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         cancelNextEpisodeAutoPlay()
         isScrubbingTimeline = false
         scrubbingPositionMs = null
+        pendingSeekPositionMs = null
+        initialSeekApplied = activeInitialPositionMs <= 0L &&
+            (activeInitialProgressFraction == null || activeInitialProgressFraction!! <= 0f)
         liveGestureFeedback = null
         renderedGestureFeedback = null
         lockedOverlayVisible = false

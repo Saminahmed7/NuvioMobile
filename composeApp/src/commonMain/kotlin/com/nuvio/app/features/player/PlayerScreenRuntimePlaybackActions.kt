@@ -35,12 +35,11 @@ internal fun PlayerScreenRuntime.updatePlaybackSnapshot(
     }
     playbackSnapshotKey = playbackKey
     val targetPositionMs = scrubbingPositionMs ?: pendingSeekPositionMs
-    if (targetPositionMs != null && !isScrubbingTimeline && (
-            abs(snapshot.positionMs - targetPositionMs) <= 1_500L
-        )
-    ) {
-        scrubbingPositionMs = null
-        pendingSeekPositionMs = null
+    if (targetPositionMs != null && !isScrubbingTimeline) {
+        if (abs(snapshot.positionMs - targetPositionMs) <= 3_000L || (snapshot.isPlaying && !snapshot.isLoading)) {
+            scrubbingPositionMs = null
+            pendingSeekPositionMs = null
+        }
     }
     return true
 }
@@ -125,6 +124,9 @@ internal fun PlayerScreenRuntime.resetIdentityStateIfNeeded() {
         initialLoadCompleted = false
         speedBoostRestoreSpeed = null
         isHoldToSpeedGestureActive = false
+        isScrubbingTimeline = false
+        scrubbingPositionMs = null
+        pendingSeekPositionMs = null
         initialSeekApplied = activeInitialPositionMs <= 0L &&
             (activeInitialProgressFraction == null || activeInitialProgressFraction!! <= 0f)
         lastProgressPersistEpochMs = 0L
@@ -360,6 +362,7 @@ internal fun PlayerScreenRuntime.scheduleProgressSyncAfterSeek() {
     val targetPos = pendingSeekPositionMs
     seekProgressSyncJob = scope.launch {
         delay(PlayerSeekProgressSyncDebounceMs)
+        pendingSeekPositionMs = null
         if (isShortPlaceholderDuration(playbackSnapshot.durationMs)) return@launch
         val pos = (targetPos ?: effectivePlaybackPositionMs).coerceAtLeast(0L)
         val snapshotToSync = if (pos != playbackSnapshot.positionMs) {

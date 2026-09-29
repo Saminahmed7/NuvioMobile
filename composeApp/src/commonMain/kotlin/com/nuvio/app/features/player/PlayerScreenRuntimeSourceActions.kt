@@ -266,6 +266,9 @@ internal fun PlayerScreenRuntime.switchToSource(stream: StreamItem) {
     val currentPositionMs = playbackSnapshot.positionMs.coerceAtLeast(0L)
     flushWatchProgress()
     stopActiveP2pStream()
+    isScrubbingTimeline = false
+    scrubbingPositionMs = null
+    pendingSeekPositionMs = null
     val currentVideoId = activeVideoId
     if (playerSettingsUiState.streamReuseLastLinkEnabled && currentVideoId != null) {
         saveDirectStreamForReuse(stream, url, currentVideoId, activeSeasonNumber, activeEpisodeNumber)
@@ -391,6 +394,7 @@ internal fun PlayerScreenRuntime.switchToDownloadedEpisode(downloadItem: Downloa
     activeVideoId = resolvedVideoId
     activeInitialPositionMs = epResumePositionMs
     activeInitialProgressFraction = epResumeFraction
+    initialSeekApplied = epResumePositionMs <= 0L && (epResumeFraction == null || epResumeFraction <= 0f)
     controlsVisible = true
 }
 
@@ -482,6 +486,9 @@ private fun PlayerScreenRuntime.resetEpisodePanelAndNextEpisodeState() {
     episodeStreamsPanelState = EpisodeStreamsPanelState()
     cancelNextEpisodeAutoPlay()
     PlayerStreamsRepository.clearEpisodeStreams()
+    isScrubbingTimeline = false
+    scrubbingPositionMs = null
+    pendingSeekPositionMs = null
 }
 
 private fun PlayerScreenRuntime.resolveEpisodeResume(epVideoId: String, episode: MetaVideo): EpisodeResume {
@@ -523,6 +530,7 @@ private fun PlayerScreenRuntime.applyEpisodeStreamMetadata(
     activeVideoId = episode.id
     activeInitialPositionMs = resume.positionMs
     activeInitialProgressFraction = resume.fraction
+    initialSeekApplied = resume.positionMs <= 0L && (resume.fraction == null || resume.fraction <= 0f)
     controlsVisible = true
 }
 
