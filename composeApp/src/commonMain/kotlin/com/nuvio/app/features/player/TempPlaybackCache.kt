@@ -89,6 +89,15 @@ object TempPlaybackCache {
     private val tailDone = mutableSetOf<Long>()
     private val proxied = mutableSetOf<Long>()
 
+    private val activeSessionKeys = mutableMapOf<Long, String>()
+    private var sessionCounter = 0L
+
+    private fun sessionKey(launchId: Long): String {
+        return activeSessionKeys.getOrPut(launchId) {
+            "p${launchId}_${++sessionCounter}"
+        }
+    }
+
     /** True when this playback runs through the loopback proxy (iOS). */
     fun isProxied(launchId: Long): Boolean = proxied.contains(launchId)
 
@@ -118,10 +127,14 @@ object TempPlaybackCache {
     ): Pair<String, Map<String, String>> {
         if (launchId == null || !shouldMirror(sourceUrl)) return sourceUrl to headers
         val bridge = NuvioCacheProxyBridgeFactory.create() ?: return sourceUrl to headers
-        val key = sessionKey(launchId)
-        // Replace any previous session for this playback (e.g. stream switch
-        // or debrid re-resolve) so its files never leak until close.
-        runCatching { bridge.stopSession(key) }
+        // Stop any previous session for this launchId (e.g. stream switch,
+        // next episode, or debrid re-resolve) so its files and sockets never leak.
+        val oldKey = activeSessionKeys.remove(launchId)
+        if (oldKey != null) {
+            runCatching { bridge.stopSession(oldKey) }
+        }
+        val key = "p${launchId}_${++sessionCounter}"
+        activeSessionKeys[launchId] = key
         val local = runCatching {
             bridge.startSession(key, sourceUrl, encodeHeaders(headers))
         }.getOrNull().orEmpty()
@@ -135,17 +148,19 @@ object TempPlaybackCache {
 
     fun pushPlayhead(launchId: Long, positionMs: Long, durationMs: Long) {
         if (!isProxied(launchId)) return
+        val key = activeSessionKeys[launchId] ?: return
         runCatching {
             NuvioCacheProxyBridgeFactory.create()
-                ?.setPlayhead(sessionKey(launchId), positionMs, durationMs)
+                ?.setPlayhead(key, positionMs, durationMs)
         }
     }
 
     fun refreshRanges(launchId: Long) {
         if (!isProxied(launchId)) return
         val bridge = NuvioCacheProxyBridgeFactory.create() ?: return
+        val key = activeSessionKeys[launchId] ?: return
         val statsJson = runCatching {
-            bridge.cacheStatsJson(sessionKey(launchId))
+            bridge.cacheStatsJson(key)
         }.getOrNull().orEmpty()
 
         if (statsJson.isNotBlank() && statsJson != "{}") {
@@ -332,8 +347,9 @@ object TempPlaybackCache {
         started.remove(launchId)
         tailDone.remove(launchId)
         proxied.remove(launchId)
+        val key = activeSessionKeys.remove(launchId) ?: "p$launchId"
         runCatching {
-            NuvioCacheProxyBridgeFactory.create()?.stopSession(sessionKey(launchId))
+            NuvioCacheProxyBridgeFactory.create()?.stopSession(key)
         }
         runCatching { TempPlaybackCachePlatform.cancelAndDelete(launchId) }
         _status.update { current -> current - launchId }
@@ -343,13 +359,8 @@ object TempPlaybackCache {
         // Only call at app cold start when no playback is active.
         started.clear()
         tailDone.clear()
-        val keys = proxied.toList()
+        activeSessionKeys.clear()
         proxied.clear()
-        keys.forEach { key ->
-            runCatching {
-                NuvioCacheProxyBridgeFactory.create()?.stopSession(sessionKey(key))
-            }
-        }
         runCatching {
             NuvioCacheProxyBridgeFactory.create()?.stopAllSessions()
         }

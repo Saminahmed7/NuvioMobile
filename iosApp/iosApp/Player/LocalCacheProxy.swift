@@ -72,7 +72,7 @@ enum NuvioCacheProxyRegistration {
 final class LocalCacheProxyServer {
     static let shared = LocalCacheProxyServer()
 
-    fileprivate let queue = DispatchQueue(label: "nuvio-cache-proxy")
+    fileprivate let queue = DispatchQueue(label: "nuvio-cache-proxy", qos: .userInitiated)
     private var listener: NWListener?
     private var port: UInt16 = 0
     private var sessions: [String: ProxySession] = [:]
@@ -279,7 +279,9 @@ final class ProxySession {
         probeDownloader?.cancel()
         probeDownloader = nil
         headWaiters.removeAll()
+        let conns = Array(activeConnections.values)
         activeConnections.removeAll()
+        conns.forEach { $0.forceClose() }
         try? FileManager.default.removeItem(at: dir)
     }
 
@@ -380,8 +382,8 @@ final class ProxySession {
 
         // 2. If forward downloader is already downloading this region forward, let it run at line rate
         if let fd = forwardDownloader, !fd.isFinished {
-            if fd.startByte <= targetStartByte && fd.streamOffset >= targetStartByte && fd.streamOffset < targetStartByte + 32 * 1024 * 1024 {
-                // Downloader has already passed or is currently streaming inside this chunk
+            if fd.startByte <= targetStartByte && fd.streamOffset >= targetStartByte {
+                // Downloader has already passed or is currently streaming ahead of this chunk
                 return
             }
             // If downloader is within 16 MB behind where bytes are needed,
@@ -623,10 +625,16 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
 
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 60)
         request.httpMethod = "GET"
-        request.networkServiceType = .default
+        request.networkServiceType = .responsiveData
         session.headers.forEach { request.setValue($1, forHTTPHeaderField: $0) }
         if request.value(forHTTPHeaderField: "User-Agent") == nil {
             request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
+        }
+        if request.value(forHTTPHeaderField: "Accept") == nil {
+            request.setValue("*/*", forHTTPHeaderField: "Accept")
+        }
+        if request.value(forHTTPHeaderField: "Accept-Language") == nil {
+            request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
         }
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         request.setValue("bytes=\(startByte)-", forHTTPHeaderField: "Range")
@@ -637,11 +645,15 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         config.timeoutIntervalForRequest = 60
         config.timeoutIntervalForResource = 60 * 60 * 6
         config.waitsForConnectivity = true
-        config.networkServiceType = .default
+        config.networkServiceType = .responsiveData
         config.httpShouldUsePipelining = true
-        config.httpMaximumConnectionsPerHost = 6
+        config.httpMaximumConnectionsPerHost = 10
+        config.shouldUseExtendedBackgroundIdleMode = true
 
-        let s = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+        let opQueue = OperationQueue()
+        opQueue.maxConcurrentOperationCount = 1
+        opQueue.qualityOfService = .userInitiated
+        let s = URLSession(configuration: config, delegate: self, delegateQueue: opQueue)
         self.urlSession = s
         let t = s.dataTask(with: request)
         self.task = t
@@ -763,7 +775,6 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
             }
 
             if totalWritten >= expectedSize {
-                try? h.synchronize()
                 session.markCached(chunkIndex)
             }
             session.notifyDataAvailable(chunkIndex: chunkIndex)
@@ -832,10 +843,16 @@ final class BackwardDownloader: NSObject, URLSessionDataDelegate {
 
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 60)
         request.httpMethod = "GET"
-        request.networkServiceType = .default
+        request.networkServiceType = .responsiveData
         session.headers.forEach { request.setValue($1, forHTTPHeaderField: $0) }
         if request.value(forHTTPHeaderField: "User-Agent") == nil {
             request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
+        }
+        if request.value(forHTTPHeaderField: "Accept") == nil {
+            request.setValue("*/*", forHTTPHeaderField: "Accept")
+        }
+        if request.value(forHTTPHeaderField: "Accept-Language") == nil {
+            request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
         }
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         request.setValue("bytes=\(startByte)-\(endByte)", forHTTPHeaderField: "Range")
@@ -845,9 +862,14 @@ final class BackwardDownloader: NSObject, URLSessionDataDelegate {
         config.timeoutIntervalForRequest = 60
         config.timeoutIntervalForResource = 3600
         config.waitsForConnectivity = true
-        config.networkServiceType = .default
+        config.networkServiceType = .responsiveData
+        config.shouldUseExtendedBackgroundIdleMode = true
 
-        let s = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+        let opQueue = OperationQueue()
+        opQueue.maxConcurrentOperationCount = 1
+        opQueue.qualityOfService = .userInitiated
+
+        let s = URLSession(configuration: config, delegate: self, delegateQueue: opQueue)
         self.urlSession = s
         let t = s.dataTask(with: request)
         self.task = t
@@ -1180,6 +1202,10 @@ final class ProxyConnection {
         connection.send(content: payload, completion: .contentProcessed { [weak self] _ in
             self?.server.queue.async { self?.close() }
         })
+    }
+
+    fileprivate func forceClose() {
+        close()
     }
 
     private func close() {
