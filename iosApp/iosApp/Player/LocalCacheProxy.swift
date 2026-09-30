@@ -284,7 +284,6 @@ final class ProxySession {
     private var probeDownloader: BackwardDownloader?
     private var activeConnections: [ObjectIdentifier: ProxyConnection] = [:]
     private var headWaiters: [ProxyConnection] = []
-    private var sharedURLSession: URLSession?
 
     init(key: String, sourceUrl: String, headers: [String: String], baseDir: URL, server: LocalCacheProxyServer) {
         self.key = key
@@ -294,29 +293,6 @@ final class ProxySession {
         self.server = server
         try? FileManager.default.createDirectory(at: baseDir, withIntermediateDirectories: true)
         probeTotalSizeIfNeeded()
-    }
-
-    func sharedURLSession() -> URLSession {
-        if let existing = sharedURLSession {
-            return existing
-        }
-        let config = URLSessionConfiguration.default
-        config.urlCache = nil
-        config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        config.timeoutIntervalForRequest = 60
-        config.timeoutIntervalForResource = 60 * 60 * 6
-        config.waitsForConnectivity = true
-        config.networkServiceType = .responsiveData
-        config.httpShouldUsePipelining = true
-        config.httpMaximumConnectionsPerHost = 10
-        config.shouldUseExtendedBackgroundIdleMode = true
-
-        let opQueue = OperationQueue()
-        opQueue.maxConcurrentOperationCount = 1
-        opQueue.qualityOfService = .userInitiated
-        let s = URLSession(configuration: config, delegate: nil, delegateQueue: opQueue)
-        sharedURLSession = s
-        return s
     }
 
     func invalidate() {
@@ -331,8 +307,6 @@ final class ProxySession {
         let conns = Array(activeConnections.values)
         activeConnections.removeAll()
         conns.forEach { $0.forceClose() }
-        sharedURLSession?.invalidateAndCancel()
-        sharedURLSession = nil
         try? FileManager.default.removeItem(at: dir)
     }
 
@@ -671,6 +645,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
     private(set) var isFinished = false
 
     private var task: URLSessionDataTask?
+    private var urlSession: URLSession?
     private var fileHandle: FileHandle?
     private var fileHandleChunk: Int64 = -1
     private var isCancelled = false
@@ -689,7 +664,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
 
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 60)
         request.httpMethod = "GET"
-        request.networkServiceType = .responsiveData
+        request.networkServiceType = .default
         session.headers.forEach { request.setValue($1, forHTTPHeaderField: $0) }
         if request.value(forHTTPHeaderField: "User-Agent") == nil {
             request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
@@ -703,8 +678,18 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         request.setValue("bytes=\(startByte)-", forHTTPHeaderField: "Range")
 
-        let urlSession = session.sharedURLSession()
-        let t = urlSession.dataTask(with: request)
+        let config = URLSessionConfiguration.default
+        config.urlCache = nil
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.timeoutIntervalForRequest = 60
+        config.timeoutIntervalForResource = 60 * 60 * 6
+        config.waitsForConnectivity = true
+        config.networkServiceType = .default
+        config.httpMaximumConnectionsPerHost = 6
+
+        let s = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+        self.urlSession = s
+        let t = s.dataTask(with: request)
         self.task = t
         t.resume()
     }
@@ -712,6 +697,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
     func cancel() {
         isCancelled = true
         task?.cancel()
+        urlSession?.invalidateAndCancel()
         cleanupFileHandle()
     }
 
@@ -859,6 +845,7 @@ final class BackwardDownloader: NSObject, URLSessionDataDelegate {
     unowned let session: ProxySession
     let chunkIndex: Int64
     private var task: URLSessionDataTask?
+    private var urlSession: URLSession?
     private var fileHandle: FileHandle?
     private var expectedBytes: Int64 = 0
     private var receivedBytes: Int64 = 0
@@ -890,7 +877,7 @@ final class BackwardDownloader: NSObject, URLSessionDataDelegate {
 
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 60)
         request.httpMethod = "GET"
-        request.networkServiceType = .responsiveData
+        request.networkServiceType = .default
         session.headers.forEach { request.setValue($1, forHTTPHeaderField: $0) }
         if request.value(forHTTPHeaderField: "User-Agent") == nil {
             request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
@@ -904,8 +891,17 @@ final class BackwardDownloader: NSObject, URLSessionDataDelegate {
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         request.setValue("bytes=\(startByte)-\(endByte)", forHTTPHeaderField: "Range")
 
-        let urlSession = session.sharedURLSession()
-        let t = urlSession.dataTask(with: request)
+        let config = URLSessionConfiguration.default
+        config.urlCache = nil
+        config.timeoutIntervalForRequest = 60
+        config.timeoutIntervalForResource = 3600
+        config.waitsForConnectivity = true
+        config.networkServiceType = .default
+        config.httpMaximumConnectionsPerHost = 6
+
+        let s = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+        self.urlSession = s
+        let t = s.dataTask(with: request)
         self.task = t
         t.resume()
     }
@@ -913,6 +909,7 @@ final class BackwardDownloader: NSObject, URLSessionDataDelegate {
     func cancel() {
         isCancelled = true
         task?.cancel()
+        urlSession?.invalidateAndCancel()
         try? fileHandle?.close()
         fileHandle = nil
     }
