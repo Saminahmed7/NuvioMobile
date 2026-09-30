@@ -625,7 +625,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
 
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 60)
         request.httpMethod = "GET"
-        request.networkServiceType = .responsiveData
+        request.networkServiceType = .default
         session.headers.forEach { request.setValue($1, forHTTPHeaderField: $0) }
         if request.value(forHTTPHeaderField: "User-Agent") == nil {
             request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
@@ -645,15 +645,10 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         config.timeoutIntervalForRequest = 60
         config.timeoutIntervalForResource = 60 * 60 * 6
         config.waitsForConnectivity = true
-        config.networkServiceType = .responsiveData
-        config.httpShouldUsePipelining = true
-        config.httpMaximumConnectionsPerHost = 10
-        config.shouldUseExtendedBackgroundIdleMode = true
+        config.networkServiceType = .default
+        config.httpMaximumConnectionsPerHost = 6
 
-        let opQueue = OperationQueue()
-        opQueue.maxConcurrentOperationCount = 1
-        opQueue.qualityOfService = .userInitiated
-        let s = URLSession(configuration: config, delegate: self, delegateQueue: opQueue)
+        let s = URLSession(configuration: config, delegate: self, delegateQueue: nil)
         self.urlSession = s
         let t = s.dataTask(with: request)
         self.task = t
@@ -843,7 +838,7 @@ final class BackwardDownloader: NSObject, URLSessionDataDelegate {
 
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 60)
         request.httpMethod = "GET"
-        request.networkServiceType = .responsiveData
+        request.networkServiceType = .default
         session.headers.forEach { request.setValue($1, forHTTPHeaderField: $0) }
         if request.value(forHTTPHeaderField: "User-Agent") == nil {
             request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
@@ -862,14 +857,10 @@ final class BackwardDownloader: NSObject, URLSessionDataDelegate {
         config.timeoutIntervalForRequest = 60
         config.timeoutIntervalForResource = 3600
         config.waitsForConnectivity = true
-        config.networkServiceType = .responsiveData
-        config.shouldUseExtendedBackgroundIdleMode = true
+        config.networkServiceType = .default
+        config.httpMaximumConnectionsPerHost = 6
 
-        let opQueue = OperationQueue()
-        opQueue.maxConcurrentOperationCount = 1
-        opQueue.qualityOfService = .userInitiated
-
-        let s = URLSession(configuration: config, delegate: self, delegateQueue: opQueue)
+        let s = URLSession(configuration: config, delegate: self, delegateQueue: nil)
         self.urlSession = s
         let t = s.dataTask(with: request)
         self.task = t
