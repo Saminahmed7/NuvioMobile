@@ -530,7 +530,6 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
         activeVideoId, parentMetaId, parentMetaType, contentType, activeSeasonNumber, activeEpisodeNumber,
         playerSettingsUiState.skipIntroEnabled,
     ) {
-        skipIntervals = emptyList()
         autoSkippedIntervals.clear()
         lastManualSkipSeekPositions = null
         activeSkipInterval = null
@@ -544,7 +543,8 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
         val vid = activeVideoId
         if (!playerSettingsUiState.skipIntroEnabled) return@LaunchedEffect
         if ((contentType ?: parentMetaType).equals("movie", ignoreCase = true)) {
-            skipIntervals = SkipIntroRepository.getMovieSkipIntervals(parentMetaId, vid)
+            val intervals = SkipIntroRepository.getMovieSkipIntervals(parentMetaId, vid)
+            skipIntervals = intervals
             return@LaunchedEffect
         }
         if (season == null || episode == null || vid == null) return@LaunchedEffect
