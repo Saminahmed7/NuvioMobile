@@ -24,6 +24,8 @@ private let saminProxyChunkBytes: Int64 = 8 * 1024 * 1024 // 8 MB chunks
 private let saminProxyLowSpaceBytes: Int64 = 500 * 1024 * 1024 // 500 MB
 private let saminProxyMaxRanges = 32
 private let saminProxyPieceBytes: Int = 512 * 1024 // 512 KB socket send slices
+private let saminProxyMinResumeBytes: Int64 = 512 * 1024 // 512 KB prebuffer lead
+private let saminProxySegmentBytes: Int64 = 32 * 1024 * 1024 // 32 MB bounded upstream segment
 
 final class LocalCacheProxyLog {
     static let shared = LocalCacheProxyLog()
@@ -749,7 +751,12 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
     private var fileHandleChunk: Int64 = -1
     private var isCancelled = false
     private var retryCount = 0
-    private let maxRetries = 2
+    private let maxRetries = 4
+
+    // Bounded upstream segments & watchdog state
+    private var currentSegmentStart: Int64 = -1
+    private var lastByteReceivedUptime: TimeInterval = 0
+    private var watchdogTimer: DispatchSourceTimer?
 
     init(session: ProxySession, startByte: Int64) {
         self.session = session
@@ -758,16 +765,44 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
     }
 
     func start() {
-        startTask(from: startByte)
+        startSegment(from: startByte)
     }
 
-    private func startTask(from offset: Int64) {
-        guard session.valid, let url = URL(string: session.sourceUrl) else {
+    private func getOrCreateSession() -> URLSession {
+        if let s = self.urlSession {
+            return s
+        }
+        let config = URLSessionConfiguration.default
+        config.urlCache = nil
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.timeoutIntervalForRequest = 30
+        config.timeoutIntervalForResource = 60 * 60 * 6
+        config.waitsForConnectivity = true
+        config.networkServiceType = .default
+        config.httpMaximumConnectionsPerHost = 6
+
+        let s = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+        self.urlSession = s
+        return s
+    }
+
+    private func startSegment(from offset: Int64) {
+        guard session.valid, !isCancelled, !isFinished, let url = URL(string: session.sourceUrl) else {
             finish(failed: true)
             return
         }
 
-        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 60)
+        if let total = session.totalSize, total > 0, offset >= total {
+            LocalCacheProxyLog.shared.log("FD [\(startByte)]: Offset \(offset) >= total \(total), forward download complete.")
+            finish(failed: false)
+            return
+        }
+
+        currentSegmentStart = offset
+        lastByteReceivedUptime = ProcessInfo.processInfo.systemUptime
+        startWatchdog()
+
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
         request.httpMethod = "GET"
         request.networkServiceType = .default
         session.headers.forEach { request.setValue($1, forHTTPHeaderField: $0) }
@@ -781,30 +816,85 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
             request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
         }
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
-        request.setValue("bytes=\(offset)-", forHTTPHeaderField: "Range")
 
-        LocalCacheProxyLog.shared.log("FD [\(startByte)]: Sending GET Range: bytes=\(offset)-")
+        let segEnd: Int64
+        if let total = session.totalSize, total > 0 {
+            segEnd = min(offset + saminProxySegmentBytes - 1, total - 1)
+        } else {
+            segEnd = offset + saminProxySegmentBytes - 1
+        }
+        request.setValue("bytes=\(offset)-\(segEnd)", forHTTPHeaderField: "Range")
 
-        let config = URLSessionConfiguration.default
-        config.urlCache = nil
-        config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        config.timeoutIntervalForRequest = 60
-        config.timeoutIntervalForResource = 60 * 60 * 6
-        config.waitsForConnectivity = true
-        config.networkServiceType = .default
-        config.httpMaximumConnectionsPerHost = 6
+        LocalCacheProxyLog.shared.log("FD [\(startByte)]: Requesting segment bytes=\(offset)-\(segEnd)")
 
-        let s = URLSession(configuration: config, delegate: self, delegateQueue: nil)
-        self.urlSession = s
+        let s = getOrCreateSession()
         let t = s.dataTask(with: request)
         self.task = t
         t.resume()
     }
 
+    private func startWatchdog() {
+        stopWatchdog()
+        lastByteReceivedUptime = ProcessInfo.processInfo.systemUptime
+        let timer = DispatchSource.makeTimerSource(queue: session.server.queue)
+        timer.schedule(deadline: .now() + 1.0, repeating: 1.0)
+        timer.setEventHandler { [weak self] in
+            guard let self, !self.isCancelled, !self.isFinished else { return }
+            self.checkWatchdog()
+        }
+        timer.resume()
+        self.watchdogTimer = timer
+    }
+
+    private func stopWatchdog() {
+        watchdogTimer?.cancel()
+        watchdogTimer = nil
+    }
+
+    private func checkWatchdog() {
+        guard task != nil, !isCancelled, !isFinished else { return }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        let idle = now - lastByteReceivedUptime
+        let clientIsWaiting = session.activeConnections.values.contains { $0.isWaitingForData }
+        let threshold: TimeInterval = clientIsWaiting ? 4.0 : 8.0
+
+        if idle >= threshold {
+            LocalCacheProxyLog.shared.log("FD [\(startByte)]: Stall watchdog triggered after \(String(format: "%.1f", idle))s (clientWaiting=\(clientIsWaiting)). Reconnecting from \(streamOffset)...")
+            restartFromCurrentOffset(reason: "stall watchdog (\(String(format: "%.1f", idle))s idle)")
+        }
+    }
+
+    private func restartFromCurrentOffset(reason: String) {
+        guard !isCancelled, !isFinished, session.valid else { return }
+        cleanupTaskAndSession()
+        cleanupFileHandle()
+
+        retryCount += 1
+        if retryCount > maxRetries {
+            LocalCacheProxyLog.shared.log("FD [\(startByte)]: Max retries (\(maxRetries)) exceeded at \(streamOffset) after \(reason)")
+            finish(failed: true)
+            return
+        }
+
+        LocalCacheProxyLog.shared.log("FD [\(startByte)]: Auto-retrying (\(retryCount)/\(maxRetries)) from \(streamOffset) [\(reason)]...")
+        session.server.queue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self, !self.isCancelled, !self.isFinished, self.session.valid else { return }
+            self.startSegment(from: self.streamOffset)
+        }
+    }
+
+    private func cleanupTaskAndSession() {
+        task?.cancel()
+        task = nil
+        urlSession?.invalidateAndCancel()
+        urlSession = nil
+    }
+
     func cancel() {
         isCancelled = true
-        task?.cancel()
-        urlSession?.invalidateAndCancel()
+        stopWatchdog()
+        cleanupTaskAndSession()
         cleanupFileHandle()
     }
 
@@ -830,23 +920,34 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         LocalCacheProxyLog.shared.log("FD [\(startByte)]: Upstream HTTP \(code), CR=\(lowered["content-range"] ?? "none"), CL=\(lowered["content-length"] ?? "none")")
 
         guard code == 200 || code == 206 else {
+            if code == 416 {
+                LocalCacheProxyLog.shared.log("FD [\(startByte)]: Upstream HTTP 416 (EOF reached)")
+                completionHandler(.cancel)
+                self.session.server.queue.async { [weak self] in
+                    self?.finish(failed: false)
+                }
+                return
+            }
             LocalCacheProxyLog.shared.log("FD [\(startByte)]: HTTP error \(code) from upstream")
             completionHandler(.cancel)
-            finish(failed: true)
+            self.session.server.queue.async { [weak self] in
+                self?.finish(failed: true)
+            }
             return
         }
 
-        if code == 200 && self.startByte > 0 {
+        if code == 200 && self.streamOffset > 0 {
             LocalCacheProxyLog.shared.log("FD [\(startByte)]: WARNING - Upstream returned 200 OK (server ignored Range header)")
         }
 
         self.session.server.queue.async { [weak self] in
             guard let self, !self.isCancelled, self.session.valid else { return }
+            self.lastByteReceivedUptime = ProcessInfo.processInfo.systemUptime
             if self.session.totalSize == nil {
                 if code == 206, let cr = lowered["content-range"], let total = ProxyConnectionTotal.parse(cr) {
                     self.session.totalSize = total
                 } else if let len = lowered["content-length"].flatMap(Int64.init), len > 0 {
-                    self.session.totalSize = (code == 206 ? self.startByte : 0) + len
+                    self.session.totalSize = (code == 206 ? self.streamOffset : 0) + len
                 }
             }
             if self.session.contentType == nil, let type = lowered["content-type"], !type.isEmpty {
@@ -861,33 +962,42 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         guard !isCancelled, !data.isEmpty else { return }
         self.session.server.queue.async { [weak self] in
             guard let self, !self.isCancelled, self.session.valid else { return }
+            self.lastByteReceivedUptime = ProcessInfo.processInfo.systemUptime
+            self.retryCount = 0
             self.processIncoming(data: data)
         }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         self.session.server.queue.async { [weak self] in
-            guard let self, !self.isCancelled else { return }
+            guard let self, !self.isCancelled, !self.isFinished else { return }
             if let error = error as NSError?, error.code == NSURLErrorCancelled {
                 return
             }
             if let error {
                 LocalCacheProxyLog.shared.log("FD [\(self.startByte)]: Disconnect error: '\(error.localizedDescription)' at offset \(self.streamOffset)")
-                if self.retryCount < self.maxRetries && self.session.valid {
-                    self.retryCount += 1
-                    LocalCacheProxyLog.shared.log("FD [\(self.startByte)]: Auto-retrying (\(self.retryCount)/\(self.maxRetries)) from \(self.streamOffset)...")
-                    self.cleanupFileHandle()
-                    self.urlSession?.invalidateAndCancel()
-                    self.task = nil
-                    self.urlSession = nil
-                    self.session.server.queue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                        guard let self, !self.isCancelled, self.session.valid else { return }
-                        self.startTask(from: self.streamOffset)
-                    }
-                    return
-                }
+                self.restartFromCurrentOffset(reason: error.localizedDescription)
+                return
             }
-            self.finish(failed: error != nil)
+
+            // Normal completion of the bounded segment
+            self.retryCount = 0
+            self.task = nil
+
+            if let total = self.session.totalSize, self.streamOffset >= total {
+                LocalCacheProxyLog.shared.log("FD [\(self.startByte)]: Segment completed and reached EOF (\(self.streamOffset)/\(total))")
+                self.finish(failed: false)
+                return
+            }
+
+            if self.streamOffset == self.currentSegmentStart {
+                LocalCacheProxyLog.shared.log("FD [\(self.startByte)]: Segment completed with 0 bytes transferred at \(self.streamOffset)")
+                self.finish(failed: false)
+                return
+            }
+
+            LocalCacheProxyLog.shared.log("FD [\(self.startByte)]: Segment completed at \(self.streamOffset). Requesting next segment...")
+            self.startSegment(from: self.streamOffset)
         }
     }
 
@@ -954,6 +1064,8 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
     private func finish(failed: Bool) {
         guard !isFinished else { return }
         isFinished = true
+        stopWatchdog()
+        cleanupTaskAndSession()
         cleanupFileHandle()
 
         if !failed {
@@ -1283,6 +1395,18 @@ final class ProxyConnection {
         let available = session.bytesAvailable(for: chunkIdx)
 
         if chunkOffset < available {
+            let bytesAhead = available - chunkOffset
+            let forwardActive = session.forwardDownloader != nil && !(session.forwardDownloader?.isFinished ?? false)
+            let isAtStreamEnd = (streamOffset + bytesAhead > streamEnd) || (session.totalSize != nil && streamOffset + bytesAhead >= session.totalSize!)
+
+            // Pre-buffering margin (shock absorber):
+            // If the connection was waiting for live data, avoid leaking tiny 16KB starved packets to MPV.
+            // Hold back until at least saminProxyMinResumeBytes (512 KB) are buffered ahead,
+            // unless the chunk is fully cached, forward downloading is finished, or we're at EOF.
+            if isWaitingForData && forwardActive && bytesAhead < saminProxyMinResumeBytes && !session.cachedChunks.contains(chunkIdx) && !isAtStreamEnd {
+                return
+            }
+
             isWaitingForData = false
             waitingChunkIndex = -1
 
