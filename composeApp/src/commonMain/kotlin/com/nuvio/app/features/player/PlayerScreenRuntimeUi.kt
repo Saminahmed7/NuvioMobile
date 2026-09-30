@@ -182,7 +182,9 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
                     onSnapshot = { snapshot ->
                         if (!active.value || !updatePlaybackSnapshot(snapshot, playbackKey)) return@PlatformPlayerSurface
                         refreshAudioTracksIfChanged()
-                        if (!snapshot.isLoading) initialLoadCompleted = true
+                        if (!snapshot.isLoading || snapshot.isPlaying || snapshot.positionMs > 0L) {
+                            initialLoadCompleted = true
+                        }
                         if (snapshot.isEnded) {
                             shouldPlay = false
                             controlsVisible = !playerControlsLocked

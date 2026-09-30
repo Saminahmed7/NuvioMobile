@@ -342,13 +342,16 @@ final class ProxySession {
     func ensureForwardDownloading(from startByte: Int64) {
         guard valid else { return }
 
-        let chunkIdx = startByte / saminProxyChunkBytes
+        // Start caching from a second before where the stream starts/requests.
+        // In LocalCacheProxy, 1 chunk = 2 MB, which corresponds to ~1-2 seconds of video.
+        let effectiveStartByte = max(0, startByte - saminProxyChunkBytes)
+        let chunkIdx = effectiveStartByte / saminProxyChunkBytes
+        let targetStartByte = chunkIdx * saminProxyChunkBytes
 
-        // If totalSize is not known yet, start from alignedStart
+        // If totalSize is not known yet, start from targetStartByte
         guard let total = totalSize, total > 0 else {
-            let alignedStart = chunkIdx * saminProxyChunkBytes
             if forwardDownloader == nil {
-                let fd = ForwardDownloader(session: self, startByte: alignedStart)
+                let fd = ForwardDownloader(session: self, startByte: targetStartByte)
                 self.forwardDownloader = fd
                 fd.start()
             }
@@ -359,26 +362,26 @@ final class ProxySession {
         // and forwardDownloader is actively running near the beginning/playhead:
         if (total - startByte) <= 4 * 1024 * 1024,
            let fd = forwardDownloader, !fd.isFinished, fd.streamOffset < (total - 32 * 1024 * 1024) {
-            fetchProbeChunk(chunkIndex: chunkIdx)
+            fetchProbeChunk(chunkIndex: startByte / saminProxyChunkBytes)
             return
         }
 
-        // Find the first uncached chunk at or after chunkIdx
+        // Check if all chunks from chunkIdx to EOF are already cached
         let totalChunks = (total + saminProxyChunkBytes - 1) / saminProxyChunkBytes
-        var targetChunk = chunkIdx
-        while targetChunk < totalChunks && cachedChunks.contains(targetChunk) {
-            targetChunk += 1
+        var allCachedForward = true
+        for c in chunkIdx..<totalChunks {
+            if !cachedChunks.contains(c) {
+                allCachedForward = false
+                break
+            }
         }
-
-        if targetChunk >= totalChunks {
-            // Everything forward from startByte to EOF is fully cached!
+        if allCachedForward {
+            // Everything forward from target position to EOF is fully cached!
             forwardDownloader?.cancel()
             forwardDownloader = nil
-            onForwardCompleted(startByte: startByte)
+            onForwardCompleted(startByte: targetStartByte)
             return
         }
-
-        let targetStartByte = targetChunk * saminProxyChunkBytes
 
         // 2. If forward downloader is already downloading this region forward, let it run at line rate
         if let fd = forwardDownloader, !fd.isFinished {

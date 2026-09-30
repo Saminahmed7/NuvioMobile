@@ -489,6 +489,7 @@ private fun PlayerScreenRuntime.resetEpisodePanelAndNextEpisodeState() {
     isScrubbingTimeline = false
     scrubbingPositionMs = null
     pendingSeekPositionMs = null
+    playbackSnapshot = PlayerPlaybackSnapshot()
 }
 
 private fun PlayerScreenRuntime.resolveEpisodeResume(epVideoId: String, episode: MetaVideo): EpisodeResume {

@@ -64,6 +64,7 @@ actual fun PlatformPlayerSurface(
     val latestOnControllerReady = rememberUpdatedState(onControllerReady)
     val latestOnSnapshot = rememberUpdatedState(onSnapshot)
     val latestOnError = rememberUpdatedState(onError)
+    val latestOnInitialPositionHandled = rememberUpdatedState(onInitialPositionHandled)
     val density = LocalDensity.current
     PlayerSettingsRepository.ensureLoaded()
     val playerSettings by PlayerSettingsRepository.uiState.collectAsStateWithLifecycle()
@@ -292,6 +293,13 @@ actual fun PlatformPlayerSurface(
             headersJson = encodePlaybackHeadersForBridge(sourceHeaders),
             subtitlesJson = encodeExternalSubtitlesForBridge(externalSubtitles),
         )
+        val startPos = initialPositionMs?.takeIf { it > 0L }
+        if (startPos != null) {
+            bridge.seekTo(startPos)
+        }
+        initialPositionRequestKey?.let { key ->
+            latestOnInitialPositionHandled.value(key, true)
+        }
         if (playWhenReady) {
             bridge.play()
         } else {
