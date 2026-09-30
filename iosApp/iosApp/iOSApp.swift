@@ -6,7 +6,12 @@ struct iOSApp: App {
     @UIApplicationDelegateAdaptor(OrientationLockAppDelegate.self) private var appDelegate
 
     init() {
-        // Samin temp cache: clear orphaned mirrors from crashed sessions.
+        // Register proxy and player bridges before any Kotlin code runs
+        NuvioCacheProxyRegistration.register()
+        NuvioPlayerRegistration.register()
+
+        // Clear all orphaned cache chunks from crashed or terminated sessions
+        LocalCacheProxyServer.shared.stopAllSessions()
         TempPlaybackCache.shared.sweepOnColdStart()
     }
 

@@ -25,7 +25,7 @@ private let saminProxyLowSpaceBytes: Int64 = 500 * 1024 * 1024 // 500 MB
 private let saminProxyMaxRanges = 32
 private let saminProxyPieceBytes: Int = 512 * 1024 // 512 KB socket send slices
 private let saminProxyMinResumeBytes: Int64 = 512 * 1024 // 512 KB prebuffer lead
-private let saminProxySegmentBytes: Int64 = 32 * 1024 * 1024 // 32 MB bounded upstream segment
+private let saminProxySegmentBytes: Int64 = 64 * 1024 * 1024 // 64 MB bounded upstream segment
 
 final class LocalCacheProxyLog {
     static let shared = LocalCacheProxyLog()
@@ -121,6 +121,32 @@ final class LocalCacheProxyServer {
     private var connections: [ObjectIdentifier: ProxyConnection] = [:]
     private let preferredPorts: [UInt16] = [19842, 19843, 19844, 19845, 19846, 19847, 19848, 19849]
     private var preferredPortIndex = 0
+    private var activeBoundPort: UInt16 = 19842
+
+    private init() {
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            self?.handleWillEnterForeground()
+        }
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            self?.handleWillEnterForeground()
+        }
+    }
+
+    private func handleWillEnterForeground() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            LocalCacheProxyLog.shared.log("Server: Foreground notification received. Ensuring listener on port \(self.activeBoundPort)...")
+            self.ensureListener()
+        }
+    }
 
     static func parseHeadersJson(_ json: String?) -> [String: String] {
         guard
@@ -147,30 +173,52 @@ final class LocalCacheProxyServer {
         queue.async { [weak self] in self?.ensureListener() }
     }
 
+    private func makeTcpParameters() -> NWParameters {
+        let tcpOptions = NWProtocolTCP.Options()
+        tcpOptions.enableKeepalive = true
+        tcpOptions.keepaliveIdle = 5
+        let params = NWParameters(tls: nil, tcp: tcpOptions)
+        params.allowLocalEndpointReuse = true
+        return params
+    }
+
     @discardableResult
-    private func ensureListener() -> Bool {
+    func ensureListener() -> Bool {
         if listener != nil, port != 0 { return true }
-        // Try preferred ports first for consistency across restarts
+
+        // If we have active sessions, we MUST stay on activeBoundPort (e.g. 19842)
+        // so MPV's active stream URLs never get broken.
+        if !sessions.isEmpty && activeBoundPort != 0 {
+            if let wirePort = NWEndpoint.Port(rawValue: activeBoundPort),
+               let created = try? NWListener(using: makeTcpParameters(), on: wirePort) {
+                setupListener(created, port: activeBoundPort)
+                LocalCacheProxyLog.shared.log("Server: Re-bound listener to active session port \(activeBoundPort)")
+                return true
+            }
+        }
+
+        // Try preferred ports in sequence
         while preferredPortIndex < preferredPorts.count {
             let portToTry = preferredPorts[preferredPortIndex]
             preferredPortIndex += 1
             guard let wirePort = NWEndpoint.Port(rawValue: portToTry),
-                  let created = try? NWListener(using: .tcp, on: wirePort) else { continue }
-            listener = created
-            port = portToTry
-            created.stateUpdateHandler = { [weak self] state in
-                self?.queue.async { self?.handleListenerState(state, listener: created) }
-            }
-            created.newConnectionHandler = { [weak self] connection in
-                self?.queue.async { self?.accept(connection) }
-            }
-            created.start(queue: queue)
+                  let created = try? NWListener(using: makeTcpParameters(), on: wirePort) else { continue }
+            setupListener(created, port: portToTry)
+            activeBoundPort = portToTry
+            LocalCacheProxyLog.shared.log("Server: Bound listener to preferred port \(portToTry)")
             return true
         }
+
         // Fallback: let OS assign ephemeral port
         guard let wirePort = NWEndpoint.Port(rawValue: 0),
-              let created = try? NWListener(using: .tcp, on: wirePort) else { return false }
-        listener = created
+              let created = try? NWListener(using: makeTcpParameters(), on: wirePort) else { return false }
+        setupListener(created, port: 0)
+        return true
+    }
+
+    private func setupListener(_ created: NWListener, port: UInt16) {
+        self.listener = created
+        self.port = port
         created.stateUpdateHandler = { [weak self] state in
             self?.queue.async { self?.handleListenerState(state, listener: created) }
         }
@@ -178,25 +226,36 @@ final class LocalCacheProxyServer {
             self?.queue.async { self?.accept(connection) }
         }
         created.start(queue: queue)
-        return true
     }
 
     private func handleListenerState(_ state: NWListener.State, listener: NWListener) {
         switch state {
         case .ready:
-            port = listener.port?.rawValue ?? 0
-        case .failed, .cancelled:
-            if self.listener === listener {
-                self.listener = nil
-                port = 0
-                preferredPortIndex = 0
-                // Auto-recreate listener
-                queue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                    self?.ensureListener()
-                }
-            }
+            self.port = listener.port?.rawValue ?? self.activeBoundPort
+            self.activeBoundPort = self.port
+            LocalCacheProxyLog.shared.log("Server: Listener ready on port \(self.port)")
+        case .failed(let error):
+            LocalCacheProxyLog.shared.log("Server: Listener failed (\(error.localizedDescription))")
+            resetListener(failedListener: listener)
+        case .cancelled:
+            LocalCacheProxyLog.shared.log("Server: Listener cancelled")
+            resetListener(failedListener: listener)
         default:
             break
+        }
+    }
+
+    private func resetListener(failedListener: NWListener) {
+        if self.listener === failedListener {
+            self.listener = nil
+            self.port = 0
+            if self.sessions.isEmpty {
+                self.preferredPortIndex = 0
+            }
+            // Auto-recreate listener after 0.2s pause
+            queue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                self?.ensureListener()
+            }
         }
     }
 
@@ -222,9 +281,31 @@ final class LocalCacheProxyServer {
 
     func stopSession(key: String) {
         queue.sync {
+            var removedAny = false
+            // 1. Exact key match
             if let session = sessions.removeValue(forKey: key) {
                 session.invalidate()
+                removedAny = true
             }
+            // 2. Prefix match (e.g. key="p1", session="p1_1" or key="p1_1", session="p1")
+            let prefix = key.contains("_") ? (key.components(separatedBy: "_").first ?? key) : key
+            let matchingKeys = sessions.keys.filter { $0 == prefix || $0.hasPrefix("\(prefix)_") }
+            for k in matchingKeys {
+                if let s = sessions.removeValue(forKey: k) {
+                    s.invalidate()
+                    removedAny = true
+                }
+            }
+            // 3. Clean matching directories on disk
+            let base = cacheBaseDir()
+            if let contents = try? FileManager.default.contentsOfDirectory(atPath: base.path) {
+                for name in contents where name == key || name == prefix || name.hasPrefix("\(prefix)_") {
+                    let dir = base.appendingPathComponent(name)
+                    try? FileManager.default.removeItem(at: dir)
+                    LocalCacheProxyLog.shared.log("Server: Deleted directory from disk: \(name)")
+                }
+            }
+            LocalCacheProxyLog.shared.log("Server: stopSession('\(key)') done (removedAny=\(removedAny), remainingSessions=\(sessions.count))")
         }
     }
 
@@ -232,7 +313,12 @@ final class LocalCacheProxyServer {
         queue.sync {
             sessions.values.forEach { $0.invalidate() }
             sessions.removeAll()
-            try? FileManager.default.removeItem(at: cacheBaseDir())
+            let base = cacheBaseDir()
+            if FileManager.default.fileExists(atPath: base.path) {
+                try? FileManager.default.removeItem(at: base)
+            }
+            try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+            LocalCacheProxyLog.shared.log("Server: stopAllSessions() completed, base directory cleared.")
         }
     }
 
@@ -399,7 +485,18 @@ final class ProxySession {
         let conns = Array(activeConnections.values)
         activeConnections.removeAll()
         conns.forEach { $0.forceClose() }
-        try? FileManager.default.removeItem(at: dir)
+
+        let targetDir = dir
+        let sessionKey = key
+        do {
+            try FileManager.default.removeItem(at: targetDir)
+            LocalCacheProxyLog.shared.log("Session [\(sessionKey)]: Removed directory \(targetDir.lastPathComponent)")
+        } catch {
+            LocalCacheProxyLog.shared.log("Session [\(sessionKey)]: Could not remove dir immediately (\(error.localizedDescription)); scheduling retry in 0.5s...")
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) {
+                try? FileManager.default.removeItem(at: targetDir)
+            }
+        }
     }
 
     var playheadByte: Int64? {
@@ -745,16 +842,23 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
     private(set) var currentChunkIndex: Int64 = -1
     private(set) var isFinished = false
 
-    private var task: URLSessionDataTask?
+    // Segment task pipeline
+    private var currentTask: URLSessionDataTask?
+    private var currentSegmentStart: Int64 = -1
+    private var currentSegmentOffset: Int64 = -1
+
+    private var nextTask: URLSessionDataTask?
+    private var nextSegmentStart: Int64 = -1
+    private var nextSegmentOffset: Int64 = -1
+    private var hasPrefetchedNext = false
+
     private var urlSession: URLSession?
-    private var fileHandle: FileHandle?
-    private var fileHandleChunk: Int64 = -1
+    private var fileHandles: [Int64: FileHandle] = [:]
     private var isCancelled = false
     private var retryCount = 0
     private let maxRetries = 4
 
-    // Bounded upstream segments & watchdog state
-    private var currentSegmentStart: Int64 = -1
+    // Watchdog
     private var lastByteReceivedUptime: TimeInterval = 0
     private var watchdogTimer: DispatchSourceTimer?
 
@@ -765,7 +869,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
     }
 
     func start() {
-        startSegment(from: startByte)
+        startCurrentSegment(from: startByte)
     }
 
     private func getOrCreateSession() -> URLSession {
@@ -786,22 +890,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         return s
     }
 
-    private func startSegment(from offset: Int64) {
-        guard session.valid, !isCancelled, !isFinished, let url = URL(string: session.sourceUrl) else {
-            finish(failed: true)
-            return
-        }
-
-        if let total = session.totalSize, total > 0, offset >= total {
-            LocalCacheProxyLog.shared.log("FD [\(startByte)]: Offset \(offset) >= total \(total), forward download complete.")
-            finish(failed: false)
-            return
-        }
-
-        currentSegmentStart = offset
-        lastByteReceivedUptime = ProcessInfo.processInfo.systemUptime
-        startWatchdog()
-
+    private func makeSegmentRequest(from offset: Int64, segEnd: Int64, url: URL) -> URLRequest {
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
         request.httpMethod = "GET"
         request.networkServiceType = .default
@@ -816,6 +905,27 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
             request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
         }
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        request.setValue("bytes=\(offset)-\(segEnd)", forHTTPHeaderField: "Range")
+        return request
+    }
+
+    private func startCurrentSegment(from offset: Int64) {
+        guard session.valid, !isCancelled, !isFinished, let url = URL(string: session.sourceUrl) else {
+            finish(failed: true)
+            return
+        }
+
+        if let total = session.totalSize, total > 0, offset >= total {
+            LocalCacheProxyLog.shared.log("FD [\(startByte)]: Offset \(offset) >= total \(total), forward download complete.")
+            finish(failed: false)
+            return
+        }
+
+        currentSegmentStart = offset
+        currentSegmentOffset = offset
+        hasPrefetchedNext = false
+        lastByteReceivedUptime = ProcessInfo.processInfo.systemUptime
+        startWatchdog()
 
         let segEnd: Int64
         if let total = session.totalSize, total > 0 {
@@ -823,13 +933,37 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         } else {
             segEnd = offset + saminProxySegmentBytes - 1
         }
-        request.setValue("bytes=\(offset)-\(segEnd)", forHTTPHeaderField: "Range")
 
         LocalCacheProxyLog.shared.log("FD [\(startByte)]: Requesting segment bytes=\(offset)-\(segEnd)")
-
+        let req = makeSegmentRequest(from: offset, segEnd: segEnd, url: url)
         let s = getOrCreateSession()
-        let t = s.dataTask(with: request)
-        self.task = t
+        let t = s.dataTask(with: req)
+        self.currentTask = t
+        t.resume()
+    }
+
+    private func startPrefetchNextSegment(from offset: Int64) {
+        guard session.valid, !isCancelled, !isFinished, nextTask == nil, let url = URL(string: session.sourceUrl) else { return }
+
+        if let total = session.totalSize, total > 0, offset >= total {
+            return
+        }
+
+        nextSegmentStart = offset
+        nextSegmentOffset = offset
+
+        let segEnd: Int64
+        if let total = session.totalSize, total > 0 {
+            segEnd = min(offset + saminProxySegmentBytes - 1, total - 1)
+        } else {
+            segEnd = offset + saminProxySegmentBytes - 1
+        }
+
+        LocalCacheProxyLog.shared.log("FD [\(startByte)]: Pre-requesting next segment bytes=\(offset)-\(segEnd) to eliminate gap")
+        let req = makeSegmentRequest(from: offset, segEnd: segEnd, url: url)
+        let s = getOrCreateSession()
+        let t = s.dataTask(with: req)
+        self.nextTask = t
         t.resume()
     }
 
@@ -852,7 +986,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
     }
 
     private func checkWatchdog() {
-        guard task != nil, !isCancelled, !isFinished else { return }
+        guard (currentTask != nil || nextTask != nil), !isCancelled, !isFinished else { return }
 
         let now = ProcessInfo.processInfo.systemUptime
         let idle = now - lastByteReceivedUptime
@@ -868,7 +1002,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
     private func restartFromCurrentOffset(reason: String) {
         guard !isCancelled, !isFinished, session.valid else { return }
         cleanupTaskAndSession()
-        cleanupFileHandle()
+        cleanupFileHandles()
 
         retryCount += 1
         if retryCount > maxRetries {
@@ -880,13 +1014,16 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         LocalCacheProxyLog.shared.log("FD [\(startByte)]: Auto-retrying (\(retryCount)/\(maxRetries)) from \(streamOffset) [\(reason)]...")
         session.server.queue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             guard let self, !self.isCancelled, !self.isFinished, self.session.valid else { return }
-            self.startSegment(from: self.streamOffset)
+            self.startCurrentSegment(from: self.streamOffset)
         }
     }
 
     private func cleanupTaskAndSession() {
-        task?.cancel()
-        task = nil
+        currentTask?.cancel()
+        currentTask = nil
+        nextTask?.cancel()
+        nextTask = nil
+        hasPrefetchedNext = false
         urlSession?.invalidateAndCancel()
         urlSession = nil
     }
@@ -895,13 +1032,32 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         isCancelled = true
         stopWatchdog()
         cleanupTaskAndSession()
-        cleanupFileHandle()
+        cleanupFileHandles()
     }
 
-    private func cleanupFileHandle() {
-        try? fileHandle?.close()
-        fileHandle = nil
-        fileHandleChunk = -1
+    private func getFileHandle(for chunkIndex: Int64) -> FileHandle? {
+        if let h = fileHandles[chunkIndex] {
+            return h
+        }
+        let fileUrl = session.chunkURL(chunkIndex)
+        if !FileManager.default.fileExists(atPath: fileUrl.path) {
+            FileManager.default.createFile(atPath: fileUrl.path, contents: nil)
+        }
+        guard let h = try? FileHandle(forUpdating: fileUrl) else { return nil }
+        fileHandles[chunkIndex] = h
+        _ = session.makeRoomForChunk(excluding: chunkIndex)
+        return h
+    }
+
+    private func closeFileHandle(for chunkIndex: Int64) {
+        if let h = fileHandles.removeValue(forKey: chunkIndex) {
+            try? h.close()
+        }
+    }
+
+    private func cleanupFileHandles() {
+        fileHandles.values.forEach { try? $0.close() }
+        fileHandles.removeAll()
     }
 
     // MARK: - URLSessionDataDelegate
@@ -964,7 +1120,40 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
             guard let self, !self.isCancelled, self.session.valid else { return }
             self.lastByteReceivedUptime = ProcessInfo.processInfo.systemUptime
             self.retryCount = 0
-            self.processIncoming(data: data)
+
+            let isCurrent = (dataTask === self.currentTask)
+            let isNext = (dataTask === self.nextTask)
+
+            if isCurrent {
+                let fromOffset = self.currentSegmentOffset
+                self.currentSegmentOffset += Int64(data.count)
+                self.streamOffset = max(self.streamOffset, self.currentSegmentOffset)
+                self.processIncoming(data: data, from: fromOffset)
+
+                // Check prefetch trigger: when current task is within 8 MB of its segment end
+                let segEnd: Int64
+                if let total = self.session.totalSize, total > 0 {
+                    segEnd = min(self.currentSegmentStart + saminProxySegmentBytes - 1, total - 1)
+                } else {
+                    segEnd = self.currentSegmentStart + saminProxySegmentBytes - 1
+                }
+                if !self.hasPrefetchedNext && (segEnd - self.currentSegmentOffset) <= saminProxyChunkBytes {
+                    let nextStart = segEnd + 1
+                    if self.session.totalSize == nil || nextStart < self.session.totalSize! {
+                        self.hasPrefetchedNext = true
+                        self.startPrefetchNextSegment(from: nextStart)
+                    }
+                }
+            } else if isNext {
+                let fromOffset = self.nextSegmentOffset
+                self.nextSegmentOffset += Int64(data.count)
+                self.streamOffset = max(self.streamOffset, self.nextSegmentOffset)
+                self.processIncoming(data: data, from: fromOffset)
+            } else {
+                let fromOffset = self.streamOffset
+                self.streamOffset += Int64(data.count)
+                self.processIncoming(data: data, from: fromOffset)
+            }
         }
     }
 
@@ -974,36 +1163,55 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
             if let error = error as NSError?, error.code == NSURLErrorCancelled {
                 return
             }
-            if let error {
-                LocalCacheProxyLog.shared.log("FD [\(self.startByte)]: Disconnect error: '\(error.localizedDescription)' at offset \(self.streamOffset)")
-                self.restartFromCurrentOffset(reason: error.localizedDescription)
-                return
+
+            let isCurrent = (task === self.currentTask)
+            let isNext = (task === self.nextTask)
+
+            if isCurrent {
+                if let error {
+                    LocalCacheProxyLog.shared.log("FD [\(self.startByte)]: Current segment disconnect error: '\(error.localizedDescription)' at \(self.streamOffset)")
+                    self.restartFromCurrentOffset(reason: error.localizedDescription)
+                    return
+                }
+
+                // Current segment completed successfully
+                self.retryCount = 0
+                self.currentTask = nil
+
+                if let total = self.session.totalSize, self.streamOffset >= total {
+                    LocalCacheProxyLog.shared.log("FD [\(self.startByte)]: Segment completed and reached EOF (\(self.streamOffset)/\(total))")
+                    self.finish(failed: false)
+                    return
+                }
+
+                // If next segment was already prefetched and running, promote it seamlessly!
+                if let next = self.nextTask {
+                    LocalCacheProxyLog.shared.log("FD [\(self.startByte)]: Seamless handover: promoted prefetch segment from \(self.nextSegmentStart)")
+                    self.currentTask = next
+                    self.currentSegmentStart = self.nextSegmentStart
+                    self.currentSegmentOffset = self.nextSegmentOffset
+                    self.nextTask = nil
+                    self.nextSegmentStart = -1
+                    self.nextSegmentOffset = -1
+                    self.hasPrefetchedNext = false
+                    return
+                }
+
+                LocalCacheProxyLog.shared.log("FD [\(self.startByte)]: Segment completed at \(self.streamOffset). Requesting next segment...")
+                self.startCurrentSegment(from: self.streamOffset)
+            } else if isNext {
+                if let error {
+                    LocalCacheProxyLog.shared.log("FD [\(self.startByte)]: Prefetch segment error: '\(error.localizedDescription)'. Will retry when current completes.")
+                    self.nextTask = nil
+                    self.hasPrefetchedNext = false
+                }
             }
-
-            // Normal completion of the bounded segment
-            self.retryCount = 0
-            self.task = nil
-
-            if let total = self.session.totalSize, self.streamOffset >= total {
-                LocalCacheProxyLog.shared.log("FD [\(self.startByte)]: Segment completed and reached EOF (\(self.streamOffset)/\(total))")
-                self.finish(failed: false)
-                return
-            }
-
-            if self.streamOffset == self.currentSegmentStart {
-                LocalCacheProxyLog.shared.log("FD [\(self.startByte)]: Segment completed with 0 bytes transferred at \(self.streamOffset)")
-                self.finish(failed: false)
-                return
-            }
-
-            LocalCacheProxyLog.shared.log("FD [\(self.startByte)]: Segment completed at \(self.streamOffset). Requesting next segment...")
-            self.startSegment(from: self.streamOffset)
         }
     }
 
-    private func processIncoming(data: Data) {
+    private func processIncoming(data: Data, from startByte: Int64) {
         session.recordBytesReceived(data.count)
-        var cursor = streamOffset
+        var cursor = startByte
         var remaining = data
 
         while !remaining.isEmpty {
@@ -1016,26 +1224,14 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
             writePiece(chunkIndex: chunkIdx, offset: chunkOffset, piece: piece)
 
             cursor += take
-            streamOffset += take
             remaining = remaining.dropFirst(Int(take))
         }
     }
 
     private func writePiece(chunkIndex: Int64, offset: Int64, piece: Data) {
-        currentChunkIndex = chunkIndex
+        currentChunkIndex = max(currentChunkIndex, chunkIndex)
 
-        if fileHandle == nil || fileHandleChunk != chunkIndex {
-            cleanupFileHandle()
-            let fileUrl = session.chunkURL(chunkIndex)
-            if !FileManager.default.fileExists(atPath: fileUrl.path) {
-                FileManager.default.createFile(atPath: fileUrl.path, contents: nil)
-            }
-            fileHandle = try? FileHandle(forUpdating: fileUrl)
-            fileHandleChunk = chunkIndex
-            _ = session.makeRoomForChunk(excluding: chunkIndex)
-        }
-
-        guard let h = fileHandle else { return }
+        guard let h = getFileHandle(for: chunkIndex) else { return }
         do {
             try h.seek(toOffset: UInt64(offset))
             try h.write(contentsOf: piece)
@@ -1053,6 +1249,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
 
             if totalWritten >= expectedSize {
                 session.markCached(chunkIndex)
+                closeFileHandle(for: chunkIndex)
                 LocalCacheProxyLog.shared.log("FD [\(startByte)]: Cached chunk \(chunkIndex) (totalCached=\(session.cachedChunks.count))")
             }
             session.notifyDataAvailable(chunkIndex: chunkIndex)
@@ -1066,7 +1263,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         isFinished = true
         stopWatchdog()
         cleanupTaskAndSession()
-        cleanupFileHandle()
+        cleanupFileHandles()
 
         if !failed {
             // Check if current final chunk is complete
