@@ -149,6 +149,16 @@ object TempPlaybackCache {
         }
     }
 
+    fun getDiagnosticReport(launchId: Long?): String {
+        val bridge = NuvioCacheProxyBridgeFactory.create()
+            ?: return "Local Cache Proxy is not active on this device/platform."
+        val key = launchId?.let { activeSessionKeys[it] }
+        val report = runCatching {
+            bridge.diagnosticReport(key.orEmpty())
+        }.getOrNull().orEmpty()
+        return if (report.isNotBlank()) report else "No diagnostic report returned from cache proxy server."
+    }
+
     fun refreshRanges(launchId: Long) {
         if (!isProxied(launchId)) return
         val bridge = NuvioCacheProxyBridgeFactory.create() ?: return

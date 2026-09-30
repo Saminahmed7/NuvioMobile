@@ -39,6 +39,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -166,6 +167,14 @@ internal fun PlayerControlActions(
     LaunchedEffect(expanded, scrollState.maxValue) {
         if (expanded) scrollState.animateScrollTo(scrollState.maxValue) else scrollState.scrollTo(0)
     }
+    var showDiagnosticsDialog by remember { mutableStateOf(false) }
+    if (showDiagnosticsDialog) {
+        PlayerDiagnosticsDialog(
+            launchId = cacheStatus?.launchId,
+            onDismiss = { showDiagnosticsDialog = false },
+        )
+    }
+
     CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = PlayerTimelineContentInset),
@@ -205,6 +214,10 @@ internal fun PlayerControlActions(
                 CacheStatsBadge(
                     cacheStatus = cacheStatus,
                     metrics = metrics,
+                    onClick = {
+                        onInteraction()
+                        showDiagnosticsDialog = true
+                    },
                 )
             }
             Box(
@@ -260,6 +273,7 @@ private data class PlayerControlAction(
 private fun CacheStatsBadge(
     cacheStatus: TempCacheStatus,
     metrics: PlayerLayoutMetrics,
+    onClick: (() -> Unit)? = null,
 ) {
     val speedBps = cacheStatus.downloadSpeedBps
     val cached = cacheStatus.totalCachedBytes
@@ -290,17 +304,24 @@ private fun CacheStatsBadge(
         else -> null
     } ?: return
 
+    val badgeShape = RoundedCornerShape(12.dp)
     Box(
         modifier = Modifier
             .padding(horizontal = 4.dp)
             .background(
                 color = Color.Black.copy(alpha = 0.45f),
-                shape = RoundedCornerShape(12.dp),
+                shape = badgeShape,
             )
             .border(
                 width = 0.5.dp,
                 color = Color.White.copy(alpha = 0.2f),
-                shape = RoundedCornerShape(12.dp),
+                shape = badgeShape,
+            )
+            .clip(badgeShape)
+            .then(
+                if (onClick != null) {
+                    Modifier.clickable(role = Role.Button, onClick = onClick)
+                } else Modifier
             )
             .padding(horizontal = 8.dp, vertical = 4.dp),
         contentAlignment = Alignment.Center,

@@ -80,12 +80,19 @@ internal fun LazyListScope.advancedSettingsContent(
             }
             val sentryEnabled by sentryEnabledFlow.collectAsStateWithLifecycle()
             var showSentryDialog by rememberSaveable { mutableStateOf(false) }
+            var showDiagnosticsDialog by rememberSaveable { mutableStateOf(false) }
 
             SettingsSection(
                 title = stringResource(Res.string.settings_advanced_section_diagnostics),
                 isTablet = isTablet,
             ) {
                 SettingsGroup(isTablet = isTablet) {
+                    SettingsNavigationRow(
+                        title = "Playback & Cache Diagnostics",
+                        description = "Inspect live streaming events, download throughput, and export diagnostic logs",
+                        isTablet = isTablet,
+                        onClick = { showDiagnosticsDialog = true },
+                    )
                     SettingsSwitchRow(
                         title = stringResource(Res.string.settings_advanced_sentry_reports),
                         description = stringResource(Res.string.settings_advanced_sentry_reports_subtitle),
@@ -94,6 +101,13 @@ internal fun LazyListScope.advancedSettingsContent(
                         onCheckedChange = { showSentryDialog = true },
                     )
                 }
+            }
+
+            if (showDiagnosticsDialog) {
+                com.nuvio.app.features.player.PlayerDiagnosticsDialog(
+                    launchId = null,
+                    onDismiss = { showDiagnosticsDialog = false },
+                )
             }
 
             if (showSentryDialog) {

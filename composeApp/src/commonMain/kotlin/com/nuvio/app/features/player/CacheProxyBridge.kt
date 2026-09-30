@@ -23,6 +23,7 @@ interface NuvioCacheProxyBridge {
     fun setPlayhead(sessionKey: String, positionMs: Long, durationMs: Long)
     fun cachedRangesJson(sessionKey: String): String
     fun cacheStatsJson(sessionKey: String): String = "{}"
+    fun diagnosticReport(sessionKey: String): String = ""
 }
 
 object NuvioCacheProxyBridgeFactory {
