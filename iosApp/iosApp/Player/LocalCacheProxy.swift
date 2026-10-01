@@ -20,7 +20,7 @@ import ComposeApp
 // 5. Watched data behind the playhead is evicted only under storage pressure.
 // 6. Ephemeral: everything is deleted when playback closes (stopSession).
 
-private let saminProxyChunkBytes: Int64 = 8 * 1024 * 1024 // 8 MB chunks
+private let saminProxyChunkBytes: Int64 = 16 * 1024 * 1024 // 16 MB chunks
 private let saminProxyLowSpaceBytes: Int64 = 500 * 1024 * 1024 // 500 MB
 private let saminProxyMaxRanges = 32
 private let saminProxyPieceBytes: Int = 512 * 1024 // 512 KB socket send slices
@@ -463,18 +463,47 @@ final class ProxySession {
     private var headWaiters: [ProxyConnection] = []
     private var lastForwardDownloaderStartTime: TimeInterval = 0
 
+    private(set) var activeChunkWriters: [Int64: String] = [:]
+
     init(key: String, sourceUrl: String, headers: [String: String], baseDir: URL, server: LocalCacheProxyServer) {
         self.key = key
         self.sourceUrl = sourceUrl
         self.headers = headers
         self.dir = baseDir
         self.server = server
+        if FileManager.default.fileExists(atPath: baseDir.path) {
+            try? FileManager.default.removeItem(at: baseDir)
+        }
         try? FileManager.default.createDirectory(at: baseDir, withIntermediateDirectories: true)
         probeTotalSizeIfNeeded()
     }
 
+    func claimChunkWrite(chunkIndex: Int64, owner: String) -> Bool {
+        if let currentOwner = activeChunkWriters[chunkIndex] {
+            if currentOwner == owner { return true }
+            return false
+        }
+        activeChunkWriters[chunkIndex] = owner
+        return true
+    }
+
+    func releaseChunkWrite(chunkIndex: Int64, owner: String? = nil) {
+        if let owner = owner {
+            if activeChunkWriters[chunkIndex] == owner {
+                activeChunkWriters.removeValue(forKey: chunkIndex)
+            }
+        } else {
+            activeChunkWriters.removeValue(forKey: chunkIndex)
+        }
+    }
+
+    func isChunkBeingWritten(_ chunkIndex: Int64) -> Bool {
+        activeChunkWriters[chunkIndex] != nil
+    }
+
     func invalidate() {
         valid = false
+        activeChunkWriters.removeAll()
         forwardDownloader?.cancel()
         forwardDownloader = nil
         backwardDownloader?.cancel()
@@ -655,6 +684,10 @@ final class ProxySession {
 
     func fetchProbeChunk(chunkIndex: Int64) {
         guard valid, probeDownloader == nil, !cachedChunks.contains(chunkIndex) else { return }
+        if !claimChunkWrite(chunkIndex: chunkIndex, owner: "probe") {
+            LocalCacheProxyLog.shared.log("Session [\(key)]: Chunk \(chunkIndex) already being written by another downloader, skipping probe")
+            return
+        }
         LocalCacheProxyLog.shared.log("Session [\(key)]: Starting probe download for chunk \(chunkIndex)")
         let pd = BackwardDownloader(session: self, chunkIndex: chunkIndex)
         self.probeDownloader = pd
@@ -679,7 +712,7 @@ final class ProxySession {
 
         let totalChunks = (total + saminProxyChunkBytes - 1) / saminProxyChunkBytes
         for idx in 0..<totalChunks {
-            if !cachedChunks.contains(idx) {
+            if !cachedChunks.contains(idx) && claimChunkWrite(chunkIndex: idx, owner: "backward") {
                 let bd = BackwardDownloader(session: self, chunkIndex: idx)
                 self.backwardDownloader = bd
                 bd.start()
@@ -691,9 +724,11 @@ final class ProxySession {
     func onBackwardChunkCompleted(chunkIndex: Int64, success: Bool) {
         if backwardDownloader?.chunkIndex == chunkIndex {
             backwardDownloader = nil
+            releaseChunkWrite(chunkIndex: chunkIndex, owner: "backward")
         }
         if probeDownloader?.chunkIndex == chunkIndex {
             probeDownloader = nil
+            releaseChunkWrite(chunkIndex: chunkIndex, owner: "probe")
         }
         guard valid, success else { return }
         guard server.freeSpaceBytes() >= saminProxyLowSpaceBytes else { return }
@@ -887,6 +922,19 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
             lastCheckUptime = 0
             retryCount = 0
         }
+
+        func resetForNextChunk() {
+            try? fileHandle?.close()
+            fileHandle = nil
+            chunkIndex = -1
+            expectedBytes = 0
+            receivedBytes = 0
+            lastByteUptime = 0
+            bytesAtLastCheck = 0
+            lastCheckUptime = 0
+            retryCount = 0
+            task = nil
+        }
     }
 
     private var workers: [Worker] = []
@@ -966,13 +1014,23 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         // Priority 1: Chunk requested by a client connection actively waiting for data
         for conn in session.activeConnections.values where conn.isWaitingForData {
             let wChunk = conn.waitingChunkIndex
-            if wChunk >= 0 && !session.cachedChunks.contains(wChunk) && !assignedChunks.contains(wChunk) {
-                return wChunk
+            guard wChunk >= 0, !session.cachedChunks.contains(wChunk), !assignedChunks.contains(wChunk) else { continue }
+            // Do not steal chunks actively being handled by probeDownloader
+            if session.probeDownloader?.chunkIndex == wChunk || session.isChunkBeingWritten(wChunk) {
+                continue
             }
+            // Distant EOF probe chunks should be left to probeDownloader
+            if let total = session.totalSize {
+                let eofChunk = (total + saminProxyChunkBytes - 1) / saminProxyChunkBytes - 1
+                if wChunk >= eofChunk - 2 && (wChunk - startChunk) > 6 {
+                    continue
+                }
+            }
+            return wChunk
         }
 
         // Priority 2: Chunk 0 (container metadata headers EBML/moov) required by player
-        if !session.cachedChunks.contains(0) && !assignedChunks.contains(0) {
+        if !session.cachedChunks.contains(0) && !assignedChunks.contains(0) && !session.isChunkBeingWritten(0) {
             return 0
         }
 
@@ -984,11 +1042,10 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         guard lowestUncached < maxChunk else { return nil }
 
         // Sliding window limit: allow workers to download up to lowestUncached + 6 chunks.
-        // This strictly prevents runaway workers from jumping 20+ chunks ahead while playhead starves.
         let windowLimit = min(lowestUncached + 6, maxChunk)
         var candidate = lowestUncached
         while candidate < windowLimit {
-            if !session.cachedChunks.contains(candidate) && !assignedChunks.contains(candidate) {
+            if !session.cachedChunks.contains(candidate) && !assignedChunks.contains(candidate) && !session.isChunkBeingWritten(candidate) {
                 return candidate
             }
             candidate += 1
@@ -1000,12 +1057,25 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         guard session.valid, !isCancelled, !isFinished, chunkIndex >= 0 else { return }
         if session.cachedChunks.contains(chunkIndex) { return }
 
+        // If probeDownloader or backward is actively fetching this chunk, let it finish without interference
+        if session.isChunkBeingWritten(chunkIndex) && !workers.contains(where: { $0.chunkIndex == chunkIndex }) {
+            return
+        }
+
+        // Distant EOF probe chunks should be routed to probeDownloader
+        if let total = session.totalSize {
+            let eofChunk = (total + saminProxyChunkBytes - 1) / saminProxyChunkBytes - 1
+            if chunkIndex >= eofChunk - 2 && (chunkIndex - (startByte / saminProxyChunkBytes)) > 6 {
+                session.fetchProbeChunk(chunkIndex: chunkIndex)
+                return
+            }
+        }
+
         let now = ProcessInfo.processInfo.systemUptime
 
         // 1. If a worker is already assigned to this waiting chunk:
         if let existingWorker = workers.first(where: { $0.chunkIndex == chunkIndex && $0.task != nil }) {
             let idle = now - existingWorker.lastByteUptime
-            // If it's been idle for >= 2.0s while client is waiting, restart it immediately
             if idle >= 2.0 {
                 LocalCacheProxyLog.shared.log("FD Worker \(existingWorker.id): Client waiting on chunk \(chunkIndex), worker idle \(String(format: "%.1f", idle))s -> immediate reconnect")
                 restartWorker(existingWorker, chunkIndex: chunkIndex, reason: "client waiting & idle")
@@ -1014,15 +1084,13 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         }
 
         // 2. No worker is currently assigned to chunkIndex:
-        // Try starting an idle worker
         if let idleWorker = workers.first(where: { $0.task == nil }) {
             LocalCacheProxyLog.shared.log("FD: Client waiting on chunk \(chunkIndex), assigning idle Worker \(idleWorker.id)")
             startWorker(idleWorker, chunkIndex: chunkIndex)
             return
         }
 
-        // 3. All 4 workers are busy downloading chunks further ahead:
-        // Preempt the worker that is downloading the furthest unneeded chunk
+        // 3. Preempt the worker that is downloading the furthest unneeded chunk
         if let furthestWorker = workers.filter({ $0.task != nil && $0.chunkIndex != chunkIndex }).max(by: { $0.chunkIndex < $1.chunkIndex }) {
             let preemptedChunk = furthestWorker.chunkIndex
             if preemptedChunk > chunkIndex {
@@ -1032,6 +1100,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
                 try? furthestWorker.fileHandle?.close()
                 furthestWorker.fileHandle = nil
                 assignedChunks.remove(preemptedChunk)
+                session.releaseChunkWrite(chunkIndex: preemptedChunk, owner: "forward_w\(furthestWorker.id)")
                 furthestWorker.reset()
                 startWorker(furthestWorker, chunkIndex: chunkIndex)
             }
@@ -1068,6 +1137,14 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
     private func startWorker(_ worker: Worker, chunkIndex: Int64) {
         guard session.valid, !isCancelled, !isFinished, let url = URL(string: session.sourceUrl) else { return }
 
+        guard session.claimChunkWrite(chunkIndex: chunkIndex, owner: "forward_w\(worker.id)") else {
+            LocalCacheProxyLog.shared.log("FD Worker \(worker.id): Chunk \(chunkIndex) is claimed by another downloader, skipping")
+            assignedChunks.remove(chunkIndex)
+            worker.reset()
+            dispatchWorkers()
+            return
+        }
+
         assignedChunks.insert(chunkIndex)
         worker.chunkIndex = chunkIndex
 
@@ -1075,6 +1152,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         let chunkEnd: Int64
         if let total = session.totalSize, total > 0 {
             if chunkStart >= total {
+                session.releaseChunkWrite(chunkIndex: chunkIndex, owner: "forward_w\(worker.id)")
                 assignedChunks.remove(chunkIndex)
                 worker.reset()
                 return
@@ -1097,9 +1175,10 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         // If chunk is already fully on disk, mark cached immediately
         if existingBytes >= fullExpectedBytes {
             session.markCached(chunkIndex)
+            session.releaseChunkWrite(chunkIndex: chunkIndex, owner: "forward_w\(worker.id)")
             session.notifyDataAvailable(chunkIndex: chunkIndex)
             assignedChunks.remove(chunkIndex)
-            worker.reset()
+            worker.resetForNextChunk()
             dispatchWorkers()
             return
         }
@@ -1111,6 +1190,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         }
 
         guard let h = try? FileHandle(forUpdating: fileUrl) else {
+            session.releaseChunkWrite(chunkIndex: chunkIndex, owner: "forward_w\(worker.id)")
             assignedChunks.remove(chunkIndex)
             worker.reset()
             return
@@ -1239,6 +1319,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
 
         if worker.retryCount > 6 {
             LocalCacheProxyLog.shared.log("FD Worker \(worker.id): Max retries exceeded on chunk \(chunkIndex)")
+            session.releaseChunkWrite(chunkIndex: chunkIndex, owner: "forward_w\(worker.id)")
             assignedChunks.remove(chunkIndex)
             worker.reset()
             dispatchWorkers()
@@ -1255,7 +1336,15 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
     func cancel() {
         isCancelled = true
         stopWatchdog()
-        workers.forEach { $0.reset() }
+        for worker in workers {
+            if worker.chunkIndex >= 0 {
+                session.releaseChunkWrite(chunkIndex: worker.chunkIndex, owner: "forward_w\(worker.id)")
+            }
+            worker.reset()
+        }
+        for chunk in assignedChunks {
+            session.releaseChunkWrite(chunkIndex: chunk, owner: "forward")
+        }
         assignedChunks.removeAll()
         urlSession?.invalidateAndCancel()
         urlSession = nil
@@ -1315,6 +1404,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
                 let expected = worker.expectedBytes > 0 ? worker.expectedBytes : saminProxyChunkBytes
                 if (self.session.bytesWrittenByChunk[chunkIdx] ?? 0) >= expected {
                     self.session.markCached(chunkIdx)
+                    self.session.releaseChunkWrite(chunkIndex: chunkIdx, owner: "forward_w\(worker.id)")
                     self.session.notifyDataAvailable(chunkIndex: chunkIdx)
                 } else {
                     self.session.bytesWrittenByChunk[chunkIdx] = 0
@@ -1324,6 +1414,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
                         try? h.close()
                     }
                 }
+                self.session.releaseChunkWrite(chunkIndex: chunkIdx, owner: "forward_w\(worker.id)")
                 self.assignedChunks.remove(chunkIdx)
                 worker.reset()
                 self.dispatchWorkers()
@@ -1359,16 +1450,13 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
                 let expectedSize = worker.expectedBytes > 0 ? worker.expectedBytes : saminProxyChunkBytes
                 if worker.receivedBytes >= expectedSize {
                     self.session.markCached(chunkIdx)
+                    self.session.releaseChunkWrite(chunkIndex: chunkIdx, owner: "forward_w\(worker.id)")
                     try? worker.fileHandle?.close()
                     worker.fileHandle = nil
                     LocalCacheProxyLog.shared.log("FD Worker \(worker.id): Cached chunk \(chunkIdx) (totalCached=\(self.session.cachedChunks.count))")
 
-                    let taskToCancel = worker.task
-                    worker.task = nil
-                    taskToCancel?.cancel()
-
                     self.assignedChunks.remove(chunkIdx)
-                    worker.reset()
+                    worker.resetForNextChunk()
                     self.dispatchWorkers()
                 }
                 self.session.notifyDataAvailable(chunkIndex: chunkIdx)
@@ -1387,9 +1475,11 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
             guard let worker = self.worker(for: task) else { return }
 
             let chunkIdx = worker.chunkIndex
+            guard chunkIdx >= 0 else { return } // Already marked cached and reset
 
             if let error {
                 LocalCacheProxyLog.shared.log("FD Worker \(worker.id): Disconnect error on chunk \(chunkIdx): '\(error.localizedDescription)'")
+                self.session.releaseChunkWrite(chunkIndex: chunkIdx, owner: "forward_w\(worker.id)")
                 self.restartWorker(worker, chunkIndex: chunkIdx, reason: error.localizedDescription)
                 return
             }
@@ -1398,14 +1488,16 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
             let expectedSize = worker.expectedBytes > 0 ? worker.expectedBytes : saminProxyChunkBytes
             if worker.receivedBytes >= expectedSize {
                 self.session.markCached(chunkIdx)
+                self.session.releaseChunkWrite(chunkIndex: chunkIdx, owner: "forward_w\(worker.id)")
                 self.session.notifyDataAvailable(chunkIndex: chunkIdx)
                 try? worker.fileHandle?.close()
                 worker.fileHandle = nil
                 self.assignedChunks.remove(chunkIdx)
-                worker.reset()
+                worker.resetForNextChunk()
                 self.dispatchWorkers()
             } else {
                 LocalCacheProxyLog.shared.log("FD Worker \(worker.id): Premature close on chunk \(chunkIdx) (\(worker.receivedBytes)/\(expectedSize) bytes)")
+                self.session.releaseChunkWrite(chunkIndex: chunkIdx, owner: "forward_w\(worker.id)")
                 self.restartWorker(worker, chunkIndex: chunkIdx, reason: "premature close (\(worker.receivedBytes)/\(expectedSize))")
             }
         }
@@ -1415,7 +1507,15 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         guard !isFinished else { return }
         isFinished = true
         stopWatchdog()
-        workers.forEach { $0.reset() }
+        for worker in workers {
+            if worker.chunkIndex >= 0 {
+                session.releaseChunkWrite(chunkIndex: worker.chunkIndex, owner: "forward_w\(worker.id)")
+            }
+            worker.reset()
+        }
+        for chunk in assignedChunks {
+            session.releaseChunkWrite(chunkIndex: chunk, owner: "forward")
+        }
         assignedChunks.removeAll()
         urlSession?.invalidateAndCancel()
         urlSession = nil
@@ -1450,11 +1550,17 @@ final class BackwardDownloader: NSObject, URLSessionDataDelegate {
 
     func start() {
         guard session.valid, let total = session.totalSize, total > 0,
-              let url = URL(string: session.sourceUrl) else { return }
+              let url = URL(string: session.sourceUrl) else {
+            session.onBackwardChunkCompleted(chunkIndex: chunkIndex, success: false)
+            return
+        }
 
         let startByte = chunkIndex * saminProxyChunkBytes
         let endByte = min(startByte + saminProxyChunkBytes - 1, total - 1)
-        guard endByte >= startByte else { return }
+        guard endByte >= startByte else {
+            session.onBackwardChunkCompleted(chunkIndex: chunkIndex, success: false)
+            return
+        }
 
         expectedBytes = endByte - startByte + 1
 
@@ -1479,7 +1585,10 @@ final class BackwardDownloader: NSObject, URLSessionDataDelegate {
             session.bytesWrittenByChunk[chunkIndex] = 0
         }
 
-        guard let h = try? FileHandle(forUpdating: fileUrl) else { return }
+        guard let h = try? FileHandle(forUpdating: fileUrl) else {
+            session.onBackwardChunkCompleted(chunkIndex: chunkIndex, success: false)
+            return
+        }
 
         if existingBytes > 0 {
             do {
@@ -1538,6 +1647,7 @@ final class BackwardDownloader: NSObject, URLSessionDataDelegate {
         urlSession?.invalidateAndCancel()
         try? fileHandle?.close()
         fileHandle = nil
+        session.releaseChunkWrite(chunkIndex: chunkIndex)
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
