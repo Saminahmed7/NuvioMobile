@@ -618,8 +618,20 @@ final class ProxySession {
         // and forwardDownloader is actively running near the beginning/playhead:
         if (total - startByte) <= 16 * 1024 * 1024,
            let fd = forwardDownloader, !fd.isFinished, fd.streamOffset < (total - 32 * 1024 * 1024) {
-            LocalCacheProxyLog.shared.log("Session [\(key)]: End-of-file probe at \(startByte); using probe chunk \(startByte / saminProxyChunkBytes)")
+            if probeDownloader == nil {
+                LocalCacheProxyLog.shared.log("Session [\(key)]: End-of-file probe at \(startByte); using probe chunk \(startByte / saminProxyChunkBytes)")
+            }
             fetchProbeChunk(chunkIndex: startByte / saminProxyChunkBytes)
+            return
+        }
+
+        // 3.5 If requested range is Chunk 0 (container header) and forwardDownloader is actively running at a forward seek position:
+        if chunkIdx == 0 && !cachedChunks.contains(0),
+           let fd = forwardDownloader, !fd.isFinished, fd.startByte > (32 * 1024 * 1024) {
+            if probeDownloader == nil {
+                LocalCacheProxyLog.shared.log("Session [\(key)]: Container header probe at chunk 0 while FD is running at \(fd.startByte); using probe chunk 0")
+            }
+            fetchProbeChunk(chunkIndex: 0)
             return
         }
 
@@ -643,9 +655,14 @@ final class ProxySession {
 
     func fetchProbeChunk(chunkIndex: Int64) {
         guard valid, probeDownloader == nil, !cachedChunks.contains(chunkIndex) else { return }
+        LocalCacheProxyLog.shared.log("Session [\(key)]: Starting probe download for chunk \(chunkIndex)")
         let pd = BackwardDownloader(session: self, chunkIndex: chunkIndex)
         self.probeDownloader = pd
         pd.start()
+    }
+
+    func notifyClientWaiting(chunkIndex: Int64) {
+        forwardDownloader?.onClientWaiting(chunkIndex: chunkIndex)
     }
 
     func onForwardCompleted(startByte: Int64) {
@@ -849,6 +866,8 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         var expectedBytes: Int64 = 0
         var receivedBytes: Int64 = 0
         var lastByteUptime: TimeInterval = 0
+        var bytesAtLastCheck: Int64 = 0
+        var lastCheckUptime: TimeInterval = 0
         var retryCount: Int = 0
 
         init(id: Int) {
@@ -864,6 +883,8 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
             expectedBytes = 0
             receivedBytes = 0
             lastByteUptime = 0
+            bytesAtLastCheck = 0
+            lastCheckUptime = 0
             retryCount = 0
         }
     }
@@ -942,14 +963,79 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
             maxChunk = startChunk + 16
         }
 
-        var candidate = startChunk
-        while candidate < maxChunk {
+        // Priority 1: Chunk requested by a client connection actively waiting for data
+        for conn in session.activeConnections.values where conn.isWaitingForData {
+            let wChunk = conn.waitingChunkIndex
+            if wChunk >= 0 && !session.cachedChunks.contains(wChunk) && !assignedChunks.contains(wChunk) {
+                return wChunk
+            }
+        }
+
+        // Priority 2: Chunk 0 (container metadata headers EBML/moov) required by player
+        if !session.cachedChunks.contains(0) && !assignedChunks.contains(0) {
+            return 0
+        }
+
+        // Priority 3: Sliding window starting from lowest uncached chunk from playhead
+        var lowestUncached = startChunk
+        while lowestUncached < maxChunk && session.cachedChunks.contains(lowestUncached) {
+            lowestUncached += 1
+        }
+        guard lowestUncached < maxChunk else { return nil }
+
+        // Sliding window limit: allow workers to download up to lowestUncached + 6 chunks.
+        // This strictly prevents runaway workers from jumping 20+ chunks ahead while playhead starves.
+        let windowLimit = min(lowestUncached + 6, maxChunk)
+        var candidate = lowestUncached
+        while candidate < windowLimit {
             if !session.cachedChunks.contains(candidate) && !assignedChunks.contains(candidate) {
                 return candidate
             }
             candidate += 1
         }
         return nil
+    }
+
+    func onClientWaiting(chunkIndex: Int64) {
+        guard session.valid, !isCancelled, !isFinished, chunkIndex >= 0 else { return }
+        if session.cachedChunks.contains(chunkIndex) { return }
+
+        let now = ProcessInfo.processInfo.systemUptime
+
+        // 1. If a worker is already assigned to this waiting chunk:
+        if let existingWorker = workers.first(where: { $0.chunkIndex == chunkIndex && $0.task != nil }) {
+            let idle = now - existingWorker.lastByteUptime
+            // If it's been idle for >= 2.0s while client is waiting, restart it immediately
+            if idle >= 2.0 {
+                LocalCacheProxyLog.shared.log("FD Worker \(existingWorker.id): Client waiting on chunk \(chunkIndex), worker idle \(String(format: "%.1f", idle))s -> immediate reconnect")
+                restartWorker(existingWorker, chunkIndex: chunkIndex, reason: "client waiting & idle")
+            }
+            return
+        }
+
+        // 2. No worker is currently assigned to chunkIndex:
+        // Try starting an idle worker
+        if let idleWorker = workers.first(where: { $0.task == nil }) {
+            LocalCacheProxyLog.shared.log("FD: Client waiting on chunk \(chunkIndex), assigning idle Worker \(idleWorker.id)")
+            startWorker(idleWorker, chunkIndex: chunkIndex)
+            return
+        }
+
+        // 3. All 4 workers are busy downloading chunks further ahead:
+        // Preempt the worker that is downloading the furthest unneeded chunk
+        if let furthestWorker = workers.filter({ $0.task != nil && $0.chunkIndex != chunkIndex }).max(by: { $0.chunkIndex < $1.chunkIndex }) {
+            let preemptedChunk = furthestWorker.chunkIndex
+            if preemptedChunk > chunkIndex {
+                LocalCacheProxyLog.shared.log("FD: Preempting Worker \(furthestWorker.id) on chunk \(preemptedChunk) to immediately serve urgent waiting chunk \(chunkIndex)")
+                furthestWorker.task?.cancel()
+                furthestWorker.task = nil
+                try? furthestWorker.fileHandle?.close()
+                furthestWorker.fileHandle = nil
+                assignedChunks.remove(preemptedChunk)
+                furthestWorker.reset()
+                startWorker(furthestWorker, chunkIndex: chunkIndex)
+            }
+        }
     }
 
     private func dispatchWorkers() {
@@ -984,8 +1070,6 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
 
         assignedChunks.insert(chunkIndex)
         worker.chunkIndex = chunkIndex
-        worker.receivedBytes = 0
-        worker.lastByteUptime = ProcessInfo.processInfo.systemUptime
 
         let chunkStart = chunkIndex * saminProxyChunkBytes
         let chunkEnd: Int64
@@ -1000,20 +1084,62 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
             chunkEnd = chunkStart + saminProxyChunkBytes - 1
         }
 
-        worker.expectedBytes = chunkEnd - chunkStart + 1
-
+        let fullExpectedBytes = chunkEnd - chunkStart + 1
         let fileUrl = session.chunkURL(chunkIndex)
+
+        var existingBytes: Int64 = session.bytesWrittenByChunk[chunkIndex] ?? 0
+        if existingBytes == 0, let attrs = try? FileManager.default.attributesOfItem(atPath: fileUrl.path),
+           let fileSize = attrs[.size] as? Int64, fileSize > 0, fileSize <= fullExpectedBytes {
+            existingBytes = fileSize
+            session.bytesWrittenByChunk[chunkIndex] = existingBytes
+        }
+
+        // If chunk is already fully on disk, mark cached immediately
+        if existingBytes >= fullExpectedBytes {
+            session.markCached(chunkIndex)
+            session.notifyDataAvailable(chunkIndex: chunkIndex)
+            assignedChunks.remove(chunkIndex)
+            worker.reset()
+            dispatchWorkers()
+            return
+        }
+
         if !FileManager.default.fileExists(atPath: fileUrl.path) {
             FileManager.default.createFile(atPath: fileUrl.path, contents: nil)
+            existingBytes = 0
+            session.bytesWrittenByChunk[chunkIndex] = 0
         }
+
         guard let h = try? FileHandle(forUpdating: fileUrl) else {
             assignedChunks.remove(chunkIndex)
             worker.reset()
             return
         }
-        try? h.truncate(atOffset: 0)
+
+        if existingBytes > 0 {
+            do {
+                try h.seek(toOffset: UInt64(existingBytes))
+            } catch {
+                try? h.truncate(atOffset: 0)
+                existingBytes = 0
+                session.bytesWrittenByChunk[chunkIndex] = 0
+            }
+        } else {
+            try? h.truncate(atOffset: 0)
+            existingBytes = 0
+            session.bytesWrittenByChunk[chunkIndex] = 0
+        }
+
         worker.fileHandle = h
+        worker.receivedBytes = existingBytes
+        worker.expectedBytes = fullExpectedBytes
+        worker.lastByteUptime = ProcessInfo.processInfo.systemUptime
+        worker.bytesAtLastCheck = existingBytes
+        worker.lastCheckUptime = ProcessInfo.processInfo.systemUptime
         _ = session.makeRoomForChunk(excluding: chunkIndex)
+
+        let requestStart = chunkStart + existingBytes
+        let requestEnd = chunkEnd
 
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
         request.httpMethod = "GET"
@@ -1029,9 +1155,13 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
             request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
         }
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
-        request.setValue("bytes=\(chunkStart)-\(chunkEnd)", forHTTPHeaderField: "Range")
+        request.setValue("bytes=\(requestStart)-\(requestEnd)", forHTTPHeaderField: "Range")
 
-        LocalCacheProxyLog.shared.log("FD Worker \(worker.id): Requesting chunk \(chunkIndex) (bytes=\(chunkStart)-\(chunkEnd))")
+        if existingBytes > 0 {
+            LocalCacheProxyLog.shared.log("FD Worker \(worker.id): Resuming chunk \(chunkIndex) from byte \(existingBytes) (Range: bytes=\(requestStart)-\(requestEnd))")
+        } else {
+            LocalCacheProxyLog.shared.log("FD Worker \(worker.id): Requesting chunk \(chunkIndex) (bytes=\(chunkStart)-\(chunkEnd))")
+        }
 
         let s = getOrCreateSession()
         let t = s.dataTask(with: request)
@@ -1068,12 +1198,34 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
             let clientIsWaiting = session.activeConnections.values.contains {
                 $0.isWaitingForData && $0.waitingChunkIndex == worker.chunkIndex
             }
-            let threshold: TimeInterval = clientIsWaiting ? 4.0 : 8.0
 
-            if idle >= threshold {
+            // Check 1: Absolute silence idle threshold (3s if client is waiting, 8s otherwise)
+            let idleThreshold: TimeInterval = clientIsWaiting ? 3.0 : 8.0
+            if idle >= idleThreshold {
                 let stalledChunk = worker.chunkIndex
-                LocalCacheProxyLog.shared.log("FD Worker \(worker.id): Stall watchdog on chunk \(stalledChunk) (idle=\(String(format: "%.1f", idle))s, clientWaiting=\(clientIsWaiting)). Reconnecting chunk...")
+                LocalCacheProxyLog.shared.log("FD Worker \(worker.id): Idle stall watchdog on chunk \(stalledChunk) (idle=\(String(format: "%.1f", idle))s, clientWaiting=\(clientIsWaiting)). Reconnecting chunk...")
                 restartWorker(worker, chunkIndex: stalledChunk, reason: "watchdog (\(String(format: "%.1f", idle))s idle)")
+                continue
+            }
+
+            // Check 2: Throughput trickle stall check (every 3 seconds)
+            if worker.lastCheckUptime == 0 {
+                worker.lastCheckUptime = now
+                worker.bytesAtLastCheck = worker.receivedBytes
+            } else if (now - worker.lastCheckUptime) >= 3.0 {
+                let bytesDelta = worker.receivedBytes - worker.bytesAtLastCheck
+                let timeDelta = now - worker.lastCheckUptime
+                let speedKB = Double(bytesDelta) / 1024.0 / timeDelta
+
+                worker.lastCheckUptime = now
+                worker.bytesAtLastCheck = worker.receivedBytes
+
+                // If client is actively blocked waiting on this chunk and speed is under 25 KB/s (< 75 KB in 3s)
+                if clientIsWaiting && bytesDelta < 75 * 1024 {
+                    let stalledChunk = worker.chunkIndex
+                    LocalCacheProxyLog.shared.log("FD Worker \(worker.id): Trickle stall watchdog on chunk \(stalledChunk) (speed=\(String(format: "%.1f", speedKB)) KB/s, client waiting). Reconnecting...")
+                    restartWorker(worker, chunkIndex: stalledChunk, reason: "trickle stall (\(String(format: "%.1f", speedKB)) KB/s)")
+                }
             }
         }
     }
@@ -1085,7 +1237,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         worker.fileHandle = nil
         worker.retryCount += 1
 
-        if worker.retryCount > 4 {
+        if worker.retryCount > 6 {
             LocalCacheProxyLog.shared.log("FD Worker \(worker.id): Max retries exceeded on chunk \(chunkIndex)")
             assignedChunks.remove(chunkIndex)
             worker.reset()
@@ -1093,7 +1245,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
             return
         }
 
-        LocalCacheProxyLog.shared.log("FD Worker \(worker.id): Retrying chunk \(chunkIndex) (attempt \(worker.retryCount)/4, reason: \(reason))...")
+        LocalCacheProxyLog.shared.log("FD Worker \(worker.id): Retrying chunk \(chunkIndex) (attempt \(worker.retryCount)/6, reason: \(reason))...")
         session.server.queue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             guard let self, !self.isCancelled, !self.isFinished, self.session.valid else { return }
             self.startWorker(worker, chunkIndex: chunkIndex)
@@ -1143,13 +1295,36 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
             self.session.notifyHeadersAvailable()
         }
 
-        if code == 200 || code == 206 {
+        if code == 200 {
+            // Server ignored Range header and sent full content from 0
+            self.session.server.queue.async { [weak self] in
+                guard let self, let worker = self.worker(for: dataTask), let h = worker.fileHandle else { return }
+                try? h.truncate(atOffset: 0)
+                try? h.seek(toOffset: 0)
+                worker.receivedBytes = 0
+                self.session.bytesWrittenByChunk[worker.chunkIndex] = 0
+            }
+            completionHandler(.allow)
+        } else if code == 206 {
             completionHandler(.allow)
         } else if code == 416 {
             completionHandler(.cancel)
             self.session.server.queue.async { [weak self] in
                 guard let self, let worker = self.worker(for: dataTask) else { return }
-                self.assignedChunks.remove(worker.chunkIndex)
+                let chunkIdx = worker.chunkIndex
+                let expected = worker.expectedBytes > 0 ? worker.expectedBytes : saminProxyChunkBytes
+                if (self.session.bytesWrittenByChunk[chunkIdx] ?? 0) >= expected {
+                    self.session.markCached(chunkIdx)
+                    self.session.notifyDataAvailable(chunkIndex: chunkIdx)
+                } else {
+                    self.session.bytesWrittenByChunk[chunkIdx] = 0
+                    if let fileUrl = self.session.chunkURL(chunkIdx) as URL?,
+                       let h = try? FileHandle(forUpdating: fileUrl) {
+                        try? h.truncate(atOffset: 0)
+                        try? h.close()
+                    }
+                }
+                self.assignedChunks.remove(chunkIdx)
                 worker.reset()
                 self.dispatchWorkers()
             }
@@ -1282,15 +1457,49 @@ final class BackwardDownloader: NSObject, URLSessionDataDelegate {
         guard endByte >= startByte else { return }
 
         expectedBytes = endByte - startByte + 1
-        receivedBytes = 0
 
         let fileUrl = session.chunkURL(chunkIndex)
+        var existingBytes: Int64 = session.bytesWrittenByChunk[chunkIndex] ?? 0
+        if existingBytes == 0, let attrs = try? FileManager.default.attributesOfItem(atPath: fileUrl.path),
+           let fileSize = attrs[.size] as? Int64, fileSize > 0, fileSize <= expectedBytes {
+            existingBytes = fileSize
+            session.bytesWrittenByChunk[chunkIndex] = existingBytes
+        }
+
+        if existingBytes >= expectedBytes {
+            session.markCached(chunkIndex)
+            session.notifyDataAvailable(chunkIndex: chunkIndex)
+            session.onBackwardChunkCompleted(chunkIndex: chunkIndex, success: true)
+            return
+        }
+
         if !FileManager.default.fileExists(atPath: fileUrl.path) {
             FileManager.default.createFile(atPath: fileUrl.path, contents: nil)
+            existingBytes = 0
+            session.bytesWrittenByChunk[chunkIndex] = 0
         }
-        guard let h = try? FileHandle(forWritingTo: fileUrl) else { return }
-        try? h.truncate(atOffset: 0)
+
+        guard let h = try? FileHandle(forUpdating: fileUrl) else { return }
+
+        if existingBytes > 0 {
+            do {
+                try h.seek(toOffset: UInt64(existingBytes))
+            } catch {
+                try? h.truncate(atOffset: 0)
+                existingBytes = 0
+                session.bytesWrittenByChunk[chunkIndex] = 0
+            }
+        } else {
+            try? h.truncate(atOffset: 0)
+            existingBytes = 0
+            session.bytesWrittenByChunk[chunkIndex] = 0
+        }
+
         self.fileHandle = h
+        self.receivedBytes = existingBytes
+
+        let requestStart = startByte + existingBytes
+        let requestEnd = endByte
 
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 60)
         request.httpMethod = "GET"
@@ -1306,7 +1515,7 @@ final class BackwardDownloader: NSObject, URLSessionDataDelegate {
             request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
         }
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
-        request.setValue("bytes=\(startByte)-\(endByte)", forHTTPHeaderField: "Range")
+        request.setValue("bytes=\(requestStart)-\(requestEnd)", forHTTPHeaderField: "Range")
 
         let config = URLSessionConfiguration.default
         config.urlCache = nil
@@ -1332,23 +1541,39 @@ final class BackwardDownloader: NSObject, URLSessionDataDelegate {
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
-        guard let http = response as? HTTPURLResponse, (http.statusCode == 200 || http.statusCode == 206) else {
+        guard let http = response as? HTTPURLResponse else {
             completionHandler(.cancel)
             return
         }
-        completionHandler(.allow)
+        if http.statusCode == 200 {
+            // Server ignored range, sent full chunk from 0
+            if let h = fileHandle {
+                try? h.truncate(atOffset: 0)
+                try? h.seek(toOffset: 0)
+            }
+            receivedBytes = 0
+            self.session.bytesWrittenByChunk[chunkIndex] = 0
+            completionHandler(.allow)
+        } else if http.statusCode == 206 {
+            completionHandler(.allow)
+        } else {
+            completionHandler(.cancel)
+        }
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         guard !isCancelled, !data.isEmpty, let h = fileHandle else { return }
-        try? h.write(contentsOf: data)
-        receivedBytes += Int64(data.count)
-        self.session.server.queue.async { [weak self] in
-            guard let self, !self.isCancelled else { return }
-            self.session.recordBytesReceived(data.count)
-            self.session.bytesWrittenByChunk[self.chunkIndex] = self.receivedBytes
-            self.session.notifyDataAvailable(chunkIndex: self.chunkIndex)
-        }
+        do {
+            try h.seek(toOffset: UInt64(receivedBytes))
+            try h.write(contentsOf: data)
+            receivedBytes += Int64(data.count)
+            self.session.server.queue.async { [weak self] in
+                guard let self, !self.isCancelled else { return }
+                self.session.recordBytesReceived(data.count)
+                self.session.bytesWrittenByChunk[self.chunkIndex] = self.receivedBytes
+                self.session.notifyDataAvailable(chunkIndex: self.chunkIndex)
+            }
+        } catch { }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
@@ -1584,9 +1809,10 @@ final class ProxyConnection {
                 return
             }
 
-            guard let data = readChunkData(session: session, chunkIndex: chunkIdx, offset: chunkOffset, count: Int(pieceLen)) else {
+            guard let data = readChunkData(session: session, chunkIndex: chunkIdx, offset: chunkOffset, count: Int(pieceLen)), !data.isEmpty else {
                 isWaitingForData = true
                 waitingChunkIndex = chunkIdx
+                session.notifyClientWaiting(chunkIndex: chunkIdx)
                 return
             }
 
@@ -1612,6 +1838,7 @@ final class ProxyConnection {
             isWaitingForData = true
             waitingChunkIndex = chunkIdx
             session.ensureForwardDownloading(from: streamOffset)
+            session.notifyClientWaiting(chunkIndex: chunkIdx)
         }
     }
 
@@ -1626,8 +1853,24 @@ final class ProxyConnection {
         guard let handle = readHandle?.handle else { return nil }
         do {
             try handle.seek(toOffset: UInt64(offset))
-            return try handle.read(upToCount: count)
+            if let data = try handle.read(upToCount: count), !data.isEmpty {
+                return data
+            }
+            // FileHandle may have cached a stale EOF if writer recently appended.
+            // Reopen a fresh handle and try reading once more.
+            try? handle.close()
+            readHandle = nil
+            let url = session.chunkURL(chunkIndex)
+            guard let freshHandle = try? FileHandle(forReadingFrom: url) else { return nil }
+            readHandle = (chunkIndex, freshHandle)
+            try freshHandle.seek(toOffset: UInt64(offset))
+            if let freshData = try freshHandle.read(upToCount: count), !freshData.isEmpty {
+                return freshData
+            }
+            return nil
         } catch {
+            try? readHandle?.handle.close()
+            readHandle = nil
             return nil
         }
     }
