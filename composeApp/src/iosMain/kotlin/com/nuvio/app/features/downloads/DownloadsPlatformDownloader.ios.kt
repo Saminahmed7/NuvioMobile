@@ -57,8 +57,8 @@ private const val DOWNLOAD_REQUEST_TIMEOUT_SECONDS = 60.0
 private const val DOWNLOAD_RESOURCE_TIMEOUT_SECONDS = 24.0 * 60.0 * 60.0
 private const val PROGRESS_MIN_INTERVAL_SECONDS = 0.5
 private const val PROGRESS_MIN_BYTE_DELTA = 512L * 1024L
-private const val DOWNLOAD_CHUNK_SIZE = 8L * 1024L * 1024L
-private const val DOWNLOAD_MAX_WORKERS = 4
+private const val DOWNLOAD_CHUNK_SIZE = 16L * 1024L * 1024L
+private const val DOWNLOAD_MAX_WORKERS = 2
 
 private val backgroundSessionCompletionHandlers = mutableMapOf<String, () -> Unit>()
 
