@@ -150,14 +150,35 @@ object TempPlaybackCache {
     }
 
     fun getDiagnosticReport(launchId: Long?): String {
+        val header = buildString {
+            appendLine("--- App-side session context ---")
+            appendLine("launchId: ${launchId ?: "none"}")
+            if (launchId != null) {
+                appendLine("sessionKey: ${activeSessionKeys[launchId] ?: "none"}")
+                appendLine("proxied (loopback cache): ${isProxied(launchId)}")
+                appendLine("free space: ${formatMb(runCatching { TempPlaybackCachePlatform.freeSpaceBytes() }.getOrNull())} (mirror stops below ${LOW_SPACE_STOP_BYTES / 1024 / 1024} MB)")
+                val snapshot = _status.value[launchId]
+                if (snapshot != null) {
+                    val total = snapshot.totalBytes?.let { "$it (${it / 1024 / 1024} MB)" } ?: "unknown"
+                    appendLine("cache status: cached=${snapshot.totalCachedBytes / 1024 / 1024} MB / total=$total, complete=${snapshot.isComplete}, speed=${snapshot.downloadSpeedBps / 1024} KB/s, ranges=${snapshot.ranges.size}")
+                } else {
+                    appendLine("cache status: none (non-progressive URL such as HLS/DASH/magnet, or session already closed)")
+                }
+            }
+            appendLine()
+        }
         val bridge = NuvioCacheProxyBridgeFactory.create()
-            ?: return "Local Cache Proxy is not active on this device/platform."
+            ?: return header + "Local Cache Proxy is not active on this device/platform (Android/desktop use the background mirror; iOS uses the loopback proxy)."
         val key = launchId?.let { activeSessionKeys[it] }
         val report = runCatching {
             bridge.diagnosticReport(key.orEmpty())
         }.getOrNull().orEmpty()
-        return if (report.isNotBlank()) report else "No diagnostic report returned from cache proxy server."
+        if (report.isBlank()) return header + "No diagnostic report returned from cache proxy server."
+        return header + report
     }
+
+    private fun formatMb(bytes: Long?): String =
+        if (bytes == null || bytes < 0L) "unknown" else "${bytes / 1024 / 1024} MB"
 
     fun refreshRanges(launchId: Long) {
         if (!isProxied(launchId)) return

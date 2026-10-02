@@ -1,7 +1,30 @@
 import Foundation
 import UIKit
 import Network
+import Darwin
 import ComposeApp
+
+// MARK: - Sleep-aware clock
+
+/// Monotonic seconds that keep advancing while the device is asleep.
+///
+/// `ProcessInfo.systemUptime` is backed by `mach_absolute_time()`, which freezes
+/// during device sleep (screen lock). Measuring stream idleness with it made a
+/// stream killed by screen-lock look brand new the moment the app woke, so the
+/// proxy logged "stream healthy; leaving it alone" and never reconnected —
+/// playback stayed dead until the whole app was relaunched. `mach_continuous_time()`
+/// keeps counting across sleep, so a wake after lock genuinely reads as idle.
+private let saminTimebase: mach_timebase_info_data_t = {
+    var info = mach_timebase_info_data_t()
+    mach_timebase_info(&info)
+    return info
+}()
+
+func saminNow() -> TimeInterval {
+    let denom = saminTimebase.denom == 0 ? 1 : saminTimebase.denom
+    let nanos = Double(mach_continuous_time()) * Double(saminTimebase.numer) / Double(denom)
+    return nanos / 1_000_000_000
+}
 
 // MARK: - Samin loopback playback cache
 //
@@ -122,6 +145,12 @@ final class LocalCacheProxyServer {
     private let preferredPorts: [UInt16] = [19842, 19843, 19844, 19845, 19846, 19847, 19848, 19849]
     private var preferredPortIndex = 0
     private var activeBoundPort: UInt16 = 19842
+    // True only once the listener reported .ready. `NWListener(using:on:)` does
+    // not throw when a port is unavailable — the failure arrives later as
+    // .failed — so creating a listener is not proof that anything is listening.
+    private var listenerReady = false
+    // Consecutive bind failures on the current port; after a few we rotate.
+    private var listenerFailureStreak = 0
 
     private init() {
         NotificationCenter.default.addObserver(
@@ -144,9 +173,10 @@ final class LocalCacheProxyServer {
         queue.async { [weak self] in
             guard let self else { return }
             LocalCacheProxyLog.shared.log("Server: Foreground notification received. Ensuring listener on port \(self.activeBoundPort)...")
-            if self.listener == nil || self.listener?.state != .ready {
+            if self.listener == nil || self.listener?.state != .ready || !self.listenerReady {
                 self.listener?.cancel()
                 self.listener = nil
+                self.listenerReady = false
                 self.port = 0
                 self.ensureListener()
             }
@@ -190,12 +220,19 @@ final class LocalCacheProxyServer {
         return params
     }
 
+    /// Returns true only when the listener is really bound and accepting.
+    /// An unavailable port surfaces asynchronously as `.failed`, so returning
+    /// true right after creating the listener handed the player a localhost URL
+    /// that nothing was serving — a first-load failure it could never recover
+    /// from without relaunching the app. Callers now wait for `.ready`, and
+    /// give up (falling back to the remote URL) if it never arrives.
     @discardableResult
     func ensureListener() -> Bool {
-        if let current = listener, current.state == .ready, port != 0 { return true }
+        if listenerReady, let current = listener, current.state == .ready, port != 0 { return true }
 
         listener?.cancel()
         listener = nil
+        listenerReady = false
         port = 0
 
         // If we have active sessions, we MUST stay on activeBoundPort (e.g. 19842)
@@ -204,8 +241,8 @@ final class LocalCacheProxyServer {
             if let wirePort = NWEndpoint.Port(rawValue: activeBoundPort),
                let created = try? NWListener(using: makeTcpParameters(), on: wirePort) {
                 setupListener(created, port: activeBoundPort)
-                LocalCacheProxyLog.shared.log("Server: Re-bound listener to active session port \(activeBoundPort)")
-                return true
+                LocalCacheProxyLog.shared.log("Server: Re-bound listener to active session port \(activeBoundPort) (waiting for ready)")
+                return false
             }
         }
 
@@ -217,20 +254,21 @@ final class LocalCacheProxyServer {
                   let created = try? NWListener(using: makeTcpParameters(), on: wirePort) else { continue }
             setupListener(created, port: portToTry)
             activeBoundPort = portToTry
-            LocalCacheProxyLog.shared.log("Server: Bound listener to preferred port \(portToTry)")
-            return true
+            LocalCacheProxyLog.shared.log("Server: Bound listener to preferred port \(portToTry) (waiting for ready)")
+            return false
         }
 
         // Fallback: let OS assign ephemeral port
         guard let wirePort = NWEndpoint.Port(rawValue: 0),
               let created = try? NWListener(using: makeTcpParameters(), on: wirePort) else { return false }
         setupListener(created, port: 0)
-        return true
+        return false
     }
 
     private func setupListener(_ created: NWListener, port: UInt16) {
         self.listener = created
         self.port = port
+        self.listenerReady = false
         created.stateUpdateHandler = { [weak self] state in
             self?.queue.async { self?.handleListenerState(state, listener: created) }
         }
@@ -241,10 +279,18 @@ final class LocalCacheProxyServer {
     }
 
     private func handleListenerState(_ state: NWListener.State, listener: NWListener) {
+        // A listener we replaced can still report .ready a moment later; acting on
+        // it would mark the server ready on the old (or not yet bound) port.
+        if case .ready = state, self.listener !== listener {
+            LocalCacheProxyLog.shared.log("Server: Ignoring stale listener .ready on port \(listener.port?.rawValue ?? 0)")
+            return
+        }
         switch state {
         case .ready:
             self.port = listener.port?.rawValue ?? self.activeBoundPort
             self.activeBoundPort = self.port
+            self.listenerReady = true
+            self.listenerFailureStreak = 0
             LocalCacheProxyLog.shared.log("Server: Listener ready on port \(self.port)")
         case .failed(let error):
             LocalCacheProxyLog.shared.log("Server: Listener failed (\(error.localizedDescription))")
@@ -260,9 +306,16 @@ final class LocalCacheProxyServer {
     private func resetListener(failedListener: NWListener) {
         if self.listener === failedListener {
             self.listener = nil
+            self.listenerReady = false
             self.port = 0
-            if self.sessions.isEmpty {
-                self.preferredPortIndex = 0
+            // A bind failure is asynchronous, so `ensureListener` used to retry the
+            // SAME port forever and the 19843..19849 fallback was never reached.
+            // Rotate after a few failures so a port the OS keeps refusing cannot
+            // wedge every future session.
+            listenerFailureStreak += 1
+            if listenerFailureStreak >= 3 {
+                listenerFailureStreak = 0
+                advanceBoundPort()
             }
             // Auto-recreate listener after 0.2s pause
             queue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
@@ -271,10 +324,23 @@ final class LocalCacheProxyServer {
         }
     }
 
+    /// Moves the active port to the next candidate after repeated failures.
+    private func advanceBoundPort() {
+        guard !preferredPorts.isEmpty else { return }
+        let currentIndex = preferredPorts.firstIndex(of: activeBoundPort) ?? -1
+        let nextIndex = (currentIndex + 1) % preferredPorts.count
+        let previous = activeBoundPort
+        activeBoundPort = preferredPorts[nextIndex]
+        preferredPortIndex = nextIndex
+        LocalCacheProxyLog.shared.log("Server: Port \(previous) kept failing; rotating listener to \(activeBoundPort)")
+    }
+
     func startSession(key: String, sourceUrl: String, headers: [String: String]) -> String {
         for _ in 0..<50 {
             var url = ""
             queue.sync {
+                // ensureListener() is only true once the socket is really bound,
+                // so the URL handed to the player always points at a live port.
                 guard ensureListener(), port != 0 else { return }
                 sessions[key] = ProxySession(
                     key: key,
@@ -288,6 +354,10 @@ final class LocalCacheProxyServer {
             if !url.isEmpty { return url }
             Thread.sleep(forTimeInterval: 0.05)
         }
+        // No live loopback port: the caller falls back to the remote URL, so
+        // playback still starts (just without the on-disk cache) instead of
+        // hanging on a dead localhost address.
+        LocalCacheProxyLog.shared.log("Server: startSession('\\(key)') aborted - listener never became ready; using direct URL")
         return ""
     }
 
@@ -359,23 +429,47 @@ final class LocalCacheProxyServer {
             let formatter = DateFormatter()
             formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
             lines.append("Generated at: \(formatter.string(from: Date()))")
+            let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+            let appBuild = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+            lines.append("App: Nuvio Samin \(appVersion) (\(appBuild))")
             lines.append("iOS: \(UIDevice.current.systemVersion) | Device: \(UIDevice.current.model)")
-            lines.append("Free disk space: \(freeSpaceBytes() / 1024 / 1024) MB")
+            lines.append("Free disk space: \(freeSpaceBytes() / 1024 / 1024) MB (low-space threshold: \(saminProxyLowSpaceBytes / 1024 / 1024) MB)")
             lines.append("Server active: \(listener != nil), port: \(port)")
             lines.append("Active session count: \(sessions.count)")
 
             let targetSession = sessions[key] ?? sessions.values.first
             if let s = targetSession {
                 lines.append("\n--- Session: [\(s.key)] ---")
-                lines.append("Host: \(URL(string: s.sourceUrl)?.host ?? "unknown")")
-                let sizeStr = s.totalSize.map { "\($0) bytes (\(String(format: "%.1f", Double($0) / 1024.0 / 1024.0)) MB)" } ?? "unknown"
+                if let url = URL(string: s.sourceUrl) {
+                    let ext = url.pathExtension.isEmpty ? "(no extension)" : ".\(url.pathExtension)"
+                    let queryInfo = url.query.map { "query=\($0.count) chars (auth token redacted)" } ?? "no query"
+                    lines.append("Host: \(url.host ?? "unknown") | Type: \(ext) | URL len: \(s.sourceUrl.count) | \(queryInfo)")
+                } else {
+                    lines.append("Source URL: unparseable (\(s.sourceUrl.count) chars)")
+                }
+                lines.append("Upstream headers held by proxy: \(s.headerNames.isEmpty ? "none" : s.headerNames.joined(separator: ", "))")
+                lines.append("HEAD probe: HTTP \(s.headStatusCode.map { String($0) } ?? "no response") | Content-Length: \(s.headContentLength.map { "\($0) (\($0 / 1024 / 1024) MB)" } ?? "missing")")
+                lines.append("Last upstream GET: HTTP \(s.lastUpstreamStatus.map { String($0) } ?? "none yet") | Accept-Ranges: \(s.upstreamAcceptRanges ?? "unknown")")
+                if s.headStatusCode != nil && s.headContentLength == nil && s.totalSize == nil {
+                    lines.append("NOTE: upstream gave no size (typical for debrid/CDN links on very large files). Ranges and duration mapping are estimated until the first GET response arrives.")
+                }
+                if s.lastUpstreamStatus == 200 {
+                    lines.append("NOTE: upstream returned HTTP 200 to a Range request (Range ignored). Proxy restarts from byte 0; seeks on huge files will be slow.")
+                }
+                let sizeStr = s.totalSize.map { "\($0) bytes (\(String(format: "%.1f", Double($0) / 1024.0 / 1024.0)) MB, \(s.totalChunks()) x 2 MB chunks)" } ?? "unknown"
                 lines.append("Total Size: \(sizeStr)")
-                lines.append("Cached: \(s.cachedChunks.count) chunks (\(String(format: "%.1f", Double(s.totalCachedBytes()) / 1024.0 / 1024.0)) MB)")
+                lines.append("Cached: \(s.cachedChunks.count) full chunks + \(s.bytesWrittenByChunk.count) partial (\(String(format: "%.1f", Double(s.totalCachedBytes()) / 1024.0 / 1024.0)) MB logical, \(s.cacheDirBytes() / 1024 / 1024) MB on disk, \(String(format: "%.1f", s.percentComplete()))%)")
+                lines.append("Evicted (watched, low space): \(s.evictedChunksCount) chunks | Write errors: \(s.writeErrorCount)\(s.lastWriteError.map { " (last: \($0))" } ?? "")")
                 lines.append("Speed: \(s.currentSpeed() / 1024) KB/s")
-                let playheadStr = s.playheadMs.map { "\($0.0 / 1000)s / \($0.1 / 1000)s" } ?? "none"
+                if s.isRateLimited {
+                    let remaining = s.rateLimitedUntil.map { max(0, Int($0.timeIntervalSinceNow)) } ?? 0
+                    lines.append("RATE LIMITED by upstream (\(s.lastRateLimitMessage ?? "")): retrying in ~\(remaining)s with no reconnects until then. If the count keeps climbing, the host is throttling this IP — pause a minute before retrying.")
+                }
+                let playheadStr = s.playheadMs.map { "\($0.0 / 1000)s / \($0.1 / 1000)s" } ?? "none (open player, wait 5s, reopen report)"
                 lines.append("Playhead: \(playheadStr)")
                 if let fd = s.forwardDownloader {
-                    lines.append("Forward Downloader: active, start=\(fd.startByte) (\(fd.startByte / 1024 / 1024) MB), offset=\(fd.streamOffset) (\(fd.streamOffset / 1024 / 1024) MB), finished=\(fd.isFinished)")
+                    let elapsed = saminNow() - fd.startedUptime
+                    lines.append("Forward Downloader: active, start=\(fd.startByte) (\(fd.startByte / 1024 / 1024) MB), offset=\(fd.streamOffset) (\(fd.streamOffset / 1024 / 1024) MB), received=\(fd.totalBytesReceived / 1024 / 1024) MB in \(String(format: "%.0f", elapsed))s, retries=\(fd.retryCount), reconnects=\(s.forwardReconnects), finished=\(fd.isFinished)\(fd.lastErrorMessage.map { ", lastError='\($0)'" } ?? "")")
                 } else {
                     lines.append("Forward Downloader: none / idle")
                 }
@@ -385,12 +479,14 @@ final class LocalCacheProxyServer {
                 if let pd = s.probeDownloader {
                     lines.append("Probe Downloader: active on chunk \(pd.chunkIndex)")
                 }
+                lines.append("MPV client range requests: \(s.clientRangeRequests)\(s.lastClientRange.map { " (last: \($0))" } ?? "")")
                 lines.append("Active Client Connections: \(s.activeConnections.count)")
                 for (_, conn) in s.activeConnections {
                     lines.append("  * conn offset=\(conn.streamOffset), end=\(conn.streamEnd), waiting=\(conn.isWaitingForData), waitingChunk=\(conn.waitingChunkIndex)")
                 }
+                lines.append("What to compare: if Total Size is 'unknown' or Last GET is 200 while a ~1 GB file shows 206 + known size, the host is not serving ranges for the big file. If Write errors > 0 or Free disk < file size, the device ran out of room (3 GB needs 3 GB free). If reconnects climb with timeout/reset errors, the upstream drops long connections.")
             } else {
-                lines.append("\nNo active session found matching '\(key)'.")
+                lines.append("\nNo active session found matching '\(key)'. Open the player first, wait a few seconds, then reopen this report.")
             }
 
             let logEntries = LocalCacheProxyLog.shared.snapshot()
@@ -477,10 +573,48 @@ final class ProxySession {
 
     private(set) var activeChunkWriters: [Int64: String] = [:]
 
+    // Diagnostic state (all touched on the server queue).
+    var headStatusCode: Int?
+    var headContentLength: Int64?
+    var lastUpstreamStatus: Int?
+    var upstreamAcceptRanges: String?
+    var evictedChunksCount = 0
+    var writeErrorCount = 0
+    var lastWriteError: String?
+    var forwardReconnects = 0
+    var clientRangeRequests = 0
+    var lastClientRange: String?
+    let headerNames: [String]
+
+    // Rate-limit backoff (HTTP 429/503 from throttling upstreams such as
+    // Cloudflare Workers). While set, no new upstream connections are opened;
+    // waiting clients stay parked and a single timer resumes the stream.
+    var rateLimitedUntil: Date?
+    var consecutiveRateLimits = 0
+    var lastRateLimitMessage: String?
+    var lastForegroundWakeUptime: TimeInterval = 0
+
+    var isRateLimited: Bool {
+        if let until = rateLimitedUntil { return Date() < until }
+        return false
+    }
+
+    func noteRateLimit(retryAfter seconds: TimeInterval) {
+        consecutiveRateLimits += 1
+        rateLimitedUntil = Date().addingTimeInterval(seconds)
+        lastRateLimitMessage = "HTTP 429/503 x\(consecutiveRateLimits), retry in \(Int(seconds))s"
+    }
+
+    func clearRateLimit() {
+        consecutiveRateLimits = 0
+        rateLimitedUntil = nil
+    }
+
     init(key: String, sourceUrl: String, headers: [String: String], baseDir: URL, server: LocalCacheProxyServer) {
         self.key = key
         self.sourceUrl = sourceUrl
         self.headers = headers
+        self.headerNames = Array(headers.keys).sorted()
         self.dir = baseDir
         self.server = server
         if FileManager.default.fileExists(atPath: baseDir.path) {
@@ -596,8 +730,34 @@ final class ProxySession {
 
     func handleForegroundWake() {
         guard valid else { return }
-        LocalCacheProxyLog.shared.log("Session [\(key)]: Handling foreground wake...")
-        forwardDownloader?.handleForegroundWake()
+        let now = saminNow()
+        if now - lastForegroundWakeUptime < 2.0 {
+            // willEnterForeground + didBecomeActive fire back-to-back on every
+            // app return (screenshot, app switch); handle only the first.
+            return
+        }
+        lastForegroundWakeUptime = now
+        if isRateLimited {
+            LocalCacheProxyLog.shared.log("Session [\(key)]: Foreground wake during rate-limit backoff; leaving stream alone")
+            return
+        }
+        guard let fd = forwardDownloader, !fd.isFinished else {
+            // Nothing is streaming forward (the download died while suspended, or it
+            // finished before the playhead). If a client is parked waiting for a
+            // chunk, restart from there — otherwise it stays hung until a relaunch.
+            if let waiting = activeConnections.values.first(where: { $0.isWaitingForData && $0.waitingChunkIndex >= 0 }) {
+                LocalCacheProxyLog.shared.log("Session [\(key)]: Foreground wake with no active forward stream -> restarting from waiting chunk \(waiting.waitingChunkIndex)")
+                ensureForwardDownloading(from: waiting.waitingChunkIndex * saminProxyChunkBytes)
+            }
+            return
+        }
+        let idle = now - fd.lastByteUptime
+        if idle > 4.0 {
+            LocalCacheProxyLog.shared.log("Session [\(key)]: Foreground wake with stalled stream (idle=\(String(format: "%.1f", idle))s) -> reconnecting...")
+            fd.handleForegroundWake()
+        } else {
+            LocalCacheProxyLog.shared.log("Session [\(key)]: Foreground wake, stream healthy (idle=\(String(format: "%.1f", idle))s); leaving it alone")
+        }
     }
 
     /// Ensures a forward download stream is actively running from the requested byte offset.
@@ -610,6 +770,12 @@ final class ProxySession {
 
         // 1. If the requested byte is already cached on disk, nothing to download
         if chunkOffset < available {
+            return
+        }
+
+        // 1b. While upstream rate-limits us, never open new connections; the
+        // client keeps waiting and the backoff timer resumes the stream.
+        if isRateLimited {
             return
         }
 
@@ -640,9 +806,13 @@ final class ProxySession {
 
         // 3. If forward downloader is actively downloading nearby (within 4 MB of startByte),
         // let the continuous stream keep flowing without interrupting the network pipe!
+        // Only a request AT OR AHEAD of the write head is guaranteed to be served
+        // shortly by the running stream. A request BEHIND it that is not already
+        // on disk (evicted, or a failed chunk write) would never be fetched again,
+        // so it must fall through and reposition instead of waiting forever.
         if let fd = forwardDownloader, !fd.isFinished {
-            let dist = abs(startByte - fd.streamOffset)
-            if dist <= 4 * 1024 * 1024 {
+            let ahead = startByte - fd.streamOffset
+            if ahead >= 0 && ahead <= 4 * 1024 * 1024 {
                 return
             }
         }
@@ -659,7 +829,7 @@ final class ProxySession {
     }
 
     private func startNewForwardDownloader(targetStartByte: Int64, reason: String) {
-        lastForwardDownloaderStartTime = ProcessInfo.processInfo.systemUptime
+        lastForwardDownloaderStartTime = saminNow()
         let fd = ForwardDownloader(session: self, startByte: targetStartByte)
         self.forwardDownloader = fd
         fd.start()
@@ -667,7 +837,7 @@ final class ProxySession {
     }
 
     func fetchProbeChunk(chunkIndex: Int64) {
-        guard valid, probeDownloader == nil, !cachedChunks.contains(chunkIndex) else { return }
+        guard valid, probeDownloader == nil, !cachedChunks.contains(chunkIndex), !isRateLimited else { return }
         if !claimChunkWrite(chunkIndex: chunkIndex, owner: "probe") {
             LocalCacheProxyLog.shared.log("Session [\(key)]: Chunk \(chunkIndex) already being written by another downloader, skipping probe")
             return
@@ -691,6 +861,7 @@ final class ProxySession {
 
     func startBackwardDownloadIfNeeded() {
         guard valid, let total = totalSize, total > 0 else { return }
+        guard !isRateLimited else { return }
         guard server.freeSpaceBytes() >= saminProxyLowSpaceBytes else { return }
         guard backwardDownloader == nil else { return }
 
@@ -738,6 +909,7 @@ final class ProxySession {
         cachedChunks.remove(index)
         bytesWrittenByChunk.removeValue(forKey: index)
         try? FileManager.default.removeItem(at: chunkURL(index))
+        evictedChunksCount += 1
     }
 
     private func onPlayheadUpdated() {
@@ -759,18 +931,32 @@ final class ProxySession {
         }
         URLSession.shared.dataTask(with: req) { [weak self] _, response, _ in
             guard let self else { return }
-            let total = (response as? HTTPURLResponse)
+            let http = response as? HTTPURLResponse
+            let code = http?.statusCode
+            let total = http
                 .flatMap { $0.value(forHTTPHeaderField: "Content-Length") }
                 .flatMap(Int64.init)
-            let type = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type")
+            let type = http?.value(forHTTPHeaderField: "Content-Type")
+            let acceptRanges = http?.value(forHTTPHeaderField: "Accept-Ranges")
             self.server.queue.async { [weak self] in
                 guard let self, self.valid else { return }
+                if let code { self.headStatusCode = code }
+                if let acceptRanges { self.upstreamAcceptRanges = acceptRanges }
+                if let total, total > 0 {
+                    self.headContentLength = total
+                }
                 if let total, total > 0, self.totalSize == nil {
                     self.totalSize = total
                     if let type, self.contentType == nil {
                         self.contentType = type
                     }
                     self.notifyHeadersAvailable()
+                } else if self.totalSize == nil {
+                    // HEAD gave no usable size (common on debrid/CDN links for
+                    // very large files): still wake waiting clients so the
+                    // failure is visible in the diagnostic report instead of
+                    // hanging silently.
+                    LocalCacheProxyLog.shared.log("Session [\(self.key)]: HEAD probe returned HTTP \(code.map { String($0) } ?? "none") with no Content-Length")
                 }
                 completion?()
             }
@@ -812,12 +998,12 @@ final class ProxySession {
     }
 
     private var speedBytesAccumulator: Int64 = 0
-    private var lastSpeedCheckUptime: TimeInterval = ProcessInfo.processInfo.systemUptime
+    private var lastSpeedCheckUptime: TimeInterval = saminNow()
     private var lastDataReceivedUptime: TimeInterval = 0
     private(set) var currentSpeedBps: Int64 = 0
 
     func recordBytesReceived(_ count: Int) {
-        let now = ProcessInfo.processInfo.systemUptime
+        let now = saminNow()
         lastDataReceivedUptime = now
         speedBytesAccumulator += Int64(count)
         let elapsed = now - lastSpeedCheckUptime
@@ -829,7 +1015,7 @@ final class ProxySession {
     }
 
     func currentSpeed() -> Int64 {
-        let now = ProcessInfo.processInfo.systemUptime
+        let now = saminNow()
         if now - lastDataReceivedUptime > 2.0 {
             return 0
         }
@@ -858,6 +1044,32 @@ final class ProxySession {
         return total
     }
 
+    /// Actual bytes on disk for this session (sums chunk files; cheap enough on demand).
+    func cacheDirBytes() -> Int64 {
+        var total: Int64 = 0
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: dir.path) else { return 0 }
+        for name in names {
+            let path = dir.appendingPathComponent(name).path
+            if let attrs = try? fm.attributesOfItem(atPath: path),
+               let size = (attrs[.size] as? NSNumber)?.int64Value {
+                total += size
+            }
+        }
+        return total
+    }
+
+    /// Total number of 2 MB chunks the file needs (0 when size unknown).
+    func totalChunks() -> Int64 {
+        guard let total = totalSize, total > 0 else { return 0 }
+        return (total + saminProxyChunkBytes - 1) / saminProxyChunkBytes
+    }
+
+    func percentComplete() -> Double {
+        guard let total = totalSize, total > 0 else { return 0 }
+        return min(1.0, Double(totalCachedBytes()) / Double(total)) * 100.0
+    }
+
     func cacheStatsJson() -> String {
         let speed = currentSpeed()
         let cached = totalCachedBytes()
@@ -883,11 +1095,14 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
     private var fileHandle: FileHandle?
     private var fileHandleChunk: Int64 = -1
     private var isCancelled = false
-    private var retryCount = 0
+    private(set) var retryCount = 0
+    private(set) var totalBytesReceived: Int64 = 0
+    private(set) var lastErrorMessage: String?
+    private(set) var startedUptime: TimeInterval = saminNow()
     private let maxRetries = 10
 
     // Watchdog
-    private var lastByteUptime: TimeInterval = 0
+    private(set) var lastByteUptime: TimeInterval = 0
     private var watchdogTimer: DispatchSourceTimer?
 
     init(session: ProxySession, startByte: Int64) {
@@ -928,7 +1143,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         }
 
         self.streamOffset = effectiveOffset
-        lastByteUptime = ProcessInfo.processInfo.systemUptime
+        lastByteUptime = saminNow()
 
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 60)
         request.httpMethod = "GET"
@@ -993,6 +1208,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
     func onClientWaiting(chunkIndex: Int64) {
         guard session.valid, !isCancelled, !isFinished, chunkIndex >= 0 else { return }
         if session.cachedChunks.contains(chunkIndex) { return }
+        if session.isRateLimited { return } // stay parked; backoff timer resumes
 
         // If probeDownloader is actively handling this chunk, let it proceed
         if session.isChunkBeingWritten(chunkIndex) && currentChunkIndex != chunkIndex {
@@ -1010,7 +1226,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
 
         // If the continuous stream is actively downloading this chunk, check for stalls
         if currentChunkIndex == chunkIndex {
-            let now = ProcessInfo.processInfo.systemUptime
+            let now = saminNow()
             let idle = now - lastByteUptime
             if idle >= 3.0 {
                 LocalCacheProxyLog.shared.log("FD [\(startByte)]: Client waiting on chunk \(chunkIndex) and idle \(String(format: "%.1f", idle))s -> reconnecting continuous stream")
@@ -1021,6 +1237,8 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
 
     private func reconnect(reason: String) {
         guard !isCancelled, !isFinished, session.valid else { return }
+        guard !session.isRateLimited else { return } // backoff timer owns the retry
+        session.forwardReconnects += 1
         LocalCacheProxyLog.shared.log("FD [\(startByte)]: Reconnecting from \(streamOffset) (reason: \(reason))...")
         task?.cancel()
         task = nil
@@ -1052,7 +1270,8 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
 
     private func checkWatchdog() {
         guard !isCancelled, !isFinished, session.valid, task != nil else { return }
-        let now = ProcessInfo.processInfo.systemUptime
+        guard !session.isRateLimited else { return } // backoff timer owns the retry
+        let now = saminNow()
         let idle = now - lastByteUptime
 
         let clientIsWaiting = session.activeConnections.values.contains { $0.isWaitingForData }
@@ -1077,22 +1296,40 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
             }
 
             let code = http.statusCode
+            self.session.lastUpstreamStatus = code
+            if let ar = http.value(forHTTPHeaderField: "Accept-Ranges") {
+                self.session.upstreamAcceptRanges = ar
+            }
             if code == 206 || code == 200 {
+                self.session.clearRateLimit()
                 var lowered: [String: String] = [:]
                 http.allHeaderFields.forEach { k, v in
                     if let ks = k as? String, let vs = v as? String {
                         lowered[ks.lowercased()] = vs
                     }
                 }
+                if self.session.contentType == nil, let type = lowered["content-type"] {
+                    self.session.contentType = type
+                }
+                // Only used when the HEAD probe never produced a size (common on
+                // debrid/CDN links) — without this, clients parked in headWaiters
+                // would never be woken and the player would hang on first load.
+                var discoveredSize: Int64?
                 if self.session.totalSize == nil || self.session.totalSize == 0 {
                     if let cr = lowered["content-range"], let total = ProxyConnectionTotal.parse(cr) {
-                        self.session.totalSize = total
+                        discoveredSize = total
                         LocalCacheProxyLog.shared.log("FD [\(self.startByte)]: Discovered totalSize=\(total) from Content-Range")
                     } else if let cl = lowered["content-length"], let len = Int64(cl), len > 0 {
-                        let total = self.streamOffset + len
-                        self.session.totalSize = total
-                        LocalCacheProxyLog.shared.log("FD [\(self.startByte)]: Discovered totalSize=\(total) from Content-Length")
+                        // HTTP 200 means the body really starts at byte 0, so
+                        // Content-Length is the whole file. Only a 206 body starts at
+                        // streamOffset. Adding the offset on a 200 inflates totalSize
+                        // and skews every cached range drawn on the timeline.
+                        discoveredSize = (code == 200) ? len : self.streamOffset + len
+                        LocalCacheProxyLog.shared.log("FD [\(self.startByte)]: Discovered totalSize=\(discoveredSize ?? 0) from Content-Length (HTTP \(code))")
                     }
+                }
+                if let discoveredSize {
+                    self.session.totalSize = discoveredSize
                 }
 
                 if code == 200 && self.streamOffset > 0 {
@@ -1102,7 +1339,47 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
 
                 LocalCacheProxyLog.shared.log("FD [\(self.startByte)]: HTTP \(code) for continuous stream from \(self.streamOffset)")
                 completionHandler(.allow)
+                // Wake parked clients only after this task is allowed to run, so the
+                // pump can't cancel the downloader from inside its own callback.
+                if discoveredSize != nil {
+                    self.session.notifyHeadersAvailable()
+                }
+            } else if code == 429 || code == 503 {
+                // Upstream is throttling us (typical for Cloudflare Worker
+                // stream proxies on long sessions). Reconnecting immediately
+                // just extends the ban: back off, park the clients, and let a
+                // single timer resume the stream.
+                let retryHeader = ProxyRetryAfter.parse(http.value(forHTTPHeaderField: "Retry-After"))
+                let backoff: TimeInterval
+                if let retryHeader {
+                    backoff = min(max(retryHeader, 5), 300)
+                } else {
+                    backoff = min(15 * pow(2.0, Double(min(self.session.consecutiveRateLimits, 4))), 300)
+                }
+                self.session.noteRateLimit(retryAfter: backoff)
+                self.lastErrorMessage = "rate limited (HTTP \(code)), retrying in \(Int(backoff))s"
+                LocalCacheProxyLog.shared.log("FD [\(self.startByte)]: Upstream rate limit HTTP \(code). Backing off \(Int(backoff))s (consecutive=\(self.session.consecutiveRateLimits)). No reconnects until backoff expires.")
+                self.task = nil
+                self.urlSession?.invalidateAndCancel()
+                self.urlSession = nil
+                self.cleanupFileHandle()
+                if self.currentChunkIndex >= 0 {
+                    self.session.releaseChunkWrite(chunkIndex: self.currentChunkIndex, owner: "forward")
+                    self.currentChunkIndex = -1
+                }
+                self.session.server.queue.asyncAfter(deadline: .now() + backoff) { [weak self] in
+                    guard let self, !self.isCancelled, !self.isFinished, self.session.valid else { return }
+                    guard !self.session.isRateLimited else { return } // superseded by a newer backoff
+                    if self.isFinished {
+                        self.session.startBackwardDownloadIfNeeded()
+                        return
+                    }
+                    LocalCacheProxyLog.shared.log("FD [\(self.startByte)]: Rate-limit backoff expired, resuming from \(self.streamOffset)...")
+                    self.startStream(from: self.streamOffset)
+                }
+                completionHandler(.cancel)
             } else {
+                self.lastErrorMessage = "HTTP \(code)"
                 LocalCacheProxyLog.shared.log("FD [\(self.startByte)]: HTTP error \(code)")
                 completionHandler(.cancel)
             }
@@ -1119,7 +1396,8 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
 
     private func processIncoming(data: Data) {
         session.recordBytesReceived(data.count)
-        lastByteUptime = ProcessInfo.processInfo.systemUptime
+        totalBytesReceived += Int64(data.count)
+        lastByteUptime = saminNow()
 
         var cursor = streamOffset
         var remaining = data
@@ -1195,7 +1473,11 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
             }
             session.notifyDataAvailable(chunkIndex: chunkIndex)
         } catch {
-            LocalCacheProxyLog.shared.log("FD [\(startByte)]: File write error on chunk \(chunkIndex): \(error.localizedDescription)")
+            let msg = "chunk \(chunkIndex): \(error.localizedDescription) (free=\(session.server.freeSpaceBytes() / 1024 / 1024) MB)"
+            session.writeErrorCount += 1
+            session.lastWriteError = msg
+            lastErrorMessage = "write failed \(msg)"
+            LocalCacheProxyLog.shared.log("FD [\(startByte)]: File write error on \(msg)")
         }
     }
 
@@ -1207,6 +1489,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
             }
 
             if let error {
+                self.lastErrorMessage = error.localizedDescription
                 LocalCacheProxyLog.shared.log("FD [\(self.startByte)]: Disconnect error: '\(error.localizedDescription)' at offset \(self.streamOffset)")
                 if self.retryCount < self.maxRetries && self.session.valid {
                     self.retryCount += 1
@@ -1308,7 +1591,7 @@ final class BackwardDownloader: NSObject, URLSessionDataDelegate {
         let fileUrl = session.chunkURL(chunkIndex)
         var existingBytes: Int64 = session.bytesWrittenByChunk[chunkIndex] ?? 0
         if existingBytes == 0, let attrs = try? FileManager.default.attributesOfItem(atPath: fileUrl.path),
-           let fileSize = attrs[.size] as? Int64, fileSize > 0, fileSize <= expectedBytes {
+           let fileSize = (attrs[.size] as? NSNumber)?.int64Value, fileSize > 0, fileSize <= expectedBytes {
             existingBytes = fileSize
             session.bytesWrittenByChunk[chunkIndex] = existingBytes
         }
@@ -1396,6 +1679,7 @@ final class BackwardDownloader: NSObject, URLSessionDataDelegate {
             completionHandler(.cancel)
             return
         }
+        self.session.lastUpstreamStatus = http.statusCode
         if http.statusCode == 200 {
             // Server ignored range, sent full chunk from 0
             if let h = fileHandle {
@@ -1540,6 +1824,8 @@ final class ProxyConnection {
         let start = range?.start ?? 0
         let requestedEnd = range?.end
 
+        session.clientRangeRequests += 1
+        session.lastClientRange = request.headers["range"] ?? "full file"
         LocalCacheProxyLog.shared.log("Client [\(sessionKey)]: \(request.method) range=\(request.headers["range"] ?? "all") (start=\(start), end=\(requestedEnd?.description ?? "EOF"))")
 
         if let total = session.totalSize, total > 0 {
@@ -1853,5 +2139,23 @@ enum ProxyConnectionTotal {
         let total = v[v.index(after: slash)...].trimmingCharacters(in: .whitespaces)
         guard total != "*" else { return nil }
         return Int64(total).flatMap { $0 > 0 ? $0 : nil }
+    }
+}
+
+enum ProxyRetryAfter {
+    /// Parses a Retry-After header: delta-seconds or an HTTP-date.
+    static func parse(_ header: String?) -> TimeInterval? {
+        guard let h = header?.trimmingCharacters(in: .whitespacesAndNewlines), !h.isEmpty else { return nil }
+        if let secs = Double(h), secs >= 0 {
+            return secs
+        }
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = TimeZone(secondsFromGMT: 0)
+        fmt.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        if let date = fmt.date(from: h) {
+            return max(0, date.timeIntervalSinceNow)
+        }
+        return nil
     }
 }

@@ -44,8 +44,10 @@ fun PlayerDiagnosticsDialog(
     val scope = rememberCoroutineScope()
     var reportText by remember { mutableStateOf("Generating diagnostic report...") }
     var copied by remember { mutableStateOf(false) }
+    var refreshTick by remember { mutableStateOf(0) }
 
-    LaunchedEffect(launchId) {
+    LaunchedEffect(launchId, refreshTick) {
+        reportText = "Generating diagnostic report..."
         reportText = TempPlaybackCache.getDiagnosticReport(launchId)
     }
 
@@ -96,6 +98,11 @@ fun PlayerDiagnosticsDialog(
                         }
                     },
                     style = DialogButtonStyle.Primary,
+                )
+                DialogButton(
+                    text = "Refresh",
+                    onClick = { refreshTick++ },
+                    style = DialogButtonStyle.Secondary,
                 )
                 DialogButton(
                     text = "Close",

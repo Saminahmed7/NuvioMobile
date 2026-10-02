@@ -122,12 +122,15 @@ internal fun PlayerTimeline(
     // Samin: official buffered tint removed — with the saved-to-disk spans
     // it was visual noise answering nothing useful. Track shows base,
     // saved (solid gray) and played only.
+    // Samin: draw every span the proxy reports (it caps at 32 merged ranges).
+    // Capping lower here silently dropped saved regions that sat past the
+    // first few, which made the gray bar disagree with what was really cached.
     val savedSpans = remember(cachedRanges) {
         cachedRanges.mapNotNull { span ->
             val start = span.start.coerceIn(0f, 1f)
             val end = span.end.coerceIn(0f, 1f)
             if (end > start) start to end else null
-        }.take(8)
+        }.take(32)
     }
     val accentBrush = MaterialTheme.themePalette.accentBrush()
     val description = stringResource(Res.string.player_seek_position)
