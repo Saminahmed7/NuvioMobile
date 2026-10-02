@@ -633,9 +633,11 @@ final class ProxySession {
             return
         }
 
-        // 3. If forward downloader is already downloading and will reach startByte in less than 250ms (< 1 MB away)
+        // 3. If forward downloader is actively downloading nearby (within 4 MB of startByte),
+        // let the continuous stream keep flowing without interrupting the network pipe!
         if let fd = forwardDownloader, !fd.isFinished {
-            if fd.streamOffset <= startByte && (startByte - fd.streamOffset) < (1024 * 1024) {
+            let dist = abs(startByte - fd.streamOffset)
+            if dist <= 4 * 1024 * 1024 {
                 return
             }
         }
