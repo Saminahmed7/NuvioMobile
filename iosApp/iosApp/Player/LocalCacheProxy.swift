@@ -24,7 +24,7 @@ private let saminProxyChunkBytes: Int64 = 2 * 1024 * 1024 // 2 MB chunks
 private let saminProxyLowSpaceBytes: Int64 = 500 * 1024 * 1024 // 500 MB
 private let saminProxyMaxRanges = 32
 private let saminProxyPieceBytes: Int = 256 * 1024 // 256 KB socket send slices
-private let saminProxyMinResumeBytes: Int64 = 256 * 1024 // 256 KB prebuffer lead
+private let saminProxyMinResumeBytes: Int64 = 0 // No hold-back; pump delivers bytes as soon as they land
 private let saminProxySegmentBytes: Int64 = 64 * 1024 * 1024 // 64 MB bounded upstream segment
 
 final class LocalCacheProxyLog {
@@ -613,11 +613,16 @@ final class ProxySession {
             return
         }
 
-        // 2. Check if requested range is near the end of file (e.g. cues/moov atom index probe)
-        if let total = totalSize, (total - startByte) <= 8 * 1024 * 1024,
-           let fd = forwardDownloader, !fd.isFinished, (total - fd.streamOffset) > 16 * 1024 * 1024 {
+        // 2. Metadata/index probe: requested byte is in the last 32 MB of file AND the FD is
+        // more than 32 MB away from that position.  This catches MKV/MP4 cue/moov atoms that
+        // sit well before EOF — the old 8 MB threshold missed them and caused the FD to
+        // ping-pong between the index position and the real playback position.
+        if let total = totalSize,
+           (total - startByte) <= 32 * 1024 * 1024,
+           let fd = forwardDownloader, !fd.isFinished,
+           abs(startByte - fd.streamOffset) > 32 * 1024 * 1024 {
             if probeDownloader == nil {
-                LocalCacheProxyLog.shared.log("Session [\(key)]: End-of-file probe at \(startByte); using probe chunk \(chunkIdx)")
+                LocalCacheProxyLog.shared.log("Session [\(key)]: EOF metadata probe at \(startByte) (\((total-startByte)/1024/1024) MB from end; FD \(abs(startByte-fd.streamOffset)/1024/1024) MB away)")
             }
             fetchProbeChunk(chunkIndex: chunkIdx)
             return
