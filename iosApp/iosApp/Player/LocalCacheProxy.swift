@@ -20,11 +20,11 @@ import ComposeApp
 // 5. Watched data behind the playhead is evicted only under storage pressure.
 // 6. Ephemeral: everything is deleted when playback closes (stopSession).
 
-private let saminProxyChunkBytes: Int64 = 16 * 1024 * 1024 // 16 MB chunks
+private let saminProxyChunkBytes: Int64 = 2 * 1024 * 1024 // 2 MB chunks
 private let saminProxyLowSpaceBytes: Int64 = 500 * 1024 * 1024 // 500 MB
 private let saminProxyMaxRanges = 32
-private let saminProxyPieceBytes: Int = 512 * 1024 // 512 KB socket send slices
-private let saminProxyMinResumeBytes: Int64 = 512 * 1024 // 512 KB prebuffer lead
+private let saminProxyPieceBytes: Int = 256 * 1024 // 256 KB socket send slices
+private let saminProxyMinResumeBytes: Int64 = 256 * 1024 // 256 KB prebuffer lead
 private let saminProxySegmentBytes: Int64 = 64 * 1024 * 1024 // 64 MB bounded upstream segment
 
 final class LocalCacheProxyLog {
@@ -144,7 +144,15 @@ final class LocalCacheProxyServer {
         queue.async { [weak self] in
             guard let self else { return }
             LocalCacheProxyLog.shared.log("Server: Foreground notification received. Ensuring listener on port \(self.activeBoundPort)...")
-            self.ensureListener()
+            if self.listener == nil || self.listener?.state != .ready {
+                self.listener?.cancel()
+                self.listener = nil
+                self.port = 0
+                self.ensureListener()
+            }
+            for session in self.sessions.values {
+                session.handleForegroundWake()
+            }
         }
     }
 
@@ -184,7 +192,11 @@ final class LocalCacheProxyServer {
 
     @discardableResult
     func ensureListener() -> Bool {
-        if listener != nil, port != 0 { return true }
+        if let current = listener, current.state == .ready, port != 0 { return true }
+
+        listener?.cancel()
+        listener = nil
+        port = 0
 
         // If we have active sessions, we MUST stay on activeBoundPort (e.g. 19842)
         // so MPV's active stream URLs never get broken.
@@ -540,6 +552,7 @@ final class ProxySession {
     func markCached(_ index: Int64) {
         cachedChunks.insert(index)
         bytesWrittenByChunk.removeValue(forKey: index)
+        notifyDataAvailable(chunkIndex: index)
     }
 
     func bytesAvailable(for chunkIndex: Int64) -> Int64 {
@@ -581,91 +594,55 @@ final class ProxySession {
         activeConnections.values.forEach { $0.onDownloadFailed() }
     }
 
+    func handleForegroundWake() {
+        guard valid else { return }
+        LocalCacheProxyLog.shared.log("Session [\(key)]: Handling foreground wake...")
+        forwardDownloader?.handleForegroundWake()
+    }
+
     /// Ensures a forward download stream is actively running from the requested byte offset.
     func ensureForwardDownloading(from startByte: Int64) {
         guard valid else { return }
 
-        // Start caching from a second before where the stream starts/requests.
-        // In LocalCacheProxy, 1 chunk = 8 MB, which corresponds to ~2-4 seconds of video.
-        let effectiveStartByte = max(0, startByte - saminProxyChunkBytes)
-        let chunkIdx = effectiveStartByte / saminProxyChunkBytes
-        let targetStartByte = chunkIdx * saminProxyChunkBytes
+        let chunkIdx = startByte / saminProxyChunkBytes
+        let chunkOffset = startByte % saminProxyChunkBytes
+        let available = bytesAvailable(for: chunkIdx)
 
-        // If totalSize is not known yet, check if existing downloader covers the target
-        guard let total = totalSize, total > 0 else {
-            if let fd = forwardDownloader, !fd.isFinished {
-                if fd.streamOffset >= targetStartByte {
-                    return
-                }
-                if (targetStartByte - fd.streamOffset) <= 32 * 1024 * 1024 {
-                    return
-                }
-                LocalCacheProxyLog.shared.log("Session [\(key)]: Cancelling initial FD (streamOffset=\(fd.streamOffset), target=\(targetStartByte))")
-                forwardDownloader?.cancel()
-                forwardDownloader = nil
-            }
-            startNewForwardDownloader(targetStartByte: targetStartByte, reason: "initial/unknown totalSize")
+        // 1. If the requested byte is already cached on disk, nothing to download
+        if chunkOffset < available {
             return
         }
 
-        let now = ProcessInfo.processInfo.systemUptime
-        let recentStart = (now - lastForwardDownloaderStartTime) < 2.0
-
-        // 1. Check if all chunks from chunkIdx to EOF are already cached
-        let totalChunks = (total + saminProxyChunkBytes - 1) / saminProxyChunkBytes
-        var allCachedForward = true
-        for c in chunkIdx..<totalChunks {
-            if !cachedChunks.contains(c) {
-                allCachedForward = false
-                break
-            }
-        }
-        if allCachedForward {
-            LocalCacheProxyLog.shared.log("Session [\(key)]: All forward chunks \(chunkIdx)..<\(totalChunks) cached! Completing.")
-            forwardDownloader?.cancel()
-            forwardDownloader = nil
-            onForwardCompleted(startByte: targetStartByte)
-            return
-        }
-
-        // 2. If forward downloader is already downloading this region forward, let it run at line rate
-        if let fd = forwardDownloader, !fd.isFinished {
-            if fd.startByte <= targetStartByte && fd.streamOffset >= targetStartByte {
-                return
-            }
-            if fd.streamOffset < targetStartByte && (targetStartByte - fd.streamOffset) <= 32 * 1024 * 1024 {
-                return
-            }
-            if recentStart && abs(targetStartByte - fd.startByte) <= 64 * 1024 * 1024 {
-                LocalCacheProxyLog.shared.log("Session [\(key)]: FD running from \(fd.startByte), nearby probe chunk=\(chunkIdx)")
-                fetchProbeChunk(chunkIndex: chunkIdx)
-                return
-            }
-        }
-
-        // 3. If requested range is a probe near the end of file (e.g. moov/cues atom)
-        // and forwardDownloader is actively running near the beginning/playhead:
-        if (total - startByte) <= 16 * 1024 * 1024,
-           let fd = forwardDownloader, !fd.isFinished, fd.streamOffset < (total - 32 * 1024 * 1024) {
+        // 2. Check if requested range is near the end of file (e.g. cues/moov atom index probe)
+        if let total = totalSize, (total - startByte) <= 8 * 1024 * 1024,
+           let fd = forwardDownloader, !fd.isFinished, (total - fd.streamOffset) > 16 * 1024 * 1024 {
             if probeDownloader == nil {
-                LocalCacheProxyLog.shared.log("Session [\(key)]: End-of-file probe at \(startByte); using probe chunk \(startByte / saminProxyChunkBytes)")
+                LocalCacheProxyLog.shared.log("Session [\(key)]: End-of-file probe at \(startByte); using probe chunk \(chunkIdx)")
             }
-            fetchProbeChunk(chunkIndex: startByte / saminProxyChunkBytes)
+            fetchProbeChunk(chunkIndex: chunkIdx)
             return
         }
 
-        // 3.5 If requested range is Chunk 0 (container header) and forwardDownloader is actively running at a forward seek position:
+        // 2.5 Container header probe at Chunk 0 while forward downloader is running far ahead
         if chunkIdx == 0 && !cachedChunks.contains(0),
-           let fd = forwardDownloader, !fd.isFinished, fd.startByte > (32 * 1024 * 1024) {
+           let fd = forwardDownloader, !fd.isFinished, fd.startByte > (16 * 1024 * 1024) {
             if probeDownloader == nil {
-                LocalCacheProxyLog.shared.log("Session [\(key)]: Container header probe at chunk 0 while FD is running at \(fd.startByte); using probe chunk 0")
+                LocalCacheProxyLog.shared.log("Session [\(key)]: Container header probe at chunk 0; using probe chunk 0")
             }
             fetchProbeChunk(chunkIndex: 0)
             return
         }
 
-        // 4. New seek point / reposition: cancel existing downloaders so 100% bandwidth serves the current play position
-        LocalCacheProxyLog.shared.log("Session [\(key)]: Repositioning download to \(startByte) (targetChunk=\(chunkIdx), targetByte=\(targetStartByte))")
+        // 3. If forward downloader is already downloading and will reach startByte in less than 250ms (< 1 MB away)
+        if let fd = forwardDownloader, !fd.isFinished {
+            if fd.streamOffset <= startByte && (startByte - fd.streamOffset) < (1024 * 1024) {
+                return
+            }
+        }
+
+        // 4. Reposition forward downloader directly to start of chunk for instant playback and clean caching!
+        let targetStartByte = chunkIdx * saminProxyChunkBytes
+        LocalCacheProxyLog.shared.log("Session [\(key)]: Repositioning download to \(targetStartByte) (seekByte=\(startByte), chunk=\(chunkIdx))")
         forwardDownloader?.cancel()
         forwardDownloader = nil
         backwardDownloader?.cancel()
@@ -923,16 +900,18 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
             return
         }
 
-        // If chunks starting at offset are already cached, advance to first uncached byte
         var effectiveOffset = offset
-        let startChunk = offset / saminProxyChunkBytes
-        var checkChunk = startChunk
-        while session.cachedChunks.contains(checkChunk) {
-            checkChunk += 1
+        let chunkIdx = offset / saminProxyChunkBytes
+        let chunkOffset = offset % saminProxyChunkBytes
+        let available = session.bytesAvailable(for: chunkIdx)
+        if chunkOffset < available {
+            effectiveOffset = (chunkIdx * saminProxyChunkBytes) + available
+        } else if session.cachedChunks.contains(chunkIdx) {
+            var checkChunk = chunkIdx + 1
+            while session.cachedChunks.contains(checkChunk) {
+                checkChunk += 1
+            }
             effectiveOffset = checkChunk * saminProxyChunkBytes
-        }
-        if let written = session.bytesWrittenByChunk[checkChunk], written > 0 {
-            effectiveOffset = (checkChunk * saminProxyChunkBytes) + written
         }
 
         if let total = session.totalSize, total > 0, effectiveOffset >= total {
@@ -996,6 +975,12 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         try? fileHandle?.close()
         fileHandle = nil
         fileHandleChunk = -1
+    }
+
+    func handleForegroundWake() {
+        guard !isCancelled, !isFinished, session.valid else { return }
+        LocalCacheProxyLog.shared.log("FD [\(startByte)]: Foreground wake -> reconnecting continuous stream from \(streamOffset)...")
+        reconnect(reason: "foreground wake")
     }
 
     func onClientWaiting(chunkIndex: Int64) {

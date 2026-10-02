@@ -275,6 +275,9 @@ final class MPVPlayerViewController: UIViewController {
     private var activeLoadedRequest: PendingLoadRequest?
     private var lastForegroundUptime: TimeInterval = 0
     private var foregroundReloadCount: Int = 0
+    private var savedPositionBeforeBackground: Double = 0
+    private var wasPlayingBeforeBackground: Bool = false
+    private var pendingResumePosition: Double?
 
     // Cached track lists
     var audioTracks: [TrackInfo] = []
@@ -553,6 +556,13 @@ final class MPVPlayerViewController: UIViewController {
 
     @objc private func enterBackground() {
         guard mpv != nil else { return }
+        let currentPos = getDouble("time-pos")
+        if currentPos > 0 {
+            savedPositionBeforeBackground = currentPos
+        } else if positionMs > 0 {
+            savedPositionBeforeBackground = Double(positionMs) / 1000.0
+        }
+        wasPlayingBeforeBackground = isPlayerPlaying
         pausePlayback()
         setStringProperty("vid", "no")
     }
@@ -562,7 +572,28 @@ final class MPVPlayerViewController: UIViewController {
         lastForegroundUptime = ProcessInfo.processInfo.systemUptime
         LocalCacheProxyServer.shared.warmup()
         setStringProperty("vid", "auto")
-        playPlayback()
+
+        let path = getString("path")
+        let isIdle = getFlag("idle-active")
+        let isEof = getFlag("eof-reached") || isPlayerEnded
+        let hasError = !currentErrorMessage.isEmpty
+
+        // If MPV lost the file or dropped connection while in background / screen off:
+        if let request = activeLoadedRequest, (path == nil || path?.isEmpty == true || isIdle || isEof || hasError) {
+            print("[MPV] Recovering playback after screen off / sleep wake at position \(savedPositionBeforeBackground)s...")
+            clearPlaybackError()
+            foregroundReloadCount = 0
+            pendingResumePosition = savedPositionBeforeBackground
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                guard let self, self.mpv != nil else { return }
+                self.startLoad(request)
+            }
+            return
+        }
+
+        if wasPlayingBeforeBackground {
+            playPlayback()
+        }
     }
 
     // MARK: - Playback API
@@ -1189,6 +1220,16 @@ final class MPVPlayerViewController: UIViewController {
                         self.foregroundReloadCount = 0
                         self.clearPlaybackError()
                         self.isPlayerLoading = false
+                        if let resumePos = self.pendingResumePosition {
+                            self.pendingResumePosition = nil
+                            if resumePos > 0.5 {
+                                print("[MPV] File loaded -> seeking immediately to resume position \(resumePos)s")
+                                self.command("seek", args: [String(format: "%.3f", resumePos), "absolute"])
+                            }
+                            if self.wasPlayingBeforeBackground {
+                                self.playPlayback()
+                            }
+                        }
                         self.updateState()
                         self.publishNowPlayingForPlaybackSession()
                         self.logCurrentAudioOutput()
@@ -1201,24 +1242,33 @@ final class MPVPlayerViewController: UIViewController {
                 case MPV_EVENT_END_FILE:
                     if let data = eventPtr.pointee.data {
                         let endFile = UnsafePointer<mpv_event_end_file>(OpaquePointer(data)).pointee
-                        if endFile.reason == MPV_END_FILE_REASON_ERROR {
-                            let errorText = String(cString: mpv_error_string(endFile.error))
-                            print("[MPV] End file error: \(errorText)")
-                            DispatchQueue.main.async {
-                                let now = ProcessInfo.processInfo.systemUptime
-                                if (now - self.lastForegroundUptime) < 4.0,
-                                   let req = self.activeLoadedRequest,
-                                   req.urlString.contains("127.0.0.1"),
-                                   self.foregroundReloadCount < 2 {
+                        let reason = endFile.reason
+                        let errorCode = endFile.error
+                        DispatchQueue.main.async {
+                            let now = ProcessInfo.processInfo.systemUptime
+                            let isRecentForeground = (now - self.lastForegroundUptime) < 5.0
+                            let isPremature = self.durationMs > 10000 && self.positionMs < (self.durationMs - 10000)
+                            let isLoopback = self.activeLoadedRequest?.urlString.contains("127.0.0.1") == true
+
+                            if isLoopback && (reason == MPV_END_FILE_REASON_ERROR || (reason == MPV_END_FILE_REASON_EOF && (isRecentForeground || isPremature))) {
+                                if self.foregroundReloadCount < 3 {
                                     self.foregroundReloadCount += 1
-                                    print("[MPV] Recovering from loopback disconnect after foregrounding; warming proxy and reloading...")
+                                    let resumePos = max(self.savedPositionBeforeBackground, Double(self.positionMs) / 1000.0)
+                                    print("[MPV] Premature end/error (reason=\(reason), error=\(errorCode)) near foreground or during playback; warming proxy and auto-recovering at \(resumePos)s...")
+                                    self.clearPlaybackError()
+                                    self.pendingResumePosition = resumePos
                                     LocalCacheProxyServer.shared.warmup()
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                                        guard let self, self.mpv != nil else { return }
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                                        guard let self, let req = self.activeLoadedRequest, self.mpv != nil else { return }
                                         self.startLoad(req)
                                     }
                                     return
                                 }
+                            }
+
+                            if reason == MPV_END_FILE_REASON_ERROR {
+                                let errorText = String(cString: mpv_error_string(errorCode))
+                                print("[MPV] End file error: \(errorText)")
                                 self.setPlaybackError("[mpv] \(errorText)")
                             }
                         }
