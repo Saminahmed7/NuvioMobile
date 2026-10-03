@@ -48,7 +48,6 @@ private let saminProxyLowSpaceBytes: Int64 = 500 * 1024 * 1024 // 500 MB
 private let saminProxyMaxRanges = 32
 private let saminProxyPieceBytes: Int = 256 * 1024 // 256 KB socket send slices
 private let saminProxyMinResumeBytes: Int64 = 0 // No hold-back; pump delivers bytes as soon as they land
-private let saminProxySegmentBytes: Int64 = 64 * 1024 * 1024 // 64 MB bounded upstream segment
 // A client request this far ahead of the write head is treated as a one-off
 // probe (index/moov atom) rather than sequential playback, so it is served by a
 // dedicated range fetch instead of dragging the prefetcher forward.
