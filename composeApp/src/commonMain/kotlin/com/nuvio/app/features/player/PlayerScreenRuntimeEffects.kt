@@ -156,7 +156,7 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
             val dur = playbackSnapshot.durationMs
             if (dur > 0L && (lastPushedMs < 0L || kotlin.math.abs(pos - lastPushedMs) > 30_000L)) {
                 lastPushedMs = pos
-                TempPlaybackCache.pushPlayhead(lid, pos, dur)
+                TempPlaybackCache.pushPlayhead(lid, pos, dur, playbackSnapshot.streamPos, playbackSnapshot.isPlaying)
             }
         }
     }

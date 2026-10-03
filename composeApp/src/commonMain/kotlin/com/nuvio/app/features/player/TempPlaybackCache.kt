@@ -140,12 +140,12 @@ object TempPlaybackCache {
         return local to emptyMap()
     }
 
-    fun pushPlayhead(launchId: Long, positionMs: Long, durationMs: Long) {
+    fun pushPlayhead(launchId: Long, positionMs: Long, durationMs: Long, streamPos: Long = 0L, isPlaying: Boolean = true) {
         if (!isProxied(launchId)) return
         val key = activeSessionKeys[launchId] ?: return
         runCatching {
             NuvioCacheProxyBridgeFactory.create()
-                ?.setPlayhead(key, positionMs, durationMs)
+                ?.setPlayhead(key, positionMs, durationMs, streamPos, isPlaying)
         }
     }
 

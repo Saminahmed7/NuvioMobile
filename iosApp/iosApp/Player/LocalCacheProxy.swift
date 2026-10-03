@@ -492,10 +492,44 @@ final class LocalCacheProxyServer {
         }
     }
 
-    func setPlayhead(key: String, positionMs: Int64, durationMs: Int64) {
+    func setPlayhead(key: String, positionMs: Int64, durationMs: Int64, streamPos: Int64? = nil, isPlaying: Bool = true) {
         queue.sync {
             sessions[key]?.playheadMs = (positionMs, durationMs)
+            if let streamPos, streamPos > 0 {
+                sessions[key]?.playheadStreamPos = streamPos
+            }
+            // Pause forward downloader when player is paused to save battery
+            if let s = sessions[key], let fd = s.forwardDownloader, !fd.isFinished {
+                if isPlaying {
+                    fd.resume()
+                } else {
+                    fd.pause()
+                }
+            }
         }
+    }
+
+    /// Pauses the continuous download to save battery when playback is paused.
+    func pause() {
+        guard !isCancelled, !isFinished else { return }
+        task?.cancel()
+        task = nil
+        urlSession?.invalidateAndCancel()
+        urlSession = nil
+        cleanupFileHandle()
+        if currentChunkIndex >= 0 {
+            session.releaseChunkWrite(chunkIndex: currentChunkIndex, owner: "forward")
+            currentChunkIndex = -1
+        }
+        stopWatchdog()
+    }
+
+    /// Resumes the download from the current stream offset.
+    func resume() {
+        guard !isCancelled, !isFinished else { return }
+        startStream(from: streamOffset)
+    }
+}
     }
 
     func cachedRangesJson(key: String) -> String {
@@ -646,6 +680,7 @@ final class ProxySession {
             onPlayheadUpdated()
         }
     }
+    var playheadStreamPos: Int64?
     var valid = true
     private(set) var cachedChunks: Set<Int64> = []
     var bytesWrittenByChunk: [Int64: Int64] = [:]
@@ -770,6 +805,9 @@ final class ProxySession {
     }
 
     var playheadByte: Int64? {
+        if let streamPos = playheadStreamPos, streamPos > 0 {
+            return streamPos
+        }
         guard let (pos, dur) = playheadMs, dur > 0, let total = totalSize, total > 0 else { return nil }
         return max(0, min(total, Int64((Double(pos) / Double(dur)) * Double(total))))
     }
@@ -907,6 +945,8 @@ final class ProxySession {
         } else {
             // Initial load, recovery after a failed stream, or a region the
             // finished stream never covered: (re)start the prefetcher here.
+            // Cancel any in-flight chunk fetchers to avoid chunk conflicts.
+            cancelAllChunkFetchers()
             startNewForwardDownloader(targetStartByte: chunkIdx * saminProxyChunkBytes, reason: "client request at \(startByte)")
         }
     }
@@ -941,6 +981,15 @@ final class ProxySession {
         chunkFetchers[chunkIndex] = bd
         LocalCacheProxyLog.shared.log("Session [\(key)]: Dedicated fetch for chunk \(chunkIndex) (pool=\(chunkFetchers.count))")
         bd.start()
+    }
+
+    /// Cancel all in-flight chunk fetchers. Called when the forward prefetcher
+    /// is repositioned to avoid chunk conflicts and redundant downloads.
+    func cancelAllChunkFetchers() {
+        for (_, fetcher) in chunkFetchers {
+            fetcher.cancel()
+        }
+        chunkFetchers.removeAll()
     }
 
     func notifyClientWaiting(chunkIndex: Int64) {
@@ -1032,19 +1081,24 @@ final class ProxySession {
         startNewForwardDownloader(targetStartByte: target, reason: "forward seek")
     }
 
-    /// Pairs a fresh playhead (time) with the byte the last seek repositioned the
-    /// downloader to, so the timeline can convert byte fractions to time.
+    /// Pairs a fresh playhead (time) with the byte MPV actually reports
+    /// (stream-pos), so the timeline can convert byte fractions to time
+    /// exactly instead of estimating from the duration ratio.
     func recordPlayheadSample() {
         guard let total = totalSize, total > 0,
               let (pos, dur) = playheadMs, dur > 0 else { return }
-        guard let pending = pendingSeekByte, saminNow() - pending.at < 3.0 else { return }
-        pendingSeekByte = nil
         let t = Double(pos) / Double(dur)
-        let b = Double(pending.byte) / Double(total)
-        // The downloader only repositions to a client-requested byte, which sits
-        // near the playhead. A large gap means this was an index/moov probe at
-        // byte 0 or a stale pairing — ignore it rather than skew the mapping.
-        guard t.isFinite, b.isFinite, abs(t - b) <= 0.10 else { return }
+        // Prefer the real byte position; fall back to the seek anchor.
+        let b: Double
+        if let streamPos = playheadStreamPos, streamPos > 0 {
+            b = Double(streamPos) / Double(total)
+        } else if let pending = pendingSeekByte, saminNow() - pending.at < 3.0 {
+            b = Double(pending.byte) / Double(total)
+        } else {
+            return
+        }
+        pendingSeekByte = nil
+        guard t.isFinite, b.isFinite else { return }
         noteRateSample(t: t, b: b)
     }
 

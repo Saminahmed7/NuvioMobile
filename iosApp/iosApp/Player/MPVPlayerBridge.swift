@@ -192,6 +192,7 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge {
     func getDurationMs() -> Int64 { return playerVC?.durationMs ?? 0 }
     func getPositionMs() -> Int64 { return playerVC?.positionMs ?? 0 }
     func getBufferedMs() -> Int64 { return playerVC?.bufferedMs ?? 0 }
+    func getStreamPos() -> Int64 { return playerVC?.streamPosBytes ?? 0 }
     func getPlaybackSpeed() -> Float { playerVC?.currentSpeed ?? 1.0 }
     func getErrorMessage() -> String { playerVC?.currentErrorMessage ?? "" }
 
@@ -290,6 +291,7 @@ final class MPVPlayerViewController: UIViewController {
     var durationMs: Int64 = 0
     var positionMs: Int64 = 0
     var bufferedMs: Int64 = 0
+    var streamPosBytes: Int64 = 0
     var currentSpeed: Float = 1.0
     var currentErrorMessage: String {
         errorStateLock.lock()
@@ -511,6 +513,12 @@ final class MPVPlayerViewController: UIViewController {
         checkError(mpv_set_option_string(mpv, "target-colorspace-hint", "yes"))
         checkError(mpv_set_option_string(mpv, "tone-mapping", "auto"))
         checkError(mpv_set_option_string(mpv, "hdr-compute-peak", "yes"))
+        // Demuxer readahead cache: buffer ahead in memory so playback rides
+        // through moments the loopback proxy is waiting on a slow upstream.
+        // Matches Android's demuxer-max-bytes (64 MB).
+        checkError(mpv_set_option_string(mpv, "demuxer-max-bytes", "67108864"))
+        checkError(mpv_set_option_string(mpv, "demuxer-readahead-secs", "30"))
+        checkError(mpv_set_option_string(mpv, "cache", "yes"))
 
         checkError(mpv_initialize(mpv))
         applyAudioLanguagePreferences(preferredAudioLanguages)
@@ -958,6 +966,7 @@ final class MPVPlayerViewController: UIViewController {
         let duration = getDouble("duration")
         let position = getDouble("time-pos")
         let cached = getDouble("demuxer-cache-time")
+        let streamPos = getDouble("stream-pos")
         let speed = getDouble("speed")
         let paused = getFlag("pause")
         let eofReached = getFlag("eof-reached")
@@ -971,6 +980,7 @@ final class MPVPlayerViewController: UIViewController {
         durationMs = Int64(duration * 1000)
         positionMs = Int64(max(position, 0) * 1000)
         bufferedMs = Int64(max(position + cached, 0) * 1000)
+        streamPosBytes = Int64(max(streamPos, 0))
         currentSpeed = Float(speed > 0 ? speed : 1.0)
 
         let shouldPublishNowPlayingState = !isPlayerLoading || isPlayerPlaying || durationMs > 0 || positionMs > 0

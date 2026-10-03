@@ -20,7 +20,7 @@ interface NuvioCacheProxyBridge {
     fun startSession(sessionKey: String, sourceUrl: String, headersJson: String?): String
     fun stopSession(sessionKey: String)
     fun stopAllSessions()
-    fun setPlayhead(sessionKey: String, positionMs: Long, durationMs: Long)
+    fun setPlayhead(sessionKey: String, positionMs: Long, durationMs: Long, streamPos: Long = 0L, isPlaying: Boolean = true)
     fun cachedRangesJson(sessionKey: String): String
     fun cacheStatsJson(sessionKey: String): String = "{}"
     fun diagnosticReport(sessionKey: String): String = ""

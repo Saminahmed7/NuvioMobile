@@ -228,6 +228,7 @@ data class PlayerPlaybackSnapshot(
     val durationMs: Long = 0L,
     val positionMs: Long = 0L,
     val bufferedPositionMs: Long = 0L,
+    val streamPos: Long = 0L,
     val playbackSpeed: Float = 1f,
     val videoWidth: Int = 0,
     val videoHeight: Int = 0,

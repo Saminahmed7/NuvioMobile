@@ -81,6 +81,8 @@ interface NuvioPlayerBridge {
     fun getDurationMs(): Long
     fun getPositionMs(): Long
     fun getBufferedMs(): Long
+    fun getStreamPos(): Long
+    fun getIsPlaying(): Boolean
     fun getPlaybackSpeed(): Float
     fun getErrorMessage(): String
     fun destroy()
