@@ -873,6 +873,7 @@ final class ProxySession {
 
     func waitForHeaders(connection: ProxyConnection) {
         headWaiters.append(connection)
+        connection.startHeadersWaitTimer()
     }
 
     func notifyHeadersAvailable() {
@@ -2057,6 +2058,8 @@ final class ProxyConnection {
     private var pendingStart: Int64 = 0
     private var pendingEnd: Int64?
     private var pendingRanged = false
+    // Timer to fail parked clients if upstream never sends headers
+    private var headersWaitTimer: DispatchSourceTimer?
 
     // Cached reading file handle
     private var readHandle: (chunkIndex: Int64, handle: FileHandle)?
@@ -2158,6 +2161,7 @@ final class ProxyConnection {
     }
 
     func onHeadersAvailable() {
+        cancelHeadersWaitTimer()
         guard !closed, !headersSent, let session = server.session(for: sessionKey) else { return }
         let start = pendingStart
         let total = session.totalSize ?? (pendingEnd.map { $0 + 1 } ?? Int64.max)
@@ -2184,6 +2188,24 @@ final class ProxyConnection {
         if isWaitingForData {
             close()
         }
+    }
+
+    func startHeadersWaitTimer(timeout: TimeInterval = 15.0) {
+        cancelHeadersWaitTimer()
+        let timer = DispatchSource.makeTimerSource(queue: server.queue)
+        timer.schedule(deadline: .now() + timeout)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            LocalCacheProxyLog.shared.log("Client [\(sessionKey)]: Headers wait timed out after \(timeout)s -> failing")
+            self.onDownloadFailed()
+        }
+        timer.resume()
+        headersWaitTimer = timer
+    }
+
+    private func cancelHeadersWaitTimer() {
+        headersWaitTimer?.cancel()
+        headersWaitTimer = nil
     }
 
     private func sendStreamingHeaders(session: ProxySession, start: Int64, end: Int64, ranged: Bool) {
@@ -2364,6 +2386,7 @@ final class ProxyConnection {
     private func close() {
         guard !closed else { return }
         closed = true
+        cancelHeadersWaitTimer()
         try? readHandle?.handle.close()
         readHandle = nil
         server.session(for: sessionKey)?.detachConnection(self)
