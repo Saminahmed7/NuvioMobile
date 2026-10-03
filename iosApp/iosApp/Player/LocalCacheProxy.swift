@@ -505,7 +505,7 @@ final class LocalCacheProxyServer {
                 } else {
                     fd.pause()
                 }
-}
+        }
     }
 
     /// Pauses the continuous download to save battery when playback is paused.
@@ -528,7 +528,6 @@ final class LocalCacheProxyServer {
         guard !isCancelled, !isFinished else { return }
         startStream(from: streamOffset)
     }
-}
     }
 
     func cachedRangesJson(key: String) -> String {
