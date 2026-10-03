@@ -111,8 +111,15 @@ final class LocalCacheProxyBridgeImpl: NSObject, NuvioCacheProxyBridge {
         LocalCacheProxyServer.shared.stopAllSessions()
     }
 
-    func setPlayhead(sessionKey: String, positionMs: Int64, durationMs: Int64) {
-        LocalCacheProxyServer.shared.setPlayhead(key: sessionKey, positionMs: positionMs, durationMs: durationMs)
+    func setPlayhead(sessionKey: String, positionMs: Int64, durationMs: Int64, streamPos: Int64, isPlaying: Bool) {
+        // isPlaying is intentionally unused: the forward download keeps running
+        // while paused so the user can let a slow stream buffer ahead.
+        LocalCacheProxyServer.shared.setPlayhead(
+            key: sessionKey,
+            positionMs: positionMs,
+            durationMs: durationMs,
+            streamPos: streamPos > 0 ? streamPos : nil
+        )
     }
 
     func cachedRangesJson(sessionKey: String) -> String {

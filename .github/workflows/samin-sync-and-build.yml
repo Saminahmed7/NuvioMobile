@@ -23,7 +23,9 @@ permissions:
 
 concurrency:
   group: samin-sync-and-build
-  cancel-in-progress: false
+  # A newer trigger supersedes a stale in-flight build instead of queueing
+  # behind it (a queued run used to wait 30+ min for the old one to finish).
+  cancel-in-progress: true
 
 jobs:
   sync-build-publish:
@@ -86,9 +88,10 @@ jobs:
           restore-keys: |
             konan-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Cache Xcode DerivedData & SwiftPM
+      - name: Restore Xcode DerivedData & SwiftPM
         if: ${{ !inputs.skip_build }}
-        uses: actions/cache@v5
+        id: xcode-derived
+        uses: actions/cache/restore@v5
         with:
           path: |
             build/ios-derived-full-release
@@ -96,6 +99,22 @@ jobs:
           key: xcode-derived-${{ runner.os }}-${{ hashFiles('iosApp/**', 'MPVKit/**') }}
           restore-keys: |
             xcode-derived-${{ runner.os }}-
+
+      # The Release Kotlin/Native link is ~50 min of every build. Its inputs are
+      # only Kotlin sources + Gradle config, so cache the Gradle project outputs
+      # and task history keyed on exactly those. A Swift-only change restores an
+      # exact match, Gradle marks the link UP-TO-DATE, and it is skipped.
+      - name: Restore Kotlin build outputs
+        if: ${{ !inputs.skip_build }}
+        id: kotlin-outputs
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            composeApp/build
+            .gradle
+          key: kotlin-outputs-${{ runner.os }}-${{ hashFiles('composeApp/src/**', 'composeApp/*.gradle.kts', '*.gradle.kts', 'gradle/libs.versions.toml', 'gradle.properties', 'gradle/wrapper/gradle-wrapper.properties', 'iosApp/Configuration/Version.xcconfig') }}
+          restore-keys: |
+            kotlin-outputs-${{ runner.os }}-
 
       - name: Verify Apple toolchain
         if: ${{ !inputs.skip_build }}
@@ -140,8 +159,13 @@ jobs:
           SAMIN_PATCH="$((PATCH_NUM * 1000 + SAMIN_REV))"
           SAMIN_VERSION="${MAJOR_MINOR}.${SAMIN_PATCH}"
           SAMIN_BUILD="${SAMIN_PATCH}"
-          sed -i '' -E "s/^(MARKETING_VERSION=).*/\1${SAMIN_VERSION}/" "${VERSION_FILE}"
-          sed -i '' -E "s/^(CURRENT_PROJECT_VERSION=).*/\1${SAMIN_BUILD}/" "${VERSION_FILE}"
+          # Do NOT rewrite Version.xcconfig: Gradle bakes it into
+          # AppVersionConfig.kt, so changing it every run forced a full
+          # Kotlin/Native relink (~50 min). XCODE_XCCONFIG_FILE overrides the
+          # bundle version for Xcode only; Kotlin keeps the upstream version.
+          OVERRIDE_XCCONFIG="${RUNNER_TEMP}/samin-version.xcconfig"
+          printf 'MARKETING_VERSION=%s\nCURRENT_PROJECT_VERSION=%s\n' "${SAMIN_VERSION}" "${SAMIN_BUILD}" > "${OVERRIDE_XCCONFIG}"
+          echo "XCODE_XCCONFIG_FILE=${OVERRIDE_XCCONFIG}" >> "${GITHUB_ENV}"
           echo "MARKETING_VERSION=${SAMIN_VERSION}" >> "${GITHUB_ENV}"
           echo "SAMIN_BUILD=${SAMIN_BUILD}" >> "${GITHUB_ENV}"
           echo "Building Nuvio Samin ${SAMIN_VERSION} (${SAMIN_BUILD}) from upstream ${UPSTREAM_SHA}."
@@ -160,7 +184,27 @@ jobs:
 
       - name: Build unsigned Samin IPA
         if: ${{ !inputs.skip_build }}
-        run: ./scripts/build-ios-ipa.sh
+        run: ./scripts/build-ios-ipa.sh "${MARKETING_VERSION}"
+
+      # Saved even when the Xcode step fails (e.g. a Swift error), so the next
+      # run doesn't redo the finished Kotlin link. Skipped on cancellation.
+      - name: Save Kotlin build outputs
+        if: ${{ !cancelled() && !inputs.skip_build && steps.kotlin-outputs.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            composeApp/build
+            .gradle
+          key: ${{ steps.kotlin-outputs.outputs.cache-primary-key }}
+
+      - name: Save Xcode DerivedData & SwiftPM
+        if: ${{ !cancelled() && !inputs.skip_build && steps.xcode-derived.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            build/ios-derived-full-release
+            ~/Library/Caches/org.swift.swiftpm
+          key: ${{ steps.xcode-derived.outputs.cache-primary-key }}
 
       - name: Publish release and update store-samin.json
         if: ${{ !inputs.skip_build }}
