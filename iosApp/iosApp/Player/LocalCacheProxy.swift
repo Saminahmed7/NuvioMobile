@@ -44,7 +44,7 @@ func saminNow() -> TimeInterval {
 // 6. Ephemeral: everything is deleted when playback closes (stopSession).
 
 private let saminProxyChunkBytes: Int64 = 2 * 1024 * 1024 // 2 MB chunks
-private let saminProxyLowSpaceBytes: Int64 = 500 * 1024 * 1024 // 500 MB
+private let saminProxyLowSpaceBytes: Int64 = 300 * 1024 * 1024 // 300 MB (aligned with Kotlin LOW_SPACE_STOP_BYTES)
 private let saminProxyMaxRanges = 32
 private let saminProxyPieceBytes: Int = 256 * 1024 // 256 KB socket send slices
 private let saminProxyMinResumeBytes: Int64 = 0 // No hold-back; pump delivers bytes as soon as they land
