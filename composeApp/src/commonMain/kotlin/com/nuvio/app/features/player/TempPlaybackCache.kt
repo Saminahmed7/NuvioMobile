@@ -121,8 +121,19 @@ object TempPlaybackCache {
     ): Pair<String, Map<String, String>> {
         if (launchId == null || !shouldMirror(sourceUrl)) return sourceUrl to headers
         val bridge = NuvioCacheProxyBridgeFactory.create() ?: return sourceUrl to headers
-        // Stop any previous session for this launchId (e.g. stream switch,
-        // next episode, or debrid re-resolve) so its files and sockets never leak.
+        // Reuse existing session for the same launchId (same episode) to preserve
+        // the on-disk cache. Only teardown on a genuinely different stream (new
+        // launchId). The Swift proxy will update its upstream URL in-place.
+        val existingKey = activeSessionKeys[launchId]
+        if (existingKey != null) {
+            // Reuse the session key; proxy updates upstream URL without deleting cache
+            val local = runCatching {
+                bridge.startSession(existingKey, sourceUrl, encodeHeaders(headers))
+            }.getOrNull().orEmpty()
+            if (local.isNotBlank()) return local to emptyMap()
+            // Fall through to create new session if reuse failed
+        }
+        // New session (different launchId or reuse failed)
         val oldKey = activeSessionKeys.remove(launchId)
         if (oldKey != null) {
             runCatching { bridge.stopSession(oldKey) }

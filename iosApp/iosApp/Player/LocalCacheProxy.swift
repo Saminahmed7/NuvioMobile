@@ -432,13 +432,20 @@ final class LocalCacheProxyServer {
                     var url = ""
                     queue.sync {
                         guard listenerReady, port != 0 else { return }
-                        sessions[key] = ProxySession(
-                            key: key,
-                            sourceUrl: sourceUrl,
-                            headers: headers,
-                            baseDir: cacheBaseDir().appendingPathComponent(key, isDirectory: true),
-                            server: self
-                        )
+                        if let existing = sessions[key] {
+                            // Same session key (same launchId) — update upstream URL
+                            // without wiping the cache directory. This handles debrid
+                            // re-resolve / stream re-select for the same episode.
+                            existing.updateSourceUrl(sourceUrl, headers)
+                        } else {
+                            sessions[key] = ProxySession(
+                                key: key,
+                                sourceUrl: sourceUrl,
+                                headers: headers,
+                                baseDir: cacheBaseDir().appendingPathComponent(key, isDirectory: true),
+                                server: self
+                            )
+                        }
                         url = "http://127.0.0.1:\(port)/s/\(key)/file"
                     }
                     if !url.isEmpty { return url }
@@ -780,6 +787,26 @@ final class ProxySession {
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) {
                 try? FileManager.default.removeItem(at: targetDir)
             }
+        }
+    }
+
+    /// Update the upstream source URL/headers for the same session (e.g. debrid re-resolve).
+    /// Preserves the on-disk cache directory and cached chunks. Restarts the forward
+    /// downloader if the upstream URL actually changed.
+    func updateSourceUrl(_ newSourceUrl: String, _ newHeaders: [String: String]) {
+        guard newSourceUrl != sourceUrl || newHeaders != headers else { return }
+        let oldSourceUrl = sourceUrl
+        sourceUrl = newSourceUrl
+        headers = newHeaders
+        headerNames = Array(newHeaders.keys).sorted()
+        LocalCacheProxyLog.shared.log("Session [\(key)]: Updated upstream URL \(oldSourceUrl) -> \(newSourceUrl)")
+        // If a forward downloader is running and the upstream changed, restart it
+        // so subsequent range requests go to the new URL. The cached chunks stay valid
+        // because debrid re-resolves point to the same file bytes.
+        if let fd = forwardDownloader, !fd.isFinished {
+            fd.cancel()
+            forwardDownloader = nil
+            startNewForwardDownloader(targetStartByte: fd.streamOffset, reason: "upstream URL changed")
         }
     }
 
