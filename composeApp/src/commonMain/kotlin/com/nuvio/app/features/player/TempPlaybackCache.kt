@@ -10,7 +10,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 
-/** One saved span on the timeline, as fractions of the file. */
+/** One saved span on the timeline, as fractions of the play duration. */
 data class TempCacheRange(
     val start: Float,
     val end: Float,

@@ -1257,7 +1257,9 @@ final class MPVPlayerViewController: UIViewController {
                                     print("[MPV] Premature end/error (reason=\(reason), error=\(errorCode)) near foreground or during playback; warming proxy and auto-recovering at \(resumePos)s...")
                                     self.clearPlaybackError()
                                     self.pendingResumePosition = resumePos
-                                    LocalCacheProxyServer.shared.warmup()
+                                    // Rebuild the loopback socket on its fixed port so the
+                                    // retry does not hit the stale, refused address again.
+                                    LocalCacheProxyServer.shared.recoverListener()
                                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
                                         guard let self, let req = self.activeLoadedRequest, self.mpv != nil else { return }
                                         self.startLoad(req)

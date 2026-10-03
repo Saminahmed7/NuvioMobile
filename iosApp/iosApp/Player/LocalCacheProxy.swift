@@ -142,15 +142,19 @@ final class LocalCacheProxyServer {
     private var port: UInt16 = 0
     private var sessions: [String: ProxySession] = [:]
     private var connections: [ObjectIdentifier: ProxyConnection] = [:]
-    private let preferredPorts: [UInt16] = [19842, 19843, 19844, 19845, 19846, 19847, 19848, 19849]
-    private var preferredPortIndex = 0
+    // The loopback port is fixed for the whole app process lifetime. MPV holds
+    // the URL http://127.0.0.1:<port>/s/<key>/file open while a stream plays,
+    // so rotating the port (or letting it drift) strands live requests on an
+    // address nothing serves and surfaces as "Connection refused".
     private var activeBoundPort: UInt16 = 19842
     // True only once the listener reported .ready. `NWListener(using:on:)` does
     // not throw when a port is unavailable — the failure arrives later as
     // .failed — so creating a listener is not proof that anything is listening.
     private var listenerReady = false
-    // Consecutive bind failures on the current port; after a few we rotate.
-    private var listenerFailureStreak = 0
+    // Set when the app really left the foreground (screen lock, app switch).
+    private var wentToBackground = false
+    // Guards one-time registration of the background notification observer.
+    private var foregroundObserverRegistered = false
 
     private init() {
         NotificationCenter.default.addObserver(
@@ -172,18 +176,50 @@ final class LocalCacheProxyServer {
     private func handleWillEnterForeground() {
         queue.async { [weak self] in
             guard let self else { return }
-            LocalCacheProxyLog.shared.log("Server: Foreground notification received. Ensuring listener on port \(self.activeBoundPort)...")
-            if self.listener == nil || self.listener?.state != .ready || !self.listenerReady {
-                self.listener?.cancel()
-                self.listener = nil
-                self.listenerReady = false
-                self.port = 0
-                self.ensureListener()
+            let fromBackground = self.wentToBackground
+            self.wentToBackground = false
+            LocalCacheProxyLog.shared.log("Server: Foreground notification received (fromBackground=\(fromBackground)). Ensuring listener on port \(self.activeBoundPort)...")
+            // A listener that reports .ready is NOT proof the port is served:
+            // iOS reclaims the listening socket when the app is suspended
+            // (screen lock) and NWListener does not always notice, so the first
+            // request after re-entry hits a closed port ("Connection refused").
+            // Returning from a real background therefore rebuilds the socket on
+            // the same fixed port, keeping MPV's already-held URL valid.
+            let listenerComingUp: Bool
+            if let state = self.listener?.state {
+                listenerComingUp = (state == .setup || state == .waiting)
+            } else {
+                listenerComingUp = false
+            }
+            // willEnterForeground and didBecomeActive fire back-to-back, so only
+            // rebuild once: skip while the fresh bind from the first notification
+            // is still coming up.
+            if fromBackground || (!listenerComingUp && (self.listener == nil || self.listener?.state != .ready || !self.listenerReady)) {
+                self.forceRebuildListener()
             }
             for session in self.sessions.values {
                 session.handleForegroundWake()
             }
         }
+    }
+
+    /// Tears the listener down and recreates it on the fixed port. Used when the
+    /// bound socket may have died underneath us (return from background, or a
+    /// probe that found the port refusing connections).
+    private func forceRebuildListener() {
+        listener?.cancel()
+        listener = nil
+        listenerReady = false
+        port = 0
+        ensureListener()
+    }
+
+    /// Recovery entry point for the player: a request to the loopback URL just
+    /// failed, so rebuild the listener on the same (fixed) port before the
+    /// player retries. Safe because the port never changes, so the URL MPV
+    /// already holds becomes valid again.
+    func recoverListener() {
+        queue.async { [weak self] in self?.forceRebuildListener() }
     }
 
     static func parseHeadersJson(_ json: String?) -> [String: String] {
@@ -207,7 +243,25 @@ final class LocalCacheProxyServer {
         return out
     }
 
+    /// Registers the didEnterBackground observer exactly once. When the app
+    /// suspends (screen lock) iOS can reclaim the listening socket while the
+    /// in-process NWListener still reports .ready; knowing the app really left
+    /// the foreground lets us rebuild the socket on return.
+    private func ensureForegroundObserver() {
+        guard !foregroundObserverRegistered else { return }
+        foregroundObserverRegistered = true
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.queue.async { self.wentToBackground = true }
+        }
+    }
+
     func warmup() {
+        ensureForegroundObserver()
         queue.async { [weak self] in self?.ensureListener() }
     }
 
@@ -230,39 +284,58 @@ final class LocalCacheProxyServer {
     func ensureListener() -> Bool {
         if listenerReady, let current = listener, current.state == .ready, port != 0 { return true }
 
+        // A listener that is still coming up must be left alone: cancelling it
+        // to create another would restart the bind on every caller (the
+        // willEnterForeground + didBecomeActive pair fires back-to-back).
+        if let current = listener, current.state == .setup || current.state == .waiting {
+            return false
+        }
+
         listener?.cancel()
         listener = nil
         listenerReady = false
         port = 0
 
-        // If we have active sessions, we MUST stay on activeBoundPort (e.g. 19842)
-        // so MPV's active stream URLs never get broken.
-        if !sessions.isEmpty && activeBoundPort != 0 {
-            if let wirePort = NWEndpoint.Port(rawValue: activeBoundPort),
-               let created = try? NWListener(using: makeTcpParameters(), on: wirePort) {
-                setupListener(created, port: activeBoundPort)
-                LocalCacheProxyLog.shared.log("Server: Re-bound listener to active session port \(activeBoundPort) (waiting for ready)")
-                return false
-            }
-        }
-
-        // Try preferred ports in sequence
-        while preferredPortIndex < preferredPorts.count {
-            let portToTry = preferredPorts[preferredPortIndex]
-            preferredPortIndex += 1
-            guard let wirePort = NWEndpoint.Port(rawValue: portToTry),
-                  let created = try? NWListener(using: makeTcpParameters(), on: wirePort) else { continue }
-            setupListener(created, port: portToTry)
-            activeBoundPort = portToTry
-            LocalCacheProxyLog.shared.log("Server: Bound listener to preferred port \(portToTry) (waiting for ready)")
+        guard let wirePort = NWEndpoint.Port(rawValue: activeBoundPort),
+              let created = try? NWListener(using: makeTcpParameters(), on: wirePort) else {
+            LocalCacheProxyLog.shared.log("Server: Failed to create listener on fixed port \(activeBoundPort)")
             return false
         }
-
-        // Fallback: let OS assign ephemeral port
-        guard let wirePort = NWEndpoint.Port(rawValue: 0),
-              let created = try? NWListener(using: makeTcpParameters(), on: wirePort) else { return false }
-        setupListener(created, port: 0)
+        setupListener(created, port: activeBoundPort)
+        LocalCacheProxyLog.shared.log("Server: Bound listener to fixed port \(activeBoundPort) (waiting for ready)")
         return false
+    }
+
+    /// Synchronously checks that something is really accepting connections on
+    /// the loopback port. NWListener can report `.ready` while the kernel socket
+    /// was reclaimed (common after screen lock), and that stale state is exactly
+    /// what produced "Connection refused" for the player. A real connect here is
+    /// cheap and lets us rebind before the URL is handed out.
+    private func probeAccepting(timeout: TimeInterval = 0.75) -> Bool {
+        let snapshotPort = queue.sync { self.port }
+        guard snapshotPort != 0, let nwPort = NWEndpoint.Port(rawValue: snapshotPort) else { return false }
+        let probeQueue = DispatchQueue(label: "nuvio-cache-proxy-probe")
+        let connection = NWConnection(host: "127.0.0.1", port: nwPort, using: .tcp)
+        let semaphore = DispatchSemaphore(value: 0)
+        var accepted = false
+        connection.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                accepted = true
+                semaphore.signal()
+            case .failed, .cancelled:
+                semaphore.signal()
+            default:
+                break
+            }
+        }
+        connection.start(queue: probeQueue)
+        if semaphore.wait(timeout: .now() + timeout) == .timedOut {
+            connection.cancel()
+            return false
+        }
+        connection.cancel()
+        return accepted
     }
 
     private func setupListener(_ created: NWListener, port: UInt16) {
@@ -290,8 +363,7 @@ final class LocalCacheProxyServer {
             self.port = listener.port?.rawValue ?? self.activeBoundPort
             self.activeBoundPort = self.port
             self.listenerReady = true
-            self.listenerFailureStreak = 0
-            LocalCacheProxyLog.shared.log("Server: Listener ready on port \(self.port)")
+            LocalCacheProxyLog.shared.log("Server: Listener ready on fixed port \(self.port)")
         case .failed(let error):
             LocalCacheProxyLog.shared.log("Server: Listener failed (\(error.localizedDescription))")
             resetListener(failedListener: listener)
@@ -308,50 +380,45 @@ final class LocalCacheProxyServer {
             self.listener = nil
             self.listenerReady = false
             self.port = 0
-            // A bind failure is asynchronous, so `ensureListener` used to retry the
-            // SAME port forever and the 19843..19849 fallback was never reached.
-            // Rotate after a few failures so a port the OS keeps refusing cannot
-            // wedge every future session.
-            listenerFailureStreak += 1
-            if listenerFailureStreak >= 3 {
-                listenerFailureStreak = 0
-                advanceBoundPort()
-            }
-            // Auto-recreate listener after 0.2s pause
+            // The port is fixed for the process lifetime (MPV holds the URL), so
+            // retry the SAME port instead of rotating away from it.
+            // `allowLocalEndpointReuse` lets the rebind succeed as soon as the
+            // old socket is released, which is normally immediate.
+            LocalCacheProxyLog.shared.log("Server: Listener lost on fixed port \(activeBoundPort); rebinding in 0.2s")
             queue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
                 self?.ensureListener()
             }
         }
     }
 
-    /// Moves the active port to the next candidate after repeated failures.
-    private func advanceBoundPort() {
-        guard !preferredPorts.isEmpty else { return }
-        let currentIndex = preferredPorts.firstIndex(of: activeBoundPort) ?? -1
-        let nextIndex = (currentIndex + 1) % preferredPorts.count
-        let previous = activeBoundPort
-        activeBoundPort = preferredPorts[nextIndex]
-        preferredPortIndex = nextIndex
-        LocalCacheProxyLog.shared.log("Server: Port \(previous) kept failing; rotating listener to \(activeBoundPort)")
-    }
-
     func startSession(key: String, sourceUrl: String, headers: [String: String]) -> String {
+        var rebuildAttempts = 0
         for _ in 0..<50 {
-            var url = ""
-            queue.sync {
-                // ensureListener() is only true once the socket is really bound,
-                // so the URL handed to the player always points at a live port.
-                guard ensureListener(), port != 0 else { return }
-                sessions[key] = ProxySession(
-                    key: key,
-                    sourceUrl: sourceUrl,
-                    headers: headers,
-                    baseDir: cacheBaseDir().appendingPathComponent(key, isDirectory: true),
-                    server: self
-                )
-                url = "http://127.0.0.1:\(port)/s/\(key)/file"
+            let ready = queue.sync { ensureListener() }
+            if ready {
+                // .ready does not guarantee the OS still serves the port (iOS
+                // reclaims the socket during suspension), so prove it with a real
+                // loopback connect before handing the URL to the player.
+                if probeAccepting() {
+                    var url = ""
+                    queue.sync {
+                        guard listenerReady, port != 0 else { return }
+                        sessions[key] = ProxySession(
+                            key: key,
+                            sourceUrl: sourceUrl,
+                            headers: headers,
+                            baseDir: cacheBaseDir().appendingPathComponent(key, isDirectory: true),
+                            server: self
+                        )
+                        url = "http://127.0.0.1:\(port)/s/\(key)/file"
+                    }
+                    if !url.isEmpty { return url }
+                } else if rebuildAttempts < 3 {
+                    rebuildAttempts += 1
+                    LocalCacheProxyLog.shared.log("Server: Port \(activeBoundPort) reports ready but refuses connections; rebuilding listener (attempt \(rebuildAttempts))")
+                    queue.sync { forceRebuildListener() }
+                }
             }
-            if !url.isEmpty { return url }
             Thread.sleep(forTimeInterval: 0.05)
         }
         // No live loopback port: the caller falls back to the remote URL, so
@@ -594,6 +661,15 @@ final class ProxySession {
     var lastRateLimitMessage: String?
     var lastForegroundWakeUptime: TimeInterval = 0
 
+    // Timeline mapping. The played bar is drawn in *time* (position/duration),
+    // but the cache only knows *byte* offsets; on a VBR file the two drift, so
+    // a raw byte fraction lands ahead of the playhead and leaves a visible gap.
+    // We anchor (timeFraction, byteFraction) pairs taken whenever the forward
+    // downloader is repositioned for a seek and the player reports the new
+    // position, then map saved byte ranges into time before drawing them.
+    private var rateSamples: [(t: Double, b: Double)] = []
+    private var pendingSeekByte: (byte: Int64, at: TimeInterval)?
+
     var isRateLimited: Bool {
         if let until = rateLimitedUntil { return Date() < until }
         return false
@@ -830,6 +906,9 @@ final class ProxySession {
 
     private func startNewForwardDownloader(targetStartByte: Int64, reason: String) {
         lastForwardDownloaderStartTime = saminNow()
+        // Remember where this (re)position points so the next playhead report
+        // can anchor the byte<->time mapping for the saved bar.
+        pendingSeekByte = (byte: targetStartByte, at: saminNow())
         let fd = ForwardDownloader(session: self, startByte: targetStartByte)
         self.forwardDownloader = fd
         fd.start()
@@ -914,8 +993,85 @@ final class ProxySession {
 
     private func onPlayheadUpdated() {
         guard valid else { return }
+        recordPlayheadSample()
         // Evict watched chunks behind the playhead if storage is currently tight
         _ = makeRoomForChunk(excluding: -1)
+    }
+
+    /// Pairs a fresh playhead (time) with the byte the last seek repositioned the
+    /// downloader to, so the timeline can convert byte fractions to time.
+    func recordPlayheadSample() {
+        guard let total = totalSize, total > 0,
+              let (pos, dur) = playheadMs, dur > 0 else { return }
+        guard let pending = pendingSeekByte, saminNow() - pending.at < 3.0 else { return }
+        pendingSeekByte = nil
+        let t = Double(pos) / Double(dur)
+        let b = Double(pending.byte) / Double(total)
+        // The downloader only repositions to a client-requested byte, which sits
+        // near the playhead. A large gap means this was an index/moov probe at
+        // byte 0 or a stale pairing — ignore it rather than skew the mapping.
+        guard t.isFinite, b.isFinite, abs(t - b) <= 0.10 else { return }
+        noteRateSample(t: t, b: b)
+    }
+
+    private func noteRateSample(t: Double, b: Double) {
+        guard t.isFinite, b.isFinite else { return }
+        let tt = min(max(t, 0.0), 1.0)
+        let bb = min(max(b, 0.0), 1.0)
+        if let last = rateSamples.last, abs(last.t - tt) < 0.002, abs(last.b - bb) < 0.002 { return }
+        rateSamples.append((t: tt, b: bb))
+        if rateSamples.count > 200 { rateSamples.removeFirst(rateSamples.count - 200) }
+        rateSamples.sort { $0.t < $1.t }
+        // Keep byte strictly increasing with time; drop anomalies (e.g. an
+        // index/moov probe at byte 0) that would skew the interpolation.
+        var monotonic: [(t: Double, b: Double)] = []
+        for s in rateSamples {
+            if let last = monotonic.last, s.b < last.b { continue }
+            monotonic.append(s)
+        }
+        rateSamples = monotonic
+    }
+
+    /// Maps a byte fraction to a timeline (time) fraction using the observed
+    /// anchors. Falls back to the raw byte fraction when nothing has been
+    /// sampled yet, and to a constant shift with a single anchor.
+    func byteFractionToTime(_ b: Double) -> Double {
+        let bb = min(max(b, 0.0), 1.0)
+        guard let anchor = rateSamples.first else { return bb }
+        if rateSamples.count == 1 {
+            return min(max(bb + (anchor.t - anchor.b), 0.0), 1.0)
+        }
+        var loIndex: Int?
+        var hiIndex: Int?
+        for (i, s) in rateSamples.enumerated() {
+            if s.b <= bb { loIndex = i }
+            if s.b >= bb { hiIndex = i; break }
+        }
+        if let li = loIndex, let hi = hiIndex, hi > li {
+            let l = rateSamples[li]
+            let h = rateSamples[hi]
+            let f = (bb - l.b) / (h.b - l.b)
+            return min(max(l.t + f * (h.t - l.t), 0.0), 1.0)
+        }
+        if let li = loIndex {
+            let l = rateSamples[li]
+            if li - 1 >= 0, rateSamples[li - 1].b < l.b {
+                let p = rateSamples[li - 1]
+                let slope = (l.t - p.t) / (l.b - p.b)
+                return min(max(l.t + (bb - l.b) * slope, 0.0), 1.0)
+            }
+            return min(max(bb + (l.t - l.b), 0.0), 1.0)
+        }
+        if let hi = hiIndex {
+            let h = rateSamples[hi]
+            if hi + 1 < rateSamples.count, rateSamples[hi + 1].b > h.b {
+                let n = rateSamples[hi + 1]
+                let slope = (n.t - h.t) / (n.b - h.b)
+                return min(max(h.t + (bb - h.b) * slope, 0.0), 1.0)
+            }
+            return min(max(bb + (h.t - h.b), 0.0), 1.0)
+        }
+        return bb
     }
 
     func probeTotalSizeIfNeeded(completion: (() -> Void)? = nil) {
@@ -991,8 +1147,12 @@ final class ProxySession {
             }
         }
 
+        // Report in the same (time) domain as the played bar so the saved
+        // stretch abuts the playhead instead of drifting ahead of it on VBR.
         let parts = merged.prefix(saminProxyMaxRanges).map { s, e in
-            "[\(Double(s) / Double(total)),\(Double(e) / Double(total))]"
+            let t0 = byteFractionToTime(Double(s) / Double(total))
+            let t1 = byteFractionToTime(Double(e) / Double(total))
+            return "[\(min(t0, t1)),\(max(t0, t1))]"
         }
         return "[\(parts.joined(separator: ","))]"
     }
