@@ -1061,15 +1061,39 @@ final class ProxySession {
     }
 
     /// Makes room for one more chunk. Only strictly watched (behind-playhead)
-    /// chunks are evicted when storage is low (< 500 MB). Forward unwatched chunks are NEVER evicted.
+    /// chunks are evicted when storage is low (< 300 MB).
+    /// Pinning Rules:
+    /// - Chunk 0 (container header / track metadata) is NEVER evicted.
+    /// - Final 8 chunks / 16 MB before EOF (Matroska seekhead / cues) are NEVER evicted.
+    /// - Rewind safety buffer (4 chunks / 8 MB behind playhead) is protected unless critical.
+    /// Forward unwatched chunks are NEVER evicted.
     func makeRoomForChunk(excluding: Int64) -> Bool {
         guard server.freeSpaceBytes() < saminProxyLowSpaceBytes else { return true }
         let playheadChunk = playheadByte.map { $0 / saminProxyChunkBytes } ?? 0
-        let backwardWatched = cachedChunks.filter { $0 != excluding && $0 < playheadChunk }.sorted()
-        for victim in backwardWatched {
+        let totalChunks = totalSize.map { ($0 + saminProxyChunkBytes - 1) / saminProxyChunkBytes } ?? Int64.max
+        let eofProtectedStart = max(1, totalChunks - 8)
+        let rewindProtectedStart = max(1, playheadChunk - 4)
+
+        // Tier 1: Older watched chunks far behind the playhead (excluding Chunk 0 and rewind buffer)
+        let tier1Victims = cachedChunks.filter {
+            $0 != excluding && $0 > 0 && $0 < rewindProtectedStart && $0 < eofProtectedStart
+        }.sorted()
+
+        for victim in tier1Victims {
             removeChunk(victim)
             if server.freeSpaceBytes() >= saminProxyLowSpaceBytes { return true }
         }
+
+        // Tier 2: If still under severe pressure, evict the rewind buffer (between rewindProtectedStart ..< playheadChunk)
+        let tier2Victims = cachedChunks.filter {
+            $0 != excluding && $0 > 0 && $0 < playheadChunk && $0 < eofProtectedStart
+        }.sorted()
+
+        for victim in tier2Victims {
+            removeChunk(victim)
+            if server.freeSpaceBytes() >= saminProxyLowSpaceBytes { return true }
+        }
+
         return server.freeSpaceBytes() >= saminProxyLowSpaceBytes
     }
 
@@ -1086,6 +1110,9 @@ final class ProxySession {
         maybeRepositionForward()
         // Evict watched chunks behind the playhead if storage is currently tight
         _ = makeRoomForChunk(excluding: -1)
+        if let fd = forwardDownloader, fd.isPausedForLowSpace, server.freeSpaceBytes() >= saminProxyLowSpaceBytes {
+            fd.resumeFromLowSpace()
+        }
     }
 
     /// Moves the prefetcher to the playhead after a genuine seek so bandwidth
@@ -1389,6 +1416,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
     private(set) var streamOffset: Int64
     private(set) var currentChunkIndex: Int64 = -1
     private(set) var isFinished = false
+    private(set) var isPausedForLowSpace = false
 
     private var task: URLSessionDataTask?
     private var urlSession: URLSession?
@@ -1503,6 +1531,29 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         guard !isCancelled, !isFinished, session.valid else { return }
         LocalCacheProxyLog.shared.log("FD [\(startByte)]: Foreground wake -> reconnecting continuous stream from \(streamOffset)...")
         reconnect(reason: "foreground wake")
+    }
+
+    func pauseForLowSpace() {
+        guard !isCancelled, !isFinished, !isPausedForLowSpace else { return }
+        isPausedForLowSpace = true
+        task?.cancel()
+        task = nil
+        urlSession?.invalidateAndCancel()
+        urlSession = nil
+        cleanupFileHandle()
+        if currentChunkIndex >= 0 {
+            session.releaseChunkWrite(chunkIndex: currentChunkIndex, owner: "forward")
+            currentChunkIndex = -1
+        }
+        stopWatchdog()
+    }
+
+    func resumeFromLowSpace() {
+        guard !isCancelled, !isFinished, isPausedForLowSpace else { return }
+        isPausedForLowSpace = false
+        LocalCacheProxyLog.shared.log("FD [\(startByte)]: Disk space restored, resuming forward download from \(streamOffset)...")
+        startWatchdog()
+        startStream(from: streamOffset)
     }
 
     func onClientWaiting(chunkIndex: Int64) {
@@ -1758,7 +1809,11 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
             }
             fileHandle = try? FileHandle(forUpdating: fileUrl)
             fileHandleChunk = chunkIndex
-            _ = session.makeRoomForChunk(excluding: chunkIndex)
+            guard session.makeRoomForChunk(excluding: chunkIndex) else {
+                LocalCacheProxyLog.shared.log("FD [\(startByte)]: Low storage with no more watched chunks -> pausing forward download")
+                pauseForLowSpace()
+                return
+            }
         }
 
         guard let h = fileHandle else { return }

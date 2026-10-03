@@ -10,7 +10,6 @@ import com.nuvio.app.features.shuffle.shuffleEpisodeProgress
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import kotlinx.coroutines.Dispatchers
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -849,13 +848,11 @@ internal fun PlayerScreenRuntime.tryRefreshCredentialedSourceAfterError(message:
             stopActiveP2pStream()
             // Samin: refreshed debrid links must also go through the proxy,
             // otherwise playback silently leaves the on-disk cache.
-            val (playUrl, playHeaders) = withContext(Dispatchers.IO) {
-                TempPlaybackCache.resolveProxiedSource(
-                    launchId = args.launchId,
-                    sourceUrl = refreshedUrl,
-                    headers = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request),
-                )
-            }
+            val (playUrl, playHeaders) = TempPlaybackCache.resolveProxiedSource(
+                launchId = args.launchId,
+                sourceUrl = refreshedUrl,
+                headers = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request),
+            )
             activeSourceUrl = playUrl
             activeSourceAudioUrl = null
             activeSourceHeaders = playHeaders
