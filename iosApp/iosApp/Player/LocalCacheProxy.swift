@@ -492,42 +492,13 @@ final class LocalCacheProxyServer {
         }
     }
 
-    func setPlayhead(key: String, positionMs: Int64, durationMs: Int64, streamPos: Int64? = nil, isPlaying: Bool = true) {
+    func setPlayhead(key: String, positionMs: Int64, durationMs: Int64, streamPos: Int64? = nil) {
         queue.sync {
             sessions[key]?.playheadMs = (positionMs, durationMs)
             if let streamPos, streamPos > 0 {
                 sessions[key]?.playheadStreamPos = streamPos
             }
-            // Pause forward downloader when player is paused to save battery
-            if let s = sessions[key], let fd = s.forwardDownloader, !fd.isFinished {
-                if isPlaying {
-                    fd.resume()
-                } else {
-                    fd.pause()
-                }
         }
-    }
-
-    /// Pauses the continuous download to save battery when playback is paused.
-    func pause() {
-        guard !isCancelled, !isFinished else { return }
-        task?.cancel()
-        task = nil
-        urlSession?.invalidateAndCancel()
-        urlSession = nil
-        cleanupFileHandle()
-        if currentChunkIndex >= 0 {
-            session.releaseChunkWrite(chunkIndex: currentChunkIndex, owner: "forward")
-            currentChunkIndex = -1
-        }
-        stopWatchdog()
-    }
-
-    /// Resumes the download from the current stream offset.
-    func resume() {
-        guard !isCancelled, !isFinished else { return }
-        startStream(from: streamOffset)
-    }
     }
 
     func cachedRangesJson(key: String) -> String {
