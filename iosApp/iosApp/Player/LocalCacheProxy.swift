@@ -196,7 +196,12 @@ final class LocalCacheProxyServer {
             // the same fixed port, keeping MPV's already-held URL valid.
             let listenerComingUp: Bool
             if let state = self.listener?.state {
-                listenerComingUp = (state == .setup || state == .waiting)
+                switch state {
+                case .setup, .waiting:
+                    listenerComingUp = true
+                default:
+                    listenerComingUp = false
+                }
             } else {
                 listenerComingUp = false
             }
@@ -296,8 +301,13 @@ final class LocalCacheProxyServer {
         // A listener that is still coming up must be left alone: cancelling it
         // to create another would restart the bind on every caller (the
         // willEnterForeground + didBecomeActive pair fires back-to-back).
-        if let current = listener, current.state == .setup || current.state == .waiting {
-            return false
+        if let current = listener {
+            switch current.state {
+            case .setup, .waiting:
+                return false
+            default:
+                break
+            }
         }
 
         listener?.cancel()
