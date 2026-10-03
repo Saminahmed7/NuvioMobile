@@ -1,13 +1,16 @@
 package com.nuvio.app.features.player
 
 import com.nuvio.app.core.ui.NuvioToastController
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.serialization.json.JsonPrimitive
 
 /** One saved span on the timeline, as fractions of the play duration. */
@@ -114,13 +117,13 @@ object TempPlaybackCache {
      * upstream headers). Use this everywhere activeSourceUrl is assigned
      * from a remote stream, otherwise the proxy is silently bypassed.
      */
-    fun resolveProxiedSource(
+    suspend fun resolveProxiedSource(
         launchId: Long?,
         sourceUrl: String,
         headers: Map<String, String> = emptyMap(),
-    ): Pair<String, Map<String, String>> {
-        if (launchId == null || !shouldMirror(sourceUrl)) return sourceUrl to headers
-        val bridge = NuvioCacheProxyBridgeFactory.create() ?: return sourceUrl to headers
+    ): Pair<String, Map<String, String>> = withContext(Dispatchers.IO) {
+        if (launchId == null || !shouldMirror(sourceUrl)) return@withContext sourceUrl to headers
+        val bridge = NuvioCacheProxyBridgeFactory.create() ?: return@withContext sourceUrl to headers
         // Reuse existing session for the same launchId (same episode) to preserve
         // the on-disk cache. Only teardown on a genuinely different stream (new
         // launchId). The Swift proxy will update its upstream URL in-place.
@@ -130,7 +133,7 @@ object TempPlaybackCache {
             val local = runCatching {
                 bridge.startSession(existingKey, sourceUrl, encodeHeaders(headers))
             }.getOrNull().orEmpty()
-            if (local.isNotBlank()) return local to emptyMap()
+            if (local.isNotBlank()) return@withContext local to emptyMap()
             // Fall through to create new session if reuse failed
         }
         // New session (different launchId or reuse failed)
@@ -143,24 +146,30 @@ object TempPlaybackCache {
         val local = runCatching {
             bridge.startSession(key, sourceUrl, encodeHeaders(headers))
         }.getOrNull().orEmpty()
-        if (local.isBlank()) return sourceUrl to headers
+        if (local.isBlank()) return@withContext sourceUrl to headers
         proxied.add(launchId)
         _status.update { current ->
             current + (launchId to TempCacheStatus(launchId = launchId))
         }
-        return local to emptyMap()
+        local to emptyMap()
     }
 
-    fun pushPlayhead(launchId: Long, positionMs: Long, durationMs: Long, streamPos: Long = 0L, isPlaying: Boolean = true) {
-        if (!isProxied(launchId)) return
-        val key = activeSessionKeys[launchId] ?: return
+    suspend fun pushPlayhead(
+        launchId: Long,
+        positionMs: Long,
+        durationMs: Long,
+        streamPos: Long = 0L,
+        isPlaying: Boolean = true,
+    ) = withContext(Dispatchers.IO) {
+        if (!isProxied(launchId)) return@withContext
+        val key = activeSessionKeys[launchId] ?: return@withContext
         runCatching {
             NuvioCacheProxyBridgeFactory.create()
                 ?.setPlayhead(key, positionMs, durationMs, streamPos, isPlaying)
         }
     }
 
-    fun getDiagnosticReport(launchId: Long?): String {
+    suspend fun getDiagnosticReport(launchId: Long?): String = withContext(Dispatchers.IO) {
         val header = buildString {
             appendLine("--- App-side session context ---")
             appendLine("launchId: ${launchId ?: "none"}")
@@ -179,22 +188,19 @@ object TempPlaybackCache {
             appendLine()
         }
         val bridge = NuvioCacheProxyBridgeFactory.create()
-            ?: return header + "Local Cache Proxy is not active on this device/platform (Android/desktop use the background mirror; iOS uses the loopback proxy)."
+            ?: return@withContext header + "Local Cache Proxy is not active on this device/platform (Android/desktop use the background mirror; iOS uses the loopback proxy)."
         val key = launchId?.let { activeSessionKeys[it] }
         val report = runCatching {
             bridge.diagnosticReport(key.orEmpty())
         }.getOrNull().orEmpty()
-        if (report.isBlank()) return header + "No diagnostic report returned from cache proxy server."
-        return header + report
+        if (report.isBlank()) return@withContext header + "No diagnostic report returned from cache proxy server."
+        header + report
     }
 
-    private fun formatMb(bytes: Long?): String =
-        if (bytes == null || bytes < 0L) "unknown" else "${bytes / 1024 / 1024} MB"
-
-    fun refreshRanges(launchId: Long) {
-        if (!isProxied(launchId)) return
-        val bridge = NuvioCacheProxyBridgeFactory.create() ?: return
-        val key = activeSessionKeys[launchId] ?: return
+    suspend fun refreshRanges(launchId: Long) = withContext(Dispatchers.IO) {
+        if (!isProxied(launchId)) return@withContext
+        val bridge = NuvioCacheProxyBridgeFactory.create() ?: return@withContext
+        val key = activeSessionKeys[launchId] ?: return@withContext
         val statsJson = runCatching {
             bridge.cacheStatsJson(key)
         }.getOrNull().orEmpty()
