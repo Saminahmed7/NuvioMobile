@@ -12,3 +12,8 @@
 	path = vendor/TorrServer
 	url = https://github.com/NuvioMedia/TorrServer.git
 	branch = Nuvio
+
+[submodule "vendor/quickjs-kt"]
+	path = vendor/quickjs-kt
+	url = https://github.com/NuvioMedia/quickjs-kt.git
+	branch = Nuvio
