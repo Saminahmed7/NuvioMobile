@@ -47,7 +47,7 @@ private let saminProxyChunkBytes: Int64 = 2 * 1024 * 1024 // 2 MB chunks
 private let saminProxyLowSpaceBytes: Int64 = 300 * 1024 * 1024 // 300 MB (aligned with Kotlin LOW_SPACE_STOP_BYTES)
 private let saminProxyMaxRanges = 32
 private let saminProxyPieceBytes: Int = 256 * 1024 // 256 KB socket send slices
-private let saminProxyMinResumeBytes: Int64 = 0 // No hold-back; pump delivers bytes as soon as they land
+private let saminProxyMinResumeBytes: Int64 = 0 // Intentionally 0 (no hold-back) to avoid 20 s seek stall; was 512 KB prebuffer lead but caused seek latency on slow links
 // A client request this far ahead of the write head is treated as a one-off
 // probe (index/moov atom) rather than sequential playback, so it is served by a
 // dedicated range fetch instead of dragging the prefetcher forward.
@@ -2262,7 +2262,8 @@ final class ProxyConnection {
 
             // Pre-buffering margin (shock absorber):
             // If the connection was waiting for live data, avoid leaking tiny 16KB starved packets to MPV.
-            // Hold back until at least saminProxyMinResumeBytes (512 KB) are buffered ahead,
+            // Hold back until at least saminProxyMinResumeBytes are buffered ahead
+            // (currently 0 to avoid 20 s seek stall; was 512 KB prebuffer lead),
             // unless the chunk is fully cached, forward downloading is finished, or we're at EOF.
             if isWaitingForData && forwardActive && bytesAhead < saminProxyMinResumeBytes && !session.cachedChunks.contains(chunkIdx) && !isAtStreamEnd {
                 return
