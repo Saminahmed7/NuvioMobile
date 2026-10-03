@@ -80,7 +80,7 @@ interface NuvioPlayerBridge {
     fun getIsEnded(): Boolean
     fun getDurationMs(): Long
     fun getPositionMs(): Long
-    fun getBufferedMs(): Long
+fun getBufferedMs(): Long
     fun getStreamPos(): Long
     fun getIsPlaying(): Boolean
     fun getPlaybackSpeed(): Float
