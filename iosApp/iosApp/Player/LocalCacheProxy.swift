@@ -505,8 +505,7 @@ final class LocalCacheProxyServer {
                 } else {
                     fd.pause()
                 }
-            }
-        }
+}
     }
 
     /// Pauses the continuous download to save battery when playback is paused.
