@@ -7,3 +7,8 @@
 	path = libass-android
 	url = https://github.com/NuvioMedia/libass-android.git
 	branch = Nuvio
+
+[submodule "vendor/TorrServer"]
+	path = vendor/TorrServer
+	url = https://github.com/NuvioMedia/TorrServer.git
+	branch = Nuvio
