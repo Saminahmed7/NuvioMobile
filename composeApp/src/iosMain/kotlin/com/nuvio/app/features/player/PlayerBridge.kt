@@ -75,14 +75,13 @@ interface NuvioPlayerBridge {
         subPos: Int,
         stripSdh: Boolean,
     )
-    fun getIsLoading(): Boolean
+fun getIsLoading(): Boolean
     fun getIsPlaying(): Boolean
     fun getIsEnded(): Boolean
     fun getDurationMs(): Long
     fun getPositionMs(): Long
-fun getBufferedMs(): Long
+    fun getBufferedMs(): Long
     fun getStreamPos(): Long
-    fun getIsPlaying(): Boolean
     fun getPlaybackSpeed(): Float
     fun getErrorMessage(): String
     fun destroy()
