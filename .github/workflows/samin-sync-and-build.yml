@@ -179,6 +179,7 @@ jobs:
         run: |
           echo "--> Validating Swift syntax..."
           xcrun --sdk iphoneos swiftc -parse iosApp/iosApp/Player/LocalCacheProxy.swift
+          xcrun --sdk iphoneos swiftc -parse iosApp/iosApp/Player/MPVPlayerBridge.swift
           echo "--> Validating Kotlin compilation..."
           ./gradlew :composeApp:compileKotlinIosArm64 --parallel
 

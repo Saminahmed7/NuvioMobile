@@ -58,6 +58,10 @@ private let saminProxyAheadWindowBytes: Int64 = 32 * 1024 * 1024
 private let saminProxyForwardSeekBytes: Int64 = 64 * 1024 * 1024
 // Max concurrent short-lived range fetches for client-requested chunks.
 private let saminProxyMaxChunkFetchers = 3
+// The prefetcher jumps back to the playhead when it lands this far behind the
+// write head AND at least saminProxyBackwardGapChunks uncached chunks follow it.
+private let saminProxyBackwardSeekBytes: Int64 = 32 * 1024 * 1024
+private let saminProxyBackwardGapChunks: Int64 = 8 // 16 MB with 2 MB chunks
 
 final class LocalCacheProxyLog {
     static let shared = LocalCacheProxyLog()
@@ -788,6 +792,18 @@ final class ProxySession {
         return max(0, min(total, Int64((Double(pos) / Double(dur)) * Double(total))))
     }
 
+    /// Adaptive lookahead window: for high-bitrate files (e.g. 4K remuxes),
+    /// scale up from 32 MB to up to 128 MB (roughly 30s of buffer) so MPV's
+    /// natural sequential readahead doesn't trigger one-off chunk fetchers.
+    var aheadWindowBytes: Int64 {
+        if let total = totalSize, total > 0, let (_, dur) = playheadMs, dur > 10_000 {
+            let bytesPerSec = Double(total) / (Double(dur) / 1000.0)
+            let adaptive = Int64(bytesPerSec * 30.0)
+            return max(saminProxyAheadWindowBytes, min(128 * 1024 * 1024, adaptive))
+        }
+        return saminProxyAheadWindowBytes
+    }
+
     func chunkURL(_ index: Int64) -> URL {
         dir.appendingPathComponent("c\(index).bin")
     }
@@ -904,7 +920,7 @@ final class ProxySession {
             let ahead = startByte - fd.streamOffset
             // Sequential read just ahead of the write head: let the running
             // stream reach it.
-            if ahead >= 0 && ahead <= saminProxyAheadWindowBytes {
+            if ahead >= 0 && ahead <= aheadWindowBytes {
                 return
             }
             // Behind the head (seek back / evicted chunk) or far ahead (index
@@ -1045,16 +1061,49 @@ final class ProxySession {
         _ = makeRoomForChunk(excluding: -1)
     }
 
-    /// A genuine forward seek moves the prefetcher to the playhead so it stops
-    /// spending bandwidth on the skipped region. Never moves it backward.
+    /// Moves the prefetcher to the playhead after a genuine seek so bandwidth
+    /// goes where playback actually is:
+    /// - forward: playhead lands far beyond the write head;
+    /// - backward: playhead lands far behind it in an uncached region (the
+    ///   stream would otherwise keep filling the far future while playback
+    ///   crawls through one-off 2 MB chunk fetches).
     private func maybeRepositionForward() {
         guard let ph = playheadByte, let fd = forwardDownloader, !fd.isFinished else { return }
-        guard ph > fd.streamOffset + saminProxyForwardSeekBytes else { return }
-        let target = (ph / saminProxyChunkBytes) * saminProxyChunkBytes
-        LocalCacheProxyLog.shared.log("Session [\(key)]: Forward seek -> moving prefetcher \(fd.streamOffset) -> \(target)")
+        guard !isRateLimited else { return }
+
+        if ph > fd.streamOffset + saminProxyForwardSeekBytes {
+            let target = (ph / saminProxyChunkBytes) * saminProxyChunkBytes
+            LocalCacheProxyLog.shared.log("Session [\(key)]: Forward seek -> moving prefetcher \(fd.streamOffset) -> \(target)")
+            fd.cancel()
+            forwardDownloader = nil
+            startNewForwardDownloader(targetStartByte: target, reason: "forward seek")
+            return
+        }
+
+        // Backward: only trust MPV's real read position (a time-ratio estimate
+        // can be off by tens of MB on VBR files), and debounce right after a
+        // (re)start so a settling seek can't bounce the stream around.
+        guard playheadStreamPos != nil,
+              ph + saminProxyBackwardSeekBytes < fd.streamOffset,
+              saminNow() - lastForwardDownloaderStartTime > 3.0 else { return }
+
+        let phChunk = ph / saminProxyChunkBytes
+        let totalChunks = totalSize.map { ($0 + saminProxyChunkBytes - 1) / saminProxyChunkBytes } ?? Int64.max
+        var gap: Int64 = 0
+        while gap < saminProxyBackwardGapChunks,
+              phChunk + gap < totalChunks,
+              !cachedChunks.contains(phChunk + gap) {
+            gap += 1
+        }
+        // A short gap before already-cached data (or EOF) is cheaper to fill
+        // with the dedicated chunk fetchers than to tear down the stream.
+        guard gap >= saminProxyBackwardGapChunks else { return }
+
+        let target = phChunk * saminProxyChunkBytes
+        LocalCacheProxyLog.shared.log("Session [\(key)]: Backward seek -> moving prefetcher \(fd.streamOffset) -> \(target)")
         fd.cancel()
         forwardDownloader = nil
-        startNewForwardDownloader(targetStartByte: target, reason: "forward seek")
+        startNewForwardDownloader(targetStartByte: target, reason: "backward seek")
     }
 
     /// Pairs a fresh playhead (time) with the byte MPV actually reports
@@ -1352,12 +1401,12 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         let available = session.bytesAvailable(for: chunkIdx)
         if chunkOffset < available {
             effectiveOffset = (chunkIdx * saminProxyChunkBytes) + available
-        } else if session.cachedChunks.contains(chunkIdx) {
-            var checkChunk = chunkIdx + 1
-            while session.cachedChunks.contains(checkChunk) {
-                checkChunk += 1
-            }
-            effectiveOffset = checkChunk * saminProxyChunkBytes
+        }
+        // Skip the whole run of already-cached chunks from here, so the stream
+        // never re-downloads (and truncates) data that is already on disk.
+        while effectiveOffset % saminProxyChunkBytes == 0,
+              session.cachedChunks.contains(effectiveOffset / saminProxyChunkBytes) {
+            effectiveOffset += saminProxyChunkBytes
         }
 
         if let total = session.totalSize, total > 0, effectiveOffset >= total {
@@ -1461,6 +1510,24 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
             currentChunkIndex = -1
         }
         startStream(from: streamOffset)
+    }
+
+    /// Re-opens the stream past a run of cached chunks starting at [offset].
+    /// startStream() advances over the whole cached run itself.
+    private func skipCachedRun(from offset: Int64) {
+        guard !isCancelled, !isFinished, session.valid else { return }
+        LocalCacheProxyLog.shared.log("FD [\(startByte)]: Chunk \(offset / saminProxyChunkBytes) already cached -> skipping cached run")
+        task?.cancel()
+        task = nil
+        urlSession?.invalidateAndCancel()
+        urlSession = nil
+        cleanupFileHandle()
+        if currentChunkIndex >= 0 {
+            session.releaseChunkWrite(chunkIndex: currentChunkIndex, owner: "forward")
+            currentChunkIndex = -1
+        }
+        streamOffset = offset
+        startStream(from: offset)
     }
 
     private func startWatchdog() {
@@ -1600,7 +1667,9 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         guard !isCancelled, !data.isEmpty else { return }
         self.session.server.queue.async { [weak self] in
-            guard let self, !self.isCancelled, self.session.valid else { return }
+            // Ignore bytes from a superseded request (reconnect / cached-run
+            // skip): they belong to a different offset than streamOffset now.
+            guard let self, !self.isCancelled, self.session.valid, dataTask === self.task else { return }
             self.processIncoming(data: data)
         }
     }
@@ -1616,6 +1685,14 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         while !remaining.isEmpty {
             let chunkIdx = cursor / saminProxyChunkBytes
             let chunkOffset = cursor % saminProxyChunkBytes
+
+            // Entering a chunk that is already complete on disk: jump past the
+            // cached run instead of truncating and re-downloading it.
+            if chunkOffset == 0, session.cachedChunks.contains(chunkIdx) {
+                skipCachedRun(from: cursor)
+                return
+            }
+
             let roomInChunk = saminProxyChunkBytes - chunkOffset
             let take = min(Int64(remaining.count), roomInChunk)
             let piece = remaining.prefix(Int(take))
