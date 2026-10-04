@@ -50,6 +50,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
@@ -262,6 +266,9 @@ internal fun PlayerControlsShell(
                         .fillMaxWidth()
                         .padding(horizontal = metrics.horizontalPadding)
                         .padding(bottom = metrics.sliderBottomOffset),
+                    cachedRanges = cachedRanges,
+                    cacheStatus = cacheStatus,
+                    onInteraction = onInteraction,
                 )
             }
             if (showPlaybackControls && !useLegacyLayout) {
@@ -619,20 +626,46 @@ private fun ProgressControls(
     onSourcesClick: (() -> Unit)? = null,
     onEpisodesClick: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
+    cachedRanges: List<TempCacheRange> = emptyList(),
+    cacheStatus: TempCacheStatus? = null,
+    onInteraction: () -> Unit = {},
 ) {
     val aspectRatioPainter = appIconPainter(AppIconResource.PlayerAspectRatio)
     val subtitlesPainter = appIconPainter(AppIconResource.PlayerSubtitles)
     val audioPainter = appIconPainter(AppIconResource.PlayerAudioFilled)
     val sourcePainter = appIconPainter(AppIconResource.PlayerSource)
     val episodesPainter = appIconPainter(AppIconResource.PlayerEpisodes)
+    var showDiagnosticsDialog by remember { mutableStateOf(false) }
+    if (showDiagnosticsDialog) {
+        PlayerDiagnosticsDialog(
+            launchId = cacheStatus?.launchId,
+            onDismiss = { showDiagnosticsDialog = false },
+        )
+    }
 
     Column(modifier = modifier) {
+        if (cacheStatus != null) {
+            Box(
+                modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                CacheStatsBadge(
+                    cacheStatus = cacheStatus,
+                    metrics = metrics,
+                    onClick = {
+                        onInteraction()
+                        showDiagnosticsDialog = true
+                    },
+                )
+            }
+        }
         PlayerSeekBar(
             durationMs = playbackSnapshot.durationMs,
             displayedPositionMs = displayedPositionMs,
             metrics = metrics,
             onScrubChange = onScrubChange,
             onScrubFinished = onScrubFinished,
+            cachedRanges = cachedRanges,
         )
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -700,6 +733,7 @@ internal fun PlayerSeekBar(
     onScrubChange: (Long) -> Unit,
     onScrubFinished: (Long) -> Unit,
     modifier: Modifier = Modifier,
+    cachedRanges: List<TempCacheRange> = emptyList(),
 ) {
     val seekDurationMs = durationMs.coerceAtLeast(1L)
     val seekDescription = stringResource(Res.string.player_seek_position)
@@ -715,7 +749,7 @@ internal fun PlayerSeekBar(
             onValueChangeFinished = { onScrubFinished(displayedPositionMs.coerceIn(0L, seekDurationMs)) },
             enabled = durationMs > 0L,
             valueRange = 0f..seekDurationMs.toFloat(),
-            track = { sliderState -> PlayerProgressTrack(sliderState) },
+            track = { sliderState -> PlayerProgressTrack(sliderState, cachedRanges) },
         )
         Row(
             modifier = Modifier
@@ -732,8 +766,18 @@ internal fun PlayerSeekBar(
 }
 
 @Composable
-private fun PlayerProgressTrack(sliderState: SliderState) {
+private fun PlayerProgressTrack(
+    sliderState: SliderState,
+    cachedRanges: List<TempCacheRange> = emptyList(),
+) {
     val palette = MaterialTheme.themePalette
+    val savedSpans = remember(cachedRanges) {
+        cachedRanges.mapNotNull { span ->
+            val start = span.start.coerceIn(0f, 1f)
+            val end = span.end.coerceIn(0f, 1f)
+            if (end > start) start to end else null
+        }.take(32)
+    }
     val inactiveTrackColors = SliderDefaults.colors(
         activeTrackColor = Color.Transparent,
         disabledActiveTrackColor = Color.Transparent,
@@ -750,6 +794,29 @@ private fun PlayerProgressTrack(sliderState: SliderState) {
             sliderState = sliderState,
             colors = inactiveTrackColors,
         )
+        if (savedSpans.isNotEmpty()) {
+            Box(
+                Modifier
+                    .matchParentSize()
+                    .drawBehind {
+                        val trackHeight = 4.dp.toPx()
+                        val trackOrigin = Offset(0f, (size.height - trackHeight) / 2)
+                        val radius = CornerRadius(trackHeight / 2)
+                        savedSpans.forEach { (start, end) ->
+                            val startX = size.width * start
+                            val endX = size.width * end
+                            if (endX > startX) {
+                                drawRoundRect(
+                                    color = SavedTrackGray,
+                                    topLeft = trackOrigin.copy(x = trackOrigin.x + startX),
+                                    size = Size(endX - startX, trackHeight),
+                                    cornerRadius = radius,
+                                )
+                            }
+                        }
+                    }
+            )
+        }
         SliderDefaults.Track(
             sliderState = sliderState,
             modifier = Modifier.gradientMask(palette.accentBrush()),

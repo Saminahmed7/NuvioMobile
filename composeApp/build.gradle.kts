@@ -235,9 +235,14 @@ val supabaseProps = Properties().apply {
 }
 val appVersionConfigFile = rootProject.file("iosApp/Configuration/Version.xcconfig")
 val releaseAppVersionName = providers.gradleProperty("nuvio.app.versionName").orNull
+    ?: providers.environmentVariable("MARKETING_VERSION").orNull
+    ?: System.getenv("MARKETING_VERSION")
     ?: readXcconfigValue(appVersionConfigFile, "MARKETING_VERSION")
     ?: error("MARKETING_VERSION is missing from ${appVersionConfigFile.path}")
-val releaseAppVersionCode = readXcconfigValue(appVersionConfigFile, "CURRENT_PROJECT_VERSION")
+val releaseAppVersionCode = providers.gradleProperty("nuvio.app.versionCode").orNull?.toIntOrNull()
+    ?: providers.environmentVariable("SAMIN_BUILD").orNull?.toIntOrNull()
+    ?: System.getenv("SAMIN_BUILD")?.toIntOrNull()
+    ?: readXcconfigValue(appVersionConfigFile, "CURRENT_PROJECT_VERSION")
     ?.toIntOrNull()
     ?: error("CURRENT_PROJECT_VERSION is missing or invalid in ${appVersionConfigFile.path}")
 val iosDistribution = (

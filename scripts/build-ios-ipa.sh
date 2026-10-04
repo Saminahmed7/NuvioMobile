@@ -41,6 +41,12 @@ fi
 if [[ -n "${NUVIO_KOTLIN_NATIVE_JVMARGS:-}" ]]; then
     build_environment+=("ORG_GRADLE_PROJECT_kotlin.native.jvmArgs=${NUVIO_KOTLIN_NATIVE_JVMARGS}")
 fi
+if [[ -n "${MARKETING_VERSION:-}" ]]; then
+    build_environment+=("ORG_GRADLE_PROJECT_nuvio.app.versionName=${MARKETING_VERSION}")
+fi
+if [[ -n "${SAMIN_BUILD:-}" ]]; then
+    build_environment+=("ORG_GRADLE_PROJECT_nuvio.app.versionCode=${SAMIN_BUILD}")
+fi
 "${build_environment[@]}" \
     xcodebuild \
     -project iosApp/iosApp.xcodeproj \

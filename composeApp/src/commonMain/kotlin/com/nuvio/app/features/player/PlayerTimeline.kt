@@ -44,8 +44,8 @@ import org.jetbrains.compose.resources.stringResource
 
 internal val PlayerTimelineContentInset = 2.dp
 
-/** Samin: solid neutral gray for saved-to-disk regions (monochrome, subtle). */
-private val SavedTrackGray = Color(0.62f, 0.62f, 0.64f)
+/** Samin: solid neutral gray for saved-to-disk regions (monochrome, distinct). */
+internal val SavedTrackGray = Color(0.72f, 0.72f, 0.75f)
 
 @Composable
 internal fun PlayerTimelineDetails(

@@ -18,11 +18,17 @@ import androidx.compose.material.icons.rounded.Palette
 import androidx.compose.material.icons.rounded.People
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Policy
+import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalUriHandler
+import com.nuvio.app.features.player.PlayerDiagnosticsDialog
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.Alignment
@@ -176,11 +182,26 @@ internal fun LazyListScope.settingsRootContent(
     if (showAboutSection) {
         item {
             val uriHandler = LocalUriHandler.current
+            var showDiagnosticsDialog by remember { mutableStateOf(false) }
+            if (showDiagnosticsDialog) {
+                PlayerDiagnosticsDialog(
+                    launchId = null,
+                    onDismiss = { showDiagnosticsDialog = false },
+                )
+            }
             SettingsSection(
                 title = stringResource(Res.string.compose_settings_root_about_section),
                 isTablet = isTablet,
             ) {
                 SettingsGroup(isTablet = isTablet) {
+                    SettingsNavigationRow(
+                        title = "Playback & Cache Diagnostics",
+                        description = "Proxy status, disk cache, and event logs",
+                        icon = Icons.Rounded.Speed,
+                        isTablet = isTablet,
+                        onClick = { showDiagnosticsDialog = true },
+                    )
+                    SettingsGroupDivider(isTablet = isTablet)
                     if (showSupportersContributorsPage) {
                         SettingsNavigationRow(
                             title = stringResource(Res.string.compose_settings_page_supporters_contributors),
@@ -265,6 +286,16 @@ internal fun LazyListScope.settingsRootContent(
                     modifier = Modifier.height(if (isTablet) 10.dp else 8.dp),
                 )
             }
+            Text(
+                text = "Nuvio Samin • Temp Playback Cache Engine",
+                modifier = Modifier.fillMaxWidth(),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.primary,
+                textAlign = TextAlign.Center,
+            )
+            androidx.compose.foundation.layout.Spacer(
+                modifier = Modifier.height(4.dp),
+            )
             Text(
                 text = stringResource(Res.string.compose_about_made_with),
                 modifier = Modifier.fillMaxWidth(),

@@ -284,7 +284,7 @@ private data class PlayerControlAction(
 )
 
 @Composable
-private fun CacheStatsBadge(
+internal fun CacheStatsBadge(
     cacheStatus: TempCacheStatus,
     metrics: PlayerLayoutMetrics,
     onClick: (() -> Unit)? = null,
@@ -315,8 +315,8 @@ private fun CacheStatsBadge(
             }
             "$cachedStr cached"
         }
-        else -> null
-    } ?: return
+        else -> "⚡ Cache Active"
+    }
 
     val badgeShape = RoundedCornerShape(12.dp)
     Box(
@@ -346,7 +346,11 @@ private fun CacheStatsBadge(
                 fontSize = (metrics.timeSize.value).sp,
                 fontWeight = FontWeight.Medium,
             ),
-            color = if (isComplete && speedBps <= 0L) Color(0xFF81C784) else Color.White.copy(alpha = 0.85f),
+            color = when {
+                isComplete && speedBps <= 0L -> Color(0xFF81C784)
+                speedBps > 0L -> Color(0xFF81D4FA)
+                else -> Color.White.copy(alpha = 0.85f)
+            },
             maxLines = 1,
         )
     }
