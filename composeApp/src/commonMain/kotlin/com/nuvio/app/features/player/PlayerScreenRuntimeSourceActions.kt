@@ -15,7 +15,9 @@ import com.nuvio.app.features.streams.StreamItem
 import com.nuvio.app.features.streams.StreamLinkCacheRepository
 import com.nuvio.app.features.watchprogress.WatchProgressRepository
 import com.nuvio.app.features.watchprogress.buildPlaybackVideoId
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 internal fun PlayerScreenRuntime.resolveDebridForPlayer(
     stream: StreamItem,
@@ -277,27 +279,29 @@ internal fun PlayerScreenRuntime.switchToSource(stream: StreamItem) {
     // Samin: route remote streams through the loopback cache proxy so the
     // player reads from disk (instant replays, offline survival). Without
     // this, every stream switch silently bypasses the proxy session.
-    val (playUrl, playHeaders) = TempPlaybackCache.resolveProxiedSource(
-        launchId = args.launchId,
-        sourceUrl = url,
-        headers = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request),
-    )
-    activeSourceUrl = playUrl
-    activeSourceAudioUrl = null
-    activeSourceHeaders = playHeaders
-    activeSourceResponseHeaders = sanitizePlaybackResponseHeaders(stream.behaviorHints.proxyHeaders?.response)
-    activeStreamType = stream.streamType
-    activeSourceIdentityKey = sourceIdentityKey
-    activeStreamTitle = stream.streamLabel
-    activeStreamSubtitle = stream.streamSubtitle
-    activeProviderName = stream.addonName
-    activeProviderAddonId = stream.addonId
-    currentStreamBingeGroup = stream.behaviorHints.bingeGroup
-    activeInitialPositionMs = currentPositionMs
-    activeInitialProgressFraction = null
-    showSourcesPanel = false
-    controlsVisible = true
-    PlayerStreamsRepository.pauseSearchForPlayback()
+    scope.launch(Dispatchers.Default) {
+        val (playUrl, playHeaders) = TempPlaybackCache.resolveProxiedSource(
+            launchId = args.launchId,
+            sourceUrl = url,
+            headers = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request),
+        )
+        activeSourceUrl = playUrl
+        activeSourceAudioUrl = null
+        activeSourceHeaders = playHeaders
+        activeSourceResponseHeaders = sanitizePlaybackResponseHeaders(stream.behaviorHints.proxyHeaders?.response)
+        activeStreamType = stream.streamType
+        activeSourceIdentityKey = sourceIdentityKey
+        activeStreamTitle = stream.streamLabel
+        activeStreamSubtitle = stream.streamSubtitle
+        activeProviderName = stream.addonName
+        activeProviderAddonId = stream.addonId
+        currentStreamBingeGroup = stream.behaviorHints.bingeGroup
+        activeInitialPositionMs = currentPositionMs
+        activeInitialProgressFraction = null
+        showSourcesPanel = false
+        controlsVisible = true
+        PlayerStreamsRepository.pauseSearchForPlayback()
+    }
 }
 
 internal fun PlayerScreenRuntime.switchToEpisodeStream(stream: StreamItem, episode: MetaVideo) {
@@ -334,17 +338,19 @@ internal fun PlayerScreenRuntime.switchToEpisodeStream(stream: StreamItem, episo
     }
     externalSubtitles = stream.externalSubtitles
     // Samin: same proxy routing as switchToSource (see above).
-    val (playUrl, playHeaders) = TempPlaybackCache.resolveProxiedSource(
-        launchId = args.launchId,
-        sourceUrl = url,
-        headers = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request),
-    )
-    activeSourceUrl = playUrl
-    activeSourceAudioUrl = null
-    activeSourceHeaders = playHeaders
-    activeSourceResponseHeaders = sanitizePlaybackResponseHeaders(stream.behaviorHints.proxyHeaders?.response)
-    activeStreamType = stream.streamType
-    applyEpisodeStreamMetadata(stream, episode, resume)
+    scope.launch(Dispatchers.Default) {
+        val (playUrl, playHeaders) = TempPlaybackCache.resolveProxiedSource(
+            launchId = args.launchId,
+            sourceUrl = url,
+            headers = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request),
+        )
+        activeSourceUrl = playUrl
+        activeSourceAudioUrl = null
+        activeSourceHeaders = playHeaders
+        activeSourceResponseHeaders = sanitizePlaybackResponseHeaders(stream.behaviorHints.proxyHeaders?.response)
+        activeStreamType = stream.streamType
+        applyEpisodeStreamMetadata(stream, episode, resume)
+    }
 }
 
 internal fun PlayerScreenRuntime.switchToDownloadedEpisode(downloadItem: DownloadItem, episode: MetaVideo) {

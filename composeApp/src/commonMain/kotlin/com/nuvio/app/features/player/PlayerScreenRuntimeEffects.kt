@@ -28,6 +28,8 @@ import com.nuvio.app.features.player.skip.intervalsAtSeekPositions
 import com.nuvio.app.features.streams.BingeGroupCacheRepository
 import com.nuvio.app.features.streams.StreamLinkCacheRepository
 import com.nuvio.app.features.streams.StreamItem
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import com.nuvio.app.features.streams.hasLikelyExpiringPlaybackCredentials
 import com.nuvio.app.features.tracking.TrackingScrobbleAction
 import com.nuvio.app.features.watchprogress.WatchProgressRepository
@@ -848,11 +850,13 @@ internal fun PlayerScreenRuntime.tryRefreshCredentialedSourceAfterError(message:
             stopActiveP2pStream()
             // Samin: refreshed debrid links must also go through the proxy,
             // otherwise playback silently leaves the on-disk cache.
-            val (playUrl, playHeaders) = TempPlaybackCache.resolveProxiedSource(
-                launchId = args.launchId,
-                sourceUrl = refreshedUrl,
-                headers = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request),
-            )
+            val (playUrl, playHeaders) = withContext(Dispatchers.Default) {
+                TempPlaybackCache.resolveProxiedSource(
+                    launchId = args.launchId,
+                    sourceUrl = refreshedUrl,
+                    headers = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request),
+                )
+            }
             activeSourceUrl = playUrl
             activeSourceAudioUrl = null
             activeSourceHeaders = playHeaders

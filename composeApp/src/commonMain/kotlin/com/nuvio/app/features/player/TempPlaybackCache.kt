@@ -116,13 +116,13 @@ object TempPlaybackCache {
      * upstream headers). Use this everywhere activeSourceUrl is assigned
      * from a remote stream, otherwise the proxy is silently bypassed.
      */
-    fun resolveProxiedSource(
+    suspend fun resolveProxiedSource(
         launchId: Long?,
         sourceUrl: String,
         headers: Map<String, String> = emptyMap(),
-    ): Pair<String, Map<String, String>> {
-        if (launchId == null || !shouldMirror(sourceUrl)) return sourceUrl to headers
-        val bridge = NuvioCacheProxyBridgeFactory.create() ?: return sourceUrl to headers
+    ): Pair<String, Map<String, String>> = withContext(Dispatchers.Default) {
+        if (launchId == null || !shouldMirror(sourceUrl)) return@withContext sourceUrl to headers
+        val bridge = NuvioCacheProxyBridgeFactory.create() ?: return@withContext sourceUrl to headers
         // Reuse existing session for the same launchId (same episode) to preserve
         // the on-disk cache. Only teardown on a genuinely different stream (new
         // launchId). The Swift proxy will update its upstream URL in-place.
@@ -132,7 +132,7 @@ object TempPlaybackCache {
             val local = runCatching {
                 bridge.startSession(existingKey, sourceUrl, encodeHeaders(headers))
             }.getOrNull().orEmpty()
-            if (local.isNotBlank()) return local to emptyMap()
+            if (local.isNotBlank()) return@withContext local to emptyMap()
             // Fall through to create new session if reuse failed
         }
         // New session (different launchId or reuse failed)
@@ -145,23 +145,23 @@ object TempPlaybackCache {
         val local = runCatching {
             bridge.startSession(key, sourceUrl, encodeHeaders(headers))
         }.getOrNull().orEmpty()
-        if (local.isBlank()) return sourceUrl to headers
+        if (local.isBlank()) return@withContext sourceUrl to headers
         proxied.add(launchId)
         _status.update { current ->
             current + (launchId to TempCacheStatus(launchId = launchId))
         }
-        return local to emptyMap()
+        local to emptyMap()
     }
 
-    fun pushPlayhead(
+    suspend fun pushPlayhead(
         launchId: Long,
         positionMs: Long,
         durationMs: Long,
         streamPos: Long = 0L,
         isPlaying: Boolean = true,
-    ) {
-        if (!isProxied(launchId)) return
-        val key = activeSessionKeys[launchId] ?: return
+    ) = withContext(Dispatchers.Default) {
+        if (!isProxied(launchId)) return@withContext
+        val key = activeSessionKeys[launchId] ?: return@withContext
         runCatching {
             NuvioCacheProxyBridgeFactory.create()
                 ?.setPlayhead(key, positionMs, durationMs, streamPos, isPlaying)
@@ -199,10 +199,10 @@ object TempPlaybackCache {
         header + report
     }
 
-    fun refreshRanges(launchId: Long) {
-        if (!isProxied(launchId)) return
-        val bridge = NuvioCacheProxyBridgeFactory.create() ?: return
-        val key = activeSessionKeys[launchId] ?: return
+    suspend fun refreshRanges(launchId: Long) = withContext(Dispatchers.Default) {
+        if (!isProxied(launchId)) return@withContext
+        val bridge = NuvioCacheProxyBridgeFactory.create() ?: return@withContext
+        val key = activeSessionKeys[launchId] ?: return@withContext
         val statsJson = runCatching {
             bridge.cacheStatsJson(key)
         }.getOrNull().orEmpty()
