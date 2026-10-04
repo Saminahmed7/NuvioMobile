@@ -84,6 +84,7 @@ fun getIsLoading(): Boolean
     fun getStreamPos(): Long
     fun getPlaybackSpeed(): Float
     fun getErrorMessage(): String
+    fun getProperty(name: String): String
     fun destroy()
 }
 
