@@ -291,16 +291,19 @@ actual fun PlatformPlayerSurface(
     // Load file and set initial state
     LaunchedEffect(bridge, sourceUrl, sourceAudioUrl, sourceHeaders, externalSubtitles) {
         bridge.applyIosVideoOutputSettings(latestPlayerSettings.value)
+        // Samin: the start position travels WITH the load request. loadFile is
+        // queued (and may be deferred until the Metal viewport is ready), so a
+        // seekTo() fired right after loadFileWithAudio() lands while mpv is
+        // still idle and is silently dropped -> resume/watch-progress starts
+        // from 0:00. The bridge now queues it and applies it on
+        // MPV_EVENT_FILE_LOADED (same proven path as background recovery).
         bridge.loadFileWithAudio(
             videoUrl = sourceUrl,
             audioUrl = sourceAudioUrl,
             headersJson = encodePlaybackHeadersForBridge(sourceHeaders),
             subtitlesJson = encodeExternalSubtitlesForBridge(externalSubtitles),
+            startPositionMs = initialPositionMs?.takeIf { it > 0L } ?: 0L,
         )
-        val startPos = initialPositionMs?.takeIf { it > 0L }
-        if (startPos != null) {
-            bridge.seekTo(startPos)
-        }
         initialPositionRequestKey?.let { key ->
             latestOnInitialPositionHandled.value(key, true)
         }

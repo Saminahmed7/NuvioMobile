@@ -22,12 +22,13 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge {
     }
 
     func loadFile(url: String) { ensurePlayerViewController().loadFile(url) }
-    func loadFileWithAudio(videoUrl: String, audioUrl: String?, headersJson: String?, subtitlesJson: String?) {
+    func loadFileWithAudio(videoUrl: String, audioUrl: String?, headersJson: String?, subtitlesJson: String?, startPositionMs: Int64) {
         ensurePlayerViewController().loadFile(
             videoUrl,
             audioUrl: audioUrl,
             requestHeaders: parseRequestHeaders(headersJson),
-            subtitles: parseSubtitles(subtitlesJson)
+            subtitles: parseSubtitles(subtitlesJson),
+            startPositionMs: startPositionMs
         )
     }
 
@@ -246,6 +247,9 @@ private struct PendingLoadRequest {
     let requestHeaders: [String: String]
     let subtitles: [PluginSubtitle]
     let queuedAtUptime: TimeInterval
+    // Resume/watch-progress position (seconds) to apply once the file is
+    // loaded. Issuing the seek before mpv has a file is silently dropped.
+    let startPositionMsSeconds: Double
 }
 
 // MARK: - MPV Player View Controller
@@ -607,13 +611,14 @@ final class MPVPlayerViewController: UIViewController {
 
     // MARK: - Playback API
 
-    func loadFile(_ urlString: String, audioUrl: String? = nil, requestHeaders: [String: String] = [:], subtitles: [PluginSubtitle] = []) {
+    func loadFile(_ urlString: String, audioUrl: String? = nil, requestHeaders: [String: String] = [:], subtitles: [PluginSubtitle] = [], startPositionMs: Int64 = 0) {
         let request = PendingLoadRequest(
             urlString: urlString,
             audioUrl: audioUrl,
             requestHeaders: requestHeaders,
             subtitles: subtitles,
-            queuedAtUptime: ProcessInfo.processInfo.systemUptime
+            queuedAtUptime: ProcessInfo.processInfo.systemUptime,
+            startPositionMsSeconds: Double(max(0, startPositionMs)) / 1000.0
         )
 
         if Thread.isMainThread {
@@ -656,6 +661,16 @@ final class MPVPlayerViewController: UIViewController {
         isPlayerLoading = true
         isPlayerEnded = false
         applyAudioLanguagePreferences(preferredAudioLanguages)
+        // Samin: initial resume position. loadFile can be queued/deferred
+        // (viewport-ready retry loop), so a seek issued at load-call time is
+        // dropped by mpv while idle. Queue it here instead and apply it on
+        // MPV_EVENT_FILE_LOADED. Recovery paths set pendingResumePosition
+        // themselves right before startLoad — never overwrite those.
+        if request.startPositionMsSeconds > 0, pendingResumePosition == nil {
+            pendingResumePosition = request.startPositionMsSeconds
+            print("[MPV] Queued initial resume position \(request.startPositionMsSeconds)s")
+        }
+        applyDemuxerCacheProfile(for: request.urlString)
         command("loadfile", args: [request.urlString, "replace"])
         if let audioUrl = request.audioUrl, !audioUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
@@ -667,6 +682,32 @@ final class MPVPlayerViewController: UIViewController {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                 self?.addSubtitle(subtitle, mode: "auto")
             }
+        }
+    }
+
+    /// Samin: per-stream demuxer cache profile.
+    ///
+    /// HLS/DASH get a much larger in-memory buffer (handoff "Option B"):
+    /// the loopback proxy deliberately does not cache playlists/segments, so
+    /// the only buffer that protects HLS from upstream stalls is mpv's own
+    /// demuxer cache. Progressive files keep the setupMpv() defaults — their
+    /// cache lives on disk in LocalCacheProxy, and growing the RAM buffer
+    /// there would only add memory pressure without benefit.
+    private func applyDemuxerCacheProfile(for urlString: String) {
+        guard mpv != nil else { return }
+        let lower = urlString.lowercased()
+        let isAdaptive = lower.contains(".m3u8") || lower.contains(".mpd")
+        if isAdaptive {
+            setStringProperty("demuxer-max-bytes", "268435456")    // 256 MB ahead
+            setStringProperty("demuxer-max-back-bytes", "134217728") // 128 MB rewind
+            setStringProperty("demuxer-readahead-secs", "120")     // 2 min ahead
+            print("[MPV] HLS/DASH demuxer profile: 256 MB / 120 s readahead")
+        } else {
+            // Keep the progressive defaults from setupMpv(); do not touch
+            // demuxer-max-back-bytes (leave the mpv default). Each playback
+            // gets its own mpv instance, so overrides never leak across.
+            setStringProperty("demuxer-max-bytes", "67108864")
+            setStringProperty("demuxer-readahead-secs", "30")
         }
     }
 
@@ -727,7 +768,12 @@ final class MPVPlayerViewController: UIViewController {
             let pos = getDouble("time-pos")
             command("loadfile", args: [path, "replace"])
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                self?.command("seek", args: [String(format: "%.3f", pos), "absolute"])
+                // Only re-seek if there was real progress; a 0-position retry
+                // must not clobber a still-pending initial resume seek that
+                // MPV_EVENT_FILE_LOADED is about to apply.
+                if pos > 0.5 {
+                    self?.command("seek", args: [String(format: "%.3f", pos), "absolute"])
+                }
             }
         }
     }
