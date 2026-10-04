@@ -2,8 +2,29 @@
 
 **Last Updated:** 2026-10-04  
 **Branch:** `samin-temp-cache` (fork: `Saminahmed7/NuvioMobile`)  
-**Latest Published Release:** **`samin-v0.5.6034-6034`** (Nuvio Samin 0.5.6034)  
+**Latest Published Release:** **`samin-v0.5.6035-6035`** (Nuvio Samin 0.5.6035)  
 **SideStore Source:** `https://raw.githubusercontent.com/Saminahmed7/NuvioMobile/samin-temp-cache/store-samin.json`  
+
+---
+
+## 0. Fixes released in Build 35 (0.5.6035 / 6035)
+
+### A. Resume-from-position broken after app restart (FIXED)
+
+**Symptom:** Watch part of a stream -> close app -> reopen -> tap the Continue Watching card ("x min left") -> pick a stream from the source list -> playback starts at 0:00 instead of the saved position.
+
+**Root cause (iOS):** `PlayerEngine.ios.kt` fired `bridge.seekTo(resumePosition)` immediately after `loadFileWithAudio(...)`. But `loadFile` only *queues* the load - and in portrait it is deferred >= 0.9 s by the viewport-ready gate (`isViewportReadyForPlayback`) until the Metal view has laid out. mpv drops `seek <t> absolute` commands issued while no file is loaded, so the resume seek was silently discarded. The engine then reported the position as "handled" (`onInitialPositionHandled(key, true)`), which also disabled the Compose-level retry effect in `PlayerScreenRuntimeEffects`. On cold start (slower viewport attach + loopback proxy first open) the race was lost every time - matching the restart repro. This equally affected in-player source switches (fresh mpv instance per playback key).
+
+**Fix:** The start position now travels with the load request and is applied at `MPV_EVENT_FILE_LOADED` - the same proven mechanism background recovery already uses:
+- `PlayerBridge.kt`: `loadFileWithAudio(..., startPositionMs: Long = 0L)`.
+- `PlayerEngine.ios.kt`: passes `startPositionMs` into the load; removed the dropped immediate seek.
+- `MPVPlayerBridge.swift`: `PendingLoadRequest.startPositionMsSeconds`; `startLoad` queues `pendingResumePosition = request.startPositionMsSeconds` **only if nil** (recovery paths set it themselves right before `startLoad` and must win). The `FILE_LOADED` handler consumes it unchanged. `retryPlayback`'s delayed `time-pos` re-seek now only fires when `pos > 0.5` so a 0-position retry cannot clobber a still-pending initial resume.
+
+### B. HLS buffering - Option B implemented (demuxer cache profile)
+
+`startLoad` now applies a per-stream demuxer profile in `MPVPlayerViewController.applyDemuxerCacheProfile(for:)`:
+- **HLS (.m3u8) / DASH (.mpd):** `demuxer-max-bytes = 256 MB`, `demuxer-max-back-bytes = 128 MB`, `demuxer-readahead-secs = 120` - mpv rides through upstream stalls entirely from RAM; also gives ~2 min of instant backward seek without re-fetching segments.
+- **Progressive (loopback proxy / direct):** unchanged - 64 MB / 30 s from `setupMpv()`, `demuxer-max-back-bytes` left at the mpv default. The progressive disk cache in `LocalCacheProxy.swift` is untouched; each playback gets its own mpv instance, so profiles never leak across streams.
 
 ---
 
@@ -91,5 +112,6 @@ Configure MPV options in `MPVPlayerBridge.swift` for HLS streams:
 | # | Item | Status | Notes |
 |---|------|--------|-------|
 | 1 | **Verify Build 34 on iPad** | **Ready for user test** | Install `0.5.6034` via SideStore. Verify "About" shows `0.5.6034 (6034)` and test progressive stream (debrid MP4/MKV) for grey bar + speed badge. |
-| 2 | **HLS Buffering Optimization (Option B)** | Queued | Increase MPV demuxer readahead buffer for HLS to 256 MB / 120s to stop HLS buffering stalls. |
-| 3 | **HLS Segment Disk Caching (Option A)** | Future Feature | Segment reverse proxy with playlist rewriting in `LocalCacheProxy.swift` for offline/disk caching of `.m3u8`. |
+| 2 | **HLS Buffering Optimization (Option B)** | **Shipped in 6035** | Demuxer profile in `MPVPlayerBridge.swift`: HLS/DASH get 256 MB / 120 s; progressive untouched. Verify with an HLS source that long stalls are gone. |
+| 3 | **Resume-from-position after restart** | **Shipped in 6035** | Seek now applied at `MPV_EVENT_FILE_LOADED` via `startPositionMs` in the load request. Test: watch 10 min -> kill app -> Continue Watching -> pick stream -> must resume. |
+| 4 | **HLS Segment Disk Caching (Option A)** | Future Feature | Segment reverse proxy with playlist rewriting in `LocalCacheProxy.swift` for offline/disk caching of `.m3u8`. |
