@@ -654,8 +654,8 @@ final class LocalCacheProxyServer {
 
 final class ProxySession {
     let key: String
-    let sourceUrl: String
-    let headers: [String: String]
+    var sourceUrl: String
+    var headers: [String: String]
     let dir: URL
     unowned let server: LocalCacheProxyServer
 
@@ -693,7 +693,7 @@ final class ProxySession {
     var forwardReconnects = 0
     var clientRangeRequests = 0
     var lastClientRange: String?
-    let headerNames: [String]
+    var headerNames: [String]
 
     // Rate-limit backoff (HTTP 429/503 from throttling upstreams such as
     // Cloudflare Workers). While set, no new upstream connections are opened;
