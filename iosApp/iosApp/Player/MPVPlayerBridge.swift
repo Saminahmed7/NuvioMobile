@@ -696,7 +696,11 @@ final class MPVPlayerViewController: UIViewController {
     private func applyDemuxerCacheProfile(for urlString: String) {
         guard mpv != nil else { return }
         let lower = urlString.lowercased()
-        let isAdaptive = lower.contains(".m3u8") || lower.contains(".mpd")
+        // "/playlist" catches HLS routed through the loopback segment cache
+        // (http://127.0.0.1:PORT/s/<key>/playlist); direct .m3u8/.mpd URLs
+        // catch pass-through streams. Proxied-HLS still benefits: mpv reads
+        // many small segment requests, and a large readahead smooths those.
+        let isAdaptive = lower.contains(".m3u8") || lower.contains(".mpd") || lower.contains("/playlist")
         if isAdaptive {
             setStringProperty("demuxer-max-bytes", "268435456")    // 256 MB ahead
             setStringProperty("demuxer-max-back-bytes", "134217728") // 128 MB rewind

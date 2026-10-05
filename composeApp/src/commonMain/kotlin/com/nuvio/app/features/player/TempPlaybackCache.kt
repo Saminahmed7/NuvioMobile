@@ -32,8 +32,15 @@ data class TempCacheRange(
  * is fully cached, the backward part (before the playhead) is fetched too —
  * but only when free storage comfortably fits it. If storage runs low,
  * the watched (backward) file is evicted first and the unwatched (forward)
- * part is kept. Only progressive http(s) files are mirrored. HLS (.m3u8),
- * DASH (.mpd), torrents and magnet links are skipped.
+ * part is kept. Only progressive http(s) files are mirrored; torrents and
+ * magnet links are skipped.
+ *
+ * HLS (.m3u8) is cached differently: on platforms with the loopback proxy
+ * (iOS) it routes through the proxy, which fetches the playlist, rewrites
+ * every segment/key/init URI back to localhost and disk-caches the segments
+ * (see LocalCacheProxy.swift HLSStreamState). See [shouldProxy]. DASH (.mpd)
+ * and unparseable playlists still bypass the proxy. Without a proxy bridge
+ * (Android) HLS plays directly from the remote URL with no caching.
  */
 data class TempCacheStatus(
     val launchId: Long,
@@ -111,6 +118,27 @@ object TempPlaybackCache {
     ): String = resolveProxiedSource(launchId, sourceUrl, headers).first
 
     /**
+     * True for HLS media/master playlists (.m3u8). These cannot use the
+     * progressive byte-chunk cache, but on iOS the loopback proxy implements
+     * a segment-level HLS cache for them.
+     */
+    fun isAdaptivePlaylist(url: String?): Boolean {
+        val lower = url?.trim()?.lowercase().orEmpty()
+        if (!lower.startsWith("http://") && !lower.startsWith("https://")) return false
+        return lower.endsWith(".m3u8") || lower.contains(".m3u8?")
+    }
+
+    /**
+     * What may go through the platform cache proxy (iOS): everything
+     * [shouldMirror] accepts (progressive files) plus HLS playlists, which
+     * the proxy handles with its own segment cache. DASH (.mpd) stays out:
+     * its init segments are commonly byte-range addressed, which the proxy
+     * does not support yet. On platforms without a proxy bridge this gate is
+     * irrelevant — [resolveProxiedSource] returns the remote URL unchanged.
+     */
+    fun shouldProxy(url: String?): Boolean = shouldMirror(url) || isAdaptivePlaylist(url)
+
+    /**
      * Same as [resolvePlayUrl] but also returns the headers the player
      * itself should use (empty for localhost: the proxy holds the real
      * upstream headers). Use this everywhere activeSourceUrl is assigned
@@ -121,7 +149,7 @@ object TempPlaybackCache {
         sourceUrl: String,
         headers: Map<String, String> = emptyMap(),
     ): Pair<String, Map<String, String>> {
-        if (launchId == null || !shouldMirror(sourceUrl)) return sourceUrl to headers
+        if (launchId == null || !shouldProxy(sourceUrl)) return sourceUrl to headers
         val bridge = NuvioCacheProxyBridgeFactory.create() ?: return sourceUrl to headers
         // Reuse existing session for the same launchId (same episode) to preserve
         // the on-disk cache. Only teardown on a genuinely different stream (new

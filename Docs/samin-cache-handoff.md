@@ -1,8 +1,8 @@
 # Samin temp-cache / seamless playback — handoff
 
-**Last Updated:** 2026-10-04  
+**Last Updated:** 2026-10-05  
 **Branch:** `samin-temp-cache` (fork: `Saminahmed7/NuvioMobile`)  
-**Latest Published Release:** **`samin-v0.5.6035-6035`** (Nuvio Samin 0.5.6035)  
+**Latest Published Release:** **`samin-v0.5.6036-6036`** (Nuvio Samin 0.5.6036)  
 **SideStore Source:** `https://raw.githubusercontent.com/Saminahmed7/NuvioMobile/samin-temp-cache/store-samin.json`  
 
 ---
@@ -25,6 +25,57 @@
 `startLoad` now applies a per-stream demuxer profile in `MPVPlayerViewController.applyDemuxerCacheProfile(for:)`:
 - **HLS (.m3u8) / DASH (.mpd):** `demuxer-max-bytes = 256 MB`, `demuxer-max-back-bytes = 128 MB`, `demuxer-readahead-secs = 120` - mpv rides through upstream stalls entirely from RAM; also gives ~2 min of instant backward seek without re-fetching segments.
 - **Progressive (loopback proxy / direct):** unchanged - 64 MB / 30 s from `setupMpv()`, `demuxer-max-back-bytes` left at the mpv default. The progressive disk cache in `LocalCacheProxy.swift` is untouched; each playback gets its own mpv instance, so profiles never leak across streams.
+
+---
+
+## 0b. HLS segment disk caching (Build 36, 0.5.6036)
+
+**Goal (work-queue item #4, handoff "Option A"):** give HLS (.m3u8) the same
+loopback disk cache experience progressive files already have - grey bar,
+cached badge, instant replay of watched segments - without touching the
+progressive byte-chunk path.
+
+**Kotlin (TempPlaybackCache.kt):**
+- New gates: `isAdaptivePlaylist()` (http(s) .m3u8) and
+  `shouldProxy() = shouldMirror(url) || isAdaptivePlaylist(url)`.
+- `resolveProxiedSource` now uses `shouldProxy`, so HLS startSession calls the
+  proxy and returns `http://127.0.0.1:<port>/s/<key>/playlist`. The background
+  mirror effect still gates on `shouldMirror`, so Android behavior is
+  unchanged (and `NuvioCacheProxyBridgeFactory.create()` returns nil there
+  anyway). DASH (.mpd) stays excluded (byte-range init segments unsupported).
+
+**Swift (LocalCacheProxy.swift):**
+- `ProxySessionKind` (`.progressive` / `.hls` / `.passThrough`); startSession
+  picks the kind from the upstream URL and hands mpv `/playlist` for HLS.
+- `HLSStreamState` per-session engine: fetches the playlist (follows one
+  master -> best-bandwidth variant hop), parses it with a dependency-free
+  parser, rewrites every segment/key/init URI to
+  `/s/<key>/seg/<i>` / `key/<i>` / `map/<i>`, disk-caches each segment as
+  `seg_<i>.bin` under the session dir, prefetches 8 segments ahead of the
+  playhead, evicts watched segments only under the 300 MB low-space
+  threshold, and parks/waiters loopback requests until their segment lands
+  (3 s watchdog re-kick). Session teardown (`stopSession`, `stopAllSessions`,
+  `invalidate`) reuses the existing directory deletion path unchanged.
+- Graceful degradation: live playlists, `EXT-X-BYTERANGE`, unknown key
+  methods, malformed playlists, or a failed initial playlist fetch all flip
+  the session to pass-through, where `/playlist` answers 302 -> upstream
+  playlist (exact pre-feature behavior, demuxer cache still active).
+- Reporting: `cachedRangesJson` returns true time-domain spans (segment
+  table), `cacheStatsJson` reports speed/cachedBytes/isComplete - so the
+  grey bar, speed badge and Settings diagnostics light up for HLS with no
+  UI changes. Diagnostics gained a per-session "Session kind" line plus HLS
+  state lines (playlist host/status, segments cached, fetches in flight,
+  parked waiters, master variant).
+
+**MPVPlayerBridge.swift:** `applyDemuxerCacheProfile` also matches
+`/playlist` (proxied HLS) so those sessions keep the 256 MB / 120 s demuxer
+buffer; progressive defaults untouched.
+
+**Known limits:** no persistence across sessions (same as progressive:
+ephemeral by design), single-variant master playlists only (highest
+bandwidth), AES-128 keys cached per-segment (shared keys refetched per
+segment index - negligible size), and no byte-range map support (falls back
+to redirect).
 
 ---
 
@@ -112,6 +163,6 @@ Configure MPV options in `MPVPlayerBridge.swift` for HLS streams:
 | # | Item | Status | Notes |
 |---|------|--------|-------|
 | 1 | **Verify Build 34 on iPad** | **Ready for user test** | Install `0.5.6034` via SideStore. Verify "About" shows `0.5.6034 (6034)` and test progressive stream (debrid MP4/MKV) for grey bar + speed badge. |
-| 2 | **HLS Buffering Optimization (Option B)** | **Shipped in 6035** | Demuxer profile in `MPVPlayerBridge.swift`: HLS/DASH get 256 MB / 120 s; progressive untouched. Verify with an HLS source that long stalls are gone. |
+| 2 | **HLS Buffering Optimization (Option B)** | **Shipped in 6035** | Demuxer profile in `MPVPlayerBridge.swift`: HLS/DASH get 256 MB / 120 s (now also matches proxied `/playlist` URLs); progressive untouched. |
 | 3 | **Resume-from-position after restart** | **Shipped in 6035** | Seek now applied at `MPV_EVENT_FILE_LOADED` via `startPositionMs` in the load request. Test: watch 10 min -> kill app -> Continue Watching -> pick stream -> must resume. |
-| 4 | **HLS Segment Disk Caching (Option A)** | Future Feature | Segment reverse proxy with playlist rewriting in `LocalCacheProxy.swift` for offline/disk caching of `.m3u8`. |
+| 4 | **HLS Segment Disk Caching (Option A)** | **Shipped in 6036** | `HLSStreamState` in `LocalCacheProxy.swift`: playlist rewrite + segment disk cache + prefetch; `/playlist` 302 redirect fallback for live/BYTERANGE/unsupported playlists. Test: HLS source -> grey bar + badge, instant replay of watched segments, diagnostics show 'Session kind: HLS segment cache'. |

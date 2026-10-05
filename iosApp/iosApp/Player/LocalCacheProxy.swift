@@ -62,6 +62,18 @@ private let saminProxyMaxChunkFetchers = 3
 private let saminProxyBackwardSeekBytes: Int64 = 32 * 1024 * 1024
 private let saminProxyBackwardGapChunks: Int64 = 8 // 16 MB with 2 MB chunks
 
+// MARK: HLS segment cache (Samin, handoff "Option A")
+//
+// An HLS session caches each media segment as its own file under the session
+// directory. The playlist is fetched once, parsed, and every segment / key /
+// init-map URI is rewritten to a loopback path, so mpv pulls each segment
+// through the proxy and replays are served from disk. Not supported (falls
+// back to byte-stream pass-through): live events, EXT-X-BYTERANGE, parsed
+// playlists with no variants/segments, and DASH manifests.
+private let saminHlsSegmentFetchers = 3
+private let saminHlsPrefetchSegments = 8
+private let saminHlsMaxPlaylistBytes = 4 * 1024 * 1024
+
 final class LocalCacheProxyLog {
     static let shared = LocalCacheProxyLog()
     private var entries: [String] = []
@@ -158,7 +170,8 @@ final class LocalCacheProxyServer {
 
     fileprivate let queue = DispatchQueue(label: "nuvio-cache-proxy", qos: .userInitiated)
     private var listener: NWListener?
-    private var port: UInt16 = 0
+    // fileprivate: the HLS layer builds loopback URLs from it.
+    fileprivate var port: UInt16 = 0
     private var sessions: [String: ProxySession] = [:]
     private var connections: [ObjectIdentifier: ProxyConnection] = [:]
     // The loopback port is fixed for the whole app process lifetime. MPV holds
@@ -432,21 +445,38 @@ final class LocalCacheProxyServer {
                     var url = ""
                     queue.sync {
                         guard listenerReady, port != 0 else { return }
+                        // Samin: DASH manifests are explicitly not cached
+                        // (byte-range init segments are unsupported); park
+                        // them on a pass-through session so the URL handed
+                        // to mpv at least resolves instead of 404ing.
+                        let wantsHls = LocalCacheProxyServer.isHlsPlaylistUrl(sourceUrl)
+                        let wantsPassThrough = sourceUrl.lowercased().contains(".mpd")
+                        let kind: ProxySessionKind = wantsHls ? .hls : (wantsPassThrough ? .passThrough : .progressive)
                         if let existing = sessions[key] {
                             // Same session key (same launchId) — update upstream URL
                             // without wiping the cache directory. This handles debrid
                             // re-resolve / stream re-select for the same episode.
                             existing.updateSourceUrl(sourceUrl, headers)
+                        } else if kind == .hls {
+                            sessions[key] = ProxySession(
+                                key: key,
+                                sourceUrl: sourceUrl,
+                                headers: headers,
+                                baseDir: cacheBaseDir().appendingPathComponent(key, isDirectory: true),
+                                server: self,
+                                kind: .hls
+                            )
                         } else {
                             sessions[key] = ProxySession(
                                 key: key,
                                 sourceUrl: sourceUrl,
                                 headers: headers,
                                 baseDir: cacheBaseDir().appendingPathComponent(key, isDirectory: true),
-                                server: self
+                                server: self,
+                                kind: kind
                             )
                         }
-                        url = "http://127.0.0.1:\(port)/s/\(key)/file"
+                        url = "http://127.0.0.1:\(port)/s/\(key)/\(kind == .hls ? "playlist" : "file")"
                     }
                     if !url.isEmpty { return url }
                 } else if rebuildAttempts < 3 {
@@ -462,6 +492,14 @@ final class LocalCacheProxyServer {
         // hanging on a dead localhost address.
         LocalCacheProxyLog.shared.log("Server: startSession('\\(key)') aborted - listener never became ready; using direct URL")
         return ""
+    }
+
+    /// True for URLs that identify an HTTP Live Streaming media or master
+    /// playlist. Checked on the raw upstream URL handed to startSession.
+    static func isHlsPlaylistUrl(_ url: String) -> Bool {
+        let lower = url.lowercased()
+        guard lower.hasPrefix("http://") || lower.hasPrefix("https://") else { return false }
+        return lower.hasSuffix(".m3u8") || lower.contains(".m3u8?")
     }
 
     func stopSession(key: String) {
@@ -548,7 +586,19 @@ final class LocalCacheProxyServer {
             let targetSession = sessions[key] ?? sessions.values.first
             if let s = targetSession {
                 lines.append("\n--- Session: [\(s.key)] ---")
-                if let url = URL(string: s.sourceUrl) {
+                lines.append("Session kind: \(s.kind == .hls ? "HLS segment cache" : (s.kind == .passThrough ? "pass-through (unsupported manifest)" : "progressive byte cache"))")
+                if s.kind == .hls || s.kind == .passThrough {
+                    // Samin: HLS sessions report their own state; the byte-model
+                    // fields (HEAD probe, chunks, forward downloader) do not apply.
+                    if let hls = s.hls {
+                        lines.append(contentsOf: hls.diagnosticLines())
+                    } else {
+                        lines.append("HLS state: unavailable (session not constructed for HLS)")
+                    }
+                    let playheadStr = s.playheadMs.map { "\($0.0 / 1000)s / \($0.1 / 1000)s" } ?? "none"
+                    lines.append("Playhead: \(playheadStr)")
+                    lines.append("What to compare: a healthy HLS session shows the fetched playlist, cached segments vs total, and the prefetch front. 'playlist failed' means the segment cache is inactive and mpv is effectively streaming pass-through.")
+                } else if let url = URL(string: s.sourceUrl) {
                     let ext = url.pathExtension.isEmpty ? "(no extension)" : ".\(url.pathExtension)"
                     let queryInfo = url.query.map { "query=\($0.count) chars (auth token redacted)" } ?? "no query"
                     lines.append("Host: \(url.host ?? "unknown") | Type: \(ext) | URL len: \(s.sourceUrl.count) | \(queryInfo)")
@@ -658,6 +708,12 @@ final class ProxySession {
     var headers: [String: String]
     let dir: URL
     unowned let server: LocalCacheProxyServer
+    /// Samin: what kind of stream this session serves. Determines whether the
+    /// byte-chunk machinery (progressive), the HLS segment machinery, or plain
+    /// pass-through is used.
+    let kind: ProxySessionKind
+    /// Samin: HLS segment cache state. nil for non-HLS sessions.
+    var hls: HLSStreamState?
 
     var totalSize: Int64?
     var contentType: String?
@@ -728,19 +784,28 @@ final class ProxySession {
         rateLimitedUntil = nil
     }
 
-    init(key: String, sourceUrl: String, headers: [String: String], baseDir: URL, server: LocalCacheProxyServer) {
+    init(key: String, sourceUrl: String, headers: [String: String], baseDir: URL, server: LocalCacheProxyServer, kind: ProxySessionKind = .progressive) {
         self.key = key
         self.sourceUrl = sourceUrl
         self.headers = headers
         self.headerNames = Array(headers.keys).sorted()
         self.dir = baseDir
         self.server = server
+        self.kind = kind
         if FileManager.default.fileExists(atPath: baseDir.path) {
             try? FileManager.default.removeItem(at: baseDir)
         }
         try? FileManager.default.createDirectory(at: baseDir, withIntermediateDirectories: true)
-        probeTotalSizeIfNeeded()
-    }
+        if kind == .hls {
+            hls = HLSStreamState(session: self)
+        } else {
+            hls = nil
+        }
+        // The byte-model HEAD probe is meaningless for a playlist (its
+        // Content-Length is the text size) and would pollute diagnostics.
+        if kind != .hls && kind != .passThrough {
+            probeTotalSizeIfNeeded()
+        }
 
     func claimChunkWrite(chunkIndex: Int64, owner: String) -> Bool {
         if let currentOwner = activeChunkWriters[chunkIndex] {
@@ -772,6 +837,7 @@ final class ProxySession {
         forwardDownloader = nil
         chunkFetchers.values.forEach { $0.cancel() }
         chunkFetchers.removeAll()
+        hls?.shutdown()
         headWaiters.removeAll()
         let conns = Array(activeConnections.values)
         activeConnections.removeAll()
@@ -800,6 +866,12 @@ final class ProxySession {
         headers = newHeaders
         headerNames = Array(newHeaders.keys).sorted()
         LocalCacheProxyLog.shared.log("Session [\(key)]: Updated upstream URL \(oldSourceUrl) -> \(newSourceUrl)")
+        // Samin: hand the new upstream to the HLS pipeline (same URL pattern as
+        // experiments over these trailers). hls may be nil when the failure is
+        // surfaced as .passThrough before state construction.
+        if let hls = hls {
+            hls.setUpstream(newSourceUrl, newHeaders)
+        }
         // If a forward downloader is running and the upstream changed, restart it
         // so subsequent range requests go to the new URL. The cached chunks stay valid
         // because debrid re-resolves point to the same file bytes.
@@ -1104,8 +1176,13 @@ final class ProxySession {
         evictedChunksCount += 1
     }
 
-    private func onPlayheadUpdated() {
+    private    func onPlayheadUpdated() {
         guard valid else { return }
+        // Samin: the byte-stream machinery has no meaning for HLS sessions.
+        guard kind != .hls, kind != .passThrough else {
+            hls?.playheadUpdated()
+            return
+        }
         recordPlayheadSample()
         maybeRepositionForward()
         // Evict watched chunks behind the playhead if storage is currently tight
@@ -1287,6 +1364,10 @@ final class ProxySession {
     }
 
     func cachedRangesJson() -> String {
+        // Samin: HLS reports time-domain spans computed from its segment table.
+        if kind == .hls || kind == .passThrough {
+            return hls?.cachedTimeRangesJson() ?? "[]"
+        }
         guard let total = totalSize, total > 0 else { return "[]" }
         var rawRanges: [(Int64, Int64)] = []
         for idx in cachedChunks {
@@ -1398,6 +1479,11 @@ final class ProxySession {
     }
 
     func cacheStatsJson() -> String {
+        // Samin: the legacy byte-format needs totalBytes, which HLS playlists
+        // never have; the segment layer reports its own shape instead.
+        if kind == .hls || kind == .passThrough {
+            return hls?.statsJson() ?? "{\"speedBps\":0,\"cachedBytes\":0,\"totalBytes\":0,\"isComplete\":false,\"ranges\":[]}" 
+        }
         let speed = currentSpeed()
         let cached = totalCachedBytes()
         let total = totalSize ?? 0
@@ -2164,13 +2250,31 @@ final class ProxyConnection {
             return
         }
         let parts = request.target.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
-        guard parts.count == 3, parts[0] == "s", parts[2] == "file",
+        guard parts.count >= 3, parts[0] == "s",
               let session = server.session(for: parts[1]) else {
             respondNow(status: 404, headers: [("Content-Length", "0")], body: nil)
             return
         }
         self.sessionKey = parts[1]
         session.attachConnection(self)
+
+        // Samin: HLS sessions serve their own subpaths (rewritten playlist,
+        // segments, keys, init maps). They never enter the byte-chunk machinery
+        // below, which assumes one seekable upstream file.
+        if session.kind == .hls {
+            guard request.method == "GET" else {
+                respondNow(status: 405, headers: [("Content-Length", "0")], body: nil)
+                return
+            }
+            let subpath = parts[2...].joined(separator: "/")
+            session.hls?.serve(subpath: subpath, connection: self)
+            return
+        }
+
+        guard parts.count == 3, parts[2] == "file" else {
+            respondNow(status: 404, headers: [("Content-Length", "0")], body: nil)
+            return
+        }
 
         if request.method == "HEAD" {
             handleHead(session)
@@ -2400,6 +2504,15 @@ final class ProxyConnection {
     }
 
     private func handleHead(_ session: ProxySession) {
+        // The byte-model HEAD makes no promise mpv can use on a playlist.
+        if session.kind == .hls {
+            respondNow(status: 200, headers: [("Content-Type", "application/vnd.apple.mpegurl"), ("Content-Length", "0"), ("Connection", "close")], body: nil)
+            return
+        }
+        if session.kind == .passThrough {
+            respondNow(status: 404, headers: [("Content-Length", "0")], body: nil)
+            return
+        }
         if let total = session.totalSize {
             respondNow(status: 200, headers: headHeaders(session: session, total: total), body: nil)
             return
@@ -2423,7 +2536,9 @@ final class ProxyConnection {
         ]
     }
 
-    private func respondNow(status: Int, headers: [(String, String)], body: Data?) {
+    /// Samin: also used by the HLS segment layer to answer waiter connections
+    /// with a complete one-shot response (no byte pump involved).
+    fileprivate func respondNow(status: Int, headers: [(String, String)], body: Data?) {
         var text = "HTTP/1.1 \(status) \(ProxyConnection.reason(status))\r\n"
         headers.forEach { text += "\($0): \($1)\r\n" }
         text += "\r\n"
@@ -2527,6 +2642,731 @@ enum ProxyConnectionTotal {
         let total = v[v.index(after: slash)...].trimmingCharacters(in: .whitespaces)
         guard total != "*" else { return nil }
         return Int64(total).flatMap { $0 > 0 ? $0 : nil }
+    }
+}
+
+/// Samin: what a proxy session serves.
+enum ProxySessionKind {
+    /// One seekable upstream file: 2 MB chunk disk cache (the original design).
+    case progressive
+    /// HLS playlist: segment-level disk cache with playlist rewriting.
+    case hls
+    /// Known-unsupported (e.g. DASH .mpd): endpoints respond 404 and playback
+    /// is expected to use the direct URL instead.
+    case passThrough
+}
+
+// MARK: - Samin HLS playlist model
+//
+// Dependency-free playlist parsing (no AVFoundation): handles media and
+// master playlists, AES-128/SAMPLE-AES keys, EXT-X-MAP init sections and
+// discontinuities. Everything the segment cache cannot faithfully rewrite
+// (BYTERANGE addressing, live windows, unknown structure) is reported as
+// unsupported so playback falls back to a redirect to the upstream playlist.
+
+struct HLSMediaSegment {
+    let url: URL
+    let start: Double
+    let duration: Double
+    let disco: Int
+}
+
+struct HLSKey {
+    let uri: URL
+    let iv: String?
+}
+
+struct HLSPlaylist {
+    let segments: [HLSMediaSegment]
+    let keys: [Int: HLSKey]
+    let maps: [Int: HLSKey]
+    let totalDuration: Double
+}
+
+enum HLSPlaylistParser {
+    static let maxSupportedVersion = 7
+
+    enum ParseOutcome {
+        case media(HLSPlaylist)
+        case master(URL)
+        case unsupported(String)
+    }
+
+    static func parse(_ text: String, base: URL) -> ParseOutcome {
+        if text.contains("#EXT-X-BYTERANGE") {
+            return .unsupported("EXT-X-BYTERANGE addressing")
+        }
+        var reader = LineScanner(text: text)
+        var variants: [(uri: URL, bandwidth: Double)] = []
+        var segments: [HLSMediaSegment] = []
+        var keys: [Int: HLSKey] = [:]
+        var maps: [Int: HLSKey] = [:]
+        var activeKey: HLSKey?
+        var activeMap: HLSKey?
+        var pendingDuration: Double?
+        var pendingDisco = 0
+        var disco = 0
+        var timeline = 0.0
+        var sawHeader = false
+        var sawEndlist = false
+
+        while let raw = reader.next() {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty { continue }
+            if line.hasPrefix("#") {
+                if line.hasPrefix("#EXTM3U") {
+                    sawHeader = true
+                } else if line.hasPrefix("#EXT-X-ENDLIST") {
+                    sawEndlist = true
+                } else if line.hasPrefix("#EXT-X-VERSION:") {
+                    let value = line.dropFirst("#EXT-X-VERSION:".count).trimmingCharacters(in: .whitespaces)
+                    if let v = Int(value), v > maxSupportedVersion {
+                        return .unsupported("protocol version \(v)")
+                    }
+                } else if line.hasPrefix("#EXT-X-STREAM-INF:") {
+                    let bandwidth = attribute(line, "BANDWIDTH").flatMap(Double.init) ?? 0
+                    var uriLine = reader.next()
+                    while let candidate = uriLine,
+                          candidate.hasPrefix("#") || candidate.trimmingCharacters(in: .whitespaces).isEmpty {
+                        uriLine = reader.next()
+                    }
+                    guard let variantLine = uriLine,
+                          let uri = URL(string: variantLine.trimmingCharacters(in: .whitespaces), relativeTo: base) else {
+                        return .unsupported("malformed master playlist")
+                    }
+                    variants.append((uri, bandwidth))
+                } else if line.hasPrefix("#EXTINF:") {
+                    let value = line.dropFirst("#EXTINF:".count)
+                    let head = value.split(separator: ",", maxSplits: 1).first ?? Substring("")
+                    guard let seconds = Double(head.trimmingCharacters(in: .whitespaces)), seconds > 0 else {
+                        return .unsupported("EXTINF without a duration")
+                    }
+                    pendingDuration = seconds
+                } else if line == "#EXT-X-DISCONTINUITY" {
+                    pendingDisco = disco
+                    disco += 1
+                } else if line.hasPrefix("#EXT-X-KEY:") {
+                    let method = attribute(line, "METHOD")?.uppercased()
+                    if method == "NONE" {
+                        activeKey = nil
+                    } else if method == "AES-128" || method == "SAMPLE-AES" {
+                        guard let uriString = attribute(line, "URI"),
+                              let uri = URL(string: uriString, relativeTo: base) else {
+                            return .unsupported("EXT-X-KEY without a URI")
+                        }
+                        activeKey = HLSKey(uri: uri, iv: attribute(line, "IV"))
+                    } else if method != nil {
+                        return .unsupported("EXT-X-KEY method \(method ?? "?")")
+                    }
+                } else if line.hasPrefix("#EXT-X-MAP:") {
+                    guard attribute(line, "BYTERANGE") == nil,
+                          let uriString = attribute(line, "URI"),
+                          let uri = URL(string: uriString, relativeTo: base) else {
+                        return .unsupported("EXT-X-MAP with BYTERANGE or no URI")
+                    }
+                    activeMap = HLSKey(uri: uri, iv: attribute(line, "IV"))
+                }
+                continue
+            }
+            // A plain URI line: the pending segment when one is open.
+            if let duration = pendingDuration, let url = URL(string: line, relativeTo: base) {
+                let index = segments.count
+                segments.append(HLSMediaSegment(url: url, start: timeline, duration: duration, disco: pendingDisco))
+                if let key = activeKey { keys[index] = key }
+                if let map = activeMap { maps[index] = map }
+                timeline += duration
+            }
+            pendingDuration = nil
+            pendingDisco = 0
+        }
+
+        if !variants.isEmpty {
+            let best = variants.max { $0.bandwidth < $1.bandwidth } ?? variants[0]
+            return .master(best.uri)
+        }
+        guard sawHeader, sawEndlist, !segments.isEmpty else {
+            if sawHeader && !sawEndlist {
+                return .unsupported("live playlist (no EXT-X-ENDLIST)")
+            }
+            return .unsupported("no recognizable segments")
+        }
+        return .media(HLSPlaylist(segments: segments, keys: keys, maps: maps, totalDuration: timeline))
+    }
+
+    static func attribute(_ line: String, _ name: String) -> String? {
+        guard let range = line.range(of: "\(name)=", options: .caseInsensitive) else { return nil }
+        var value = String(line[range.upperBound...])
+        if value.hasPrefix("\"") {
+            guard let end = value.dropFirst().firstIndex(of: "\"") else { return nil }
+            value = String(value[value.index(after: value.startIndex)..<end])
+        } else {
+            value = String(value.prefix { $0 != "," })
+        }
+        let trimmed = value.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+struct LineScanner {
+    private var lines: [Substring]
+    private var index = 0
+
+    init(text: String) {
+        lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+    }
+
+    mutating func next() -> String? {
+        guard index < lines.count else { return nil }
+        defer { index += 1 }
+        var line = String(lines[index])
+        while line.hasSuffix("\r") { line.removeLast() }
+        return line
+    }
+}
+
+// MARK: - Samin HLS segment cache engine
+
+/// Per-session state for HLS (.m3u8) streams: fetches and parses the media
+/// playlist, rewrites every segment/key/init URI to a loopback path backed by
+/// the on-disk segment cache, prefetches segments ahead of the playhead, and
+/// reports cached timeline spans in the same JSON shapes the progressive cache
+/// uses (so the grey bar, badge and diagnostics work unchanged). Playlists it
+/// cannot cache are answered with a redirect to the upstream playlist, which
+/// keeps playback working exactly as before this layer existed.
+final class HLSStreamState {
+    private unowned let session: ProxySession
+
+    private struct SegmentRef {
+        let index: Int
+        let url: URL
+        let start: Double
+        let duration: Double
+        let disco: Int
+    }
+
+    // All state below is confined to session.server.queue.
+    private var upstreamHeaders: [String: String]
+    private var upstreamPlaylistUrl: URL?
+    private var segments: [SegmentRef] = []
+    private var keysBySegment: [Int: HLSKey] = [:]
+    private var mapsBySegment: [Int: HLSKey] = [:]
+    private var totalDuration: Double = 0
+    private var cachedSegments: Set<Int> = []
+    private var cachedBytesTotal: Int64 = 0
+    private var activeFetches: [Int: String] = [:]
+    private var segmentWaiters: [Int: [ProxyConnection]] = [:]
+    private var smallWaiters: [(name: String, isMap: Bool, connection: ProxyConnection)] = []
+    private var inFlightSmall: Set<String> = []
+    private var playlistWaiters: [ProxyConnection] = []
+    private var inFlightPlaylistFetch = false
+    private var playlistFetchedOnce = false
+    private var playheadSeconds: Double = 0
+    private var passthroughReason: String?
+    private var evictedSegments = 0
+    private var lastPlaylistStatus: Int?
+    private var lastPlaylistError: String?
+    private var bestVariantUrl: URL?
+    private var speedBytesAccumulator: Int64 = 0
+    private var lastSpeedUpdateUptime: TimeInterval = saminNow()
+    private var currentSpeedBps: Int64 = 0
+    private var segmentWatchdog: DispatchSourceTimer?
+
+    init(session: ProxySession) {
+        self.session = session
+        self.upstreamHeaders = session.headers
+        self.upstreamPlaylistUrl = URL(string: session.sourceUrl)
+        LocalCacheProxyLog.shared.log("HLS [\(session.key)]: segment-cache session created for \(URL(string: session.sourceUrl)?.host ?? "?")")
+        ensurePlaylist()
+    }
+
+    func shutdown() {
+        segmentWatchdog?.cancel()
+        segmentWatchdog = nil
+    }
+
+    /// New upstream for the same session key (debrid re-resolve). Runs on the
+    /// server queue; also gives a previously-unsupported playlist one more
+    /// chance with the new URL before falling back to the redirect.
+    func setUpstream(_ sourceUrl: String, _ headers: [String: String]) {
+        session.server.queue.async { [weak self] in
+            guard let self, self.session.valid else { return }
+            self.upstreamHeaders = headers
+            self.upstreamPlaylistUrl = URL(string: sourceUrl)
+            self.playlistFetchedOnce = false
+            self.bestVariantUrl = nil
+            self.passthroughReason = nil
+            self.ensurePlaylist(force: true)
+        }
+    }
+
+    // MARK: Serving
+
+    /// Entry point for every rewritten loopback request
+    /// (/s/<key>/playlist.m3u8, /s/<key>/seg/<i>, /s/<key>/key/<i>,
+    /// /s/<key>/map/<i>). Always called on the server queue.
+    func serve(subpath: String, connection: ProxyConnection) {
+        session.server.queue.async { [weak self] in
+            guard let self, self.session.valid else {
+                connection.respondNow(status: 404, headers: [("Content-Length", "0")], body: nil)
+                return
+            }
+            let parts = subpath.split(separator: "/").map(String.init)
+            let first = parts.first ?? ""
+            if first == "playlist" || first.hasPrefix("playlist.") {
+                self.requestPlaylist(connection: connection)
+            } else if first == "seg", parts.count == 2, let index = Int(parts[1]) {
+                self.serveSegment(index: index, connection: connection)
+            } else if first == "key", parts.count == 2, let index = Int(parts[1]) {
+                self.serveKeyOrMap(index: index, isMap: false, connection: connection)
+            } else if first == "map", parts.count == 2, let index = Int(parts[1]) {
+                self.serveKeyOrMap(index: index, isMap: true, connection: connection)
+            } else {
+                connection.respondNow(status: 404, headers: [("Content-Length", "0")], body: nil)
+            }
+        }
+    }
+
+    private func requestPlaylist(connection: ProxyConnection) {
+        if let reason = passthroughReason, let upstream = upstreamPlaylistUrl {
+            LocalCacheProxyLog.shared.log("HLS [\(session.key)]: redirecting player to upstream playlist (segment cache inactive: \(reason))")
+            connection.respondNow(status: 302, headers: [("Location", upstream.absoluteString), ("Content-Length", "0")], body: nil)
+            return
+        }
+        if segments.isEmpty && passthroughReason == nil {
+            // First request can beat the initial playlist fetch; park until it
+            // resolves instead of failing the load.
+            playlistWaiters.append(connection)
+            ensurePlaylist { [weak self] in self?.flushPlaylistWaiters() }
+            return
+        }
+        ensurePlaylist { [weak self] in self?.servePlaylist(connection: connection) }
+    }
+
+    private func flushPlaylistWaiters() {
+        let waiters = playlistWaiters
+        playlistWaiters.removeAll()
+        for connection in waiters {
+            servePlaylist(connection: connection)
+        }
+    }
+
+    private func servePlaylist(connection: ProxyConnection) {
+        if passthroughReason != nil {
+            if let upstream = upstreamPlaylistUrl {
+                connection.respondNow(status: 302, headers: [("Location", upstream.absoluteString), ("Content-Length", "0")], body: nil)
+            } else {
+                connection.respondNow(status: 404, headers: [("Content-Length", "0")], body: nil)
+            }
+            return
+        }
+        guard !segments.isEmpty else {
+            connection.respondNow(status: 404, headers: [("Content-Length", "0")], body: nil)
+            return
+        }
+        let port = session.server.port
+        var text = "#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-PLAYLIST-TYPE:VOD\n"
+        for seg in segments {
+            let eraStart = seg.index == 0 || segments[seg.index - 1].disco != seg.disco
+            if eraStart && seg.disco > 0 {
+                text += "#EXT-X-DISCONTINUITY\n"
+            }
+            if let key = keysBySegment[seg.index] {
+                text += "#EXT-X-KEY:METHOD=AES-128,URI=\"http://127.0.0.1:\(port)/s/\(session.key)/key/\(seg.index)\""
+                if let iv = key.iv { text += ",IV=\(iv)" }
+                text += "\n"
+            } else {
+                text += "#EXT-X-KEY:METHOD=NONE\n"
+            }
+            if let map = mapsBySegment[seg.index] {
+                text += "#EXT-X-MAP:URI=\"http://127.0.0.1:\(port)/s/\(session.key)/map/\(seg.index)\"\n"
+            }
+            text += "#EXTINF:\(String(format: "%.3f", seg.duration)),\n"
+            text += "http://127.0.0.1:\(port)/s/\(session.key)/seg/\(seg.index)\n"
+        }
+        connection.respondNow(
+            status: 200,
+            headers: [
+                ("Content-Type", "application/vnd.apple.mpegurl"),
+                ("Content-Length", "\(text.utf8.count)"),
+                ("Cache-Control", "no-store"),
+                ("Connection", "close"),
+            ],
+            body: Data(text.utf8)
+        )
+        LocalCacheProxyLog.shared.log("HLS [\(session.key)]: served rewritten playlist (\(segments.count) segments, \(String(format: "%.0f", totalDuration))s)")
+    }
+
+    private func serveSegment(index: Int, connection: ProxyConnection) {
+        guard index >= 0, index < segments.count else {
+            connection.respondNow(status: 404, headers: [("Content-Length", "0")], body: nil)
+            return
+        }
+        if cachedSegments.contains(index) {
+            serveSegmentFromDisk(index: index, connection: connection)
+            return
+        }
+        if passthroughReason != nil {
+            connection.respondNow(status: 404, headers: [("Content-Length", "0")], body: nil)
+            return
+        }
+        // Park the connection; the fetch (or the watchdog) resolves it.
+        segmentWaiters[index, default: []].append(connection)
+        scheduleSegmentWatchdogIfNeeded()
+        let behind = index - currentSegmentIndex()
+        ensureSegmentFetch(index: index, reason: behind <= 0 ? "playback" : "prefetch+\(behind)")
+    }
+
+    private func serveSegmentFromDisk(index: Int, connection: ProxyConnection) {
+        let url = session.dir.appendingPathComponent("seg_\(index).bin")
+        guard let data = try? Data(contentsOf: url), !data.isEmpty else {
+            cachedSegments.remove(index)
+            connection.respondNow(status: 404, headers: [("Content-Length", "0")], body: nil)
+            return
+        }
+        connection.respondNow(
+            status: 200,
+            headers: [
+                ("Content-Type", "application/octet-stream"),
+                ("Content-Length", "\(data.count)"),
+                ("Connection", "close"),
+            ],
+            body: data
+        )
+    }
+
+    // MARK: Fetches
+
+    private func ensureSegmentFetch(index: Int, reason: String) {
+        guard passthroughReason == nil else { return }
+        guard index >= 0, index < segments.count else { return }
+        if cachedSegments.contains(index) { return }
+        if activeFetches[index] != nil { return }
+        guard activeFetches.count < saminHlsSegmentFetchers else { return }
+        activeFetches[index] = reason
+        let seg = segments[index]
+        let request = Self.makeRequest(url: seg.url, headers: upstreamHeaders)
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let payload = (error == nil && status == 200) ? data : nil
+            self?.session.server.queue.async { [weak self] in
+                guard let self, self.session.valid else { return }
+                self.activeFetches.removeValue(forKey: index)
+                if let payload, !payload.isEmpty {
+                    do {
+                        try payload.write(to: self.session.dir.appendingPathComponent("seg_\(index).bin"), options: .atomic)
+                        self.cachedSegments.insert(index)
+                        self.cachedBytesTotal += Int64(payload.count)
+                        self.recordBytes(Int64(payload.count))
+                        self.resolveSegmentWaiters(index: index, success: true)
+                        self.prefetchAhead()
+                    } catch {
+                        LocalCacheProxyLog.shared.log("HLS [\(self.session.key)]: segment \(index) write failed: \(error.localizedDescription)")
+                        self.resolveSegmentWaiters(index: index, success: false)
+                    }
+                } else {
+                    LocalCacheProxyLog.shared.log("HLS [\(self.session.key)]: segment \(index) fetch failed (HTTP \(status)) \(error?.localizedDescription ?? "")")
+                    self.resolveSegmentWaiters(index: index, success: false)
+                }
+            }
+        }.resume()
+        LocalCacheProxyLog.shared.log("HLS [\(session.key)]: fetching segment \(index) (\(reason), pool=\(activeFetches.count))")
+    }
+
+    private func resolveSegmentWaiters(index: Int, success: Bool) {
+        let waiters = segmentWaiters.removeValue(forKey: index) ?? []
+        for connection in waiters {
+            if success {
+                serveSegmentFromDisk(index: index, connection: connection)
+            } else {
+                connection.respondNow(status: 502, headers: [("Content-Length", "0")], body: nil)
+            }
+        }
+    }
+
+    /// Re-kicks fetches for parked connections so a transient failure or a
+    /// fetch that died while suspended cannot strand playback.
+    private func scheduleSegmentWatchdogIfNeeded() {
+        guard segmentWatchdog == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: session.server.queue)
+        timer.schedule(deadline: .now() + 3.0, repeating: 3.0)
+        timer.setEventHandler { [weak self] in
+            guard let self, self.session.valid else { return }
+            for index in self.segmentWaiters.keys.sorted() where !(self.segmentWaiters[index]?.isEmpty ?? true) {
+                if self.cachedSegments.contains(index) {
+                    self.resolveSegmentWaiters(index: index, success: true)
+                } else if self.activeFetches[index] == nil, self.passthroughReason == nil {
+                    self.ensureSegmentFetch(index: index, reason: "waiter retry")
+                }
+            }
+        }
+        timer.resume()
+        segmentWatchdog = timer
+    }
+
+    private func serveKeyOrMap(index: Int, isMap: Bool, connection: ProxyConnection) {
+        guard let upstream = isMap ? mapsBySegment[index]?.uri : keysBySegment[index]?.uri else {
+            connection.respondNow(status: 404, headers: [("Content-Length", "0")], body: nil)
+            return
+        }
+        let name = isMap ? "map_\(index).bin" : "key_\(index).bin"
+        let fileUrl = session.dir.appendingPathComponent(name)
+        if let data = try? Data(contentsOf: fileUrl), !data.isEmpty {
+            connection.respondNow(status: 200, headers: [("Content-Type", isMap ? "video/mp4" : "application/octet-stream"), ("Content-Length", "\(data.count)"), ("Connection", "close")], body: data)
+            return
+        }
+        smallWaiters.append((name, isMap, connection))
+        ensureSmallResource(name: name, upstream: upstream, isMap: isMap)
+    }
+
+    private func ensureSmallResource(name: String, upstream: URL, isMap: Bool) {
+        guard !inFlightSmall.contains(name) else { return }
+        inFlightSmall.insert(name)
+        let request = Self.makeRequest(url: upstream, headers: upstreamHeaders)
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let payload = (error == nil && status == 200) ? data : nil
+            self?.session.server.queue.async { [weak self] in
+                guard let self, self.session.valid else { return }
+                self.inFlightSmall.remove(name)
+                let waiters = self.smallWaiters.filter { $0.name == name }
+                self.smallWaiters.removeAll { $0.name == name }
+                if let payload, !payload.isEmpty {
+                    try? payload.write(to: self.session.dir.appendingPathComponent(name), options: .atomic)
+                    self.cachedBytesTotal += Int64(payload.count)
+                    self.recordBytes(Int64(payload.count))
+                    for waiter in waiters {
+                        waiter.connection.respondNow(status: 200, headers: [("Content-Type", isMap ? "video/mp4" : "application/octet-stream"), ("Content-Length", "\(payload.count)"), ("Connection", "close")], body: payload)
+                    }
+                    LocalCacheProxyLog.shared.log("HLS [\(self.session.key)]: cached \(isMap ? "map" : "key") \(name) (\(payload.count) B, waiters=\(waiters.count))")
+                } else {
+                    LocalCacheProxyLog.shared.log("HLS [\(self.session.key)]: \(isMap ? "map" : "key") \(name) fetch failed (HTTP \(status)) \(error?.localizedDescription ?? "")")
+                    for waiter in waiters {
+                        waiter.connection.respondNow(status: 502, headers: [("Content-Length", "0")], body: nil)
+                    }
+                }
+            }
+        }.resume()
+    }
+
+    // MARK: Playlist fetch / parse
+
+    private func ensurePlaylist(force: Bool = false, completion: (() -> Void)? = nil) {
+        if passthroughReason != nil {
+            completion?()
+            return
+        }
+        if !force && playlistFetchedOnce {
+            completion?()
+            return
+        }
+        if inFlightPlaylistFetch {
+            completion?()
+            return
+        }
+        guard let base = upstreamPlaylistUrl else {
+            completion?()
+            return
+        }
+        inFlightPlaylistFetch = true
+        var request = Self.makeRequest(url: base, headers: upstreamHeaders)
+        request.timeoutInterval = 30
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let payload = (error == nil && status == 200) ? data : nil
+            let errText = error?.localizedDescription
+            self?.session.server.queue.async { [weak self] in
+                guard let self, self.session.valid else { return }
+                self.inFlightPlaylistFetch = false
+                self.playlistFetchedOnce = true
+                self.lastPlaylistStatus = status
+                self.lastPlaylistError = errText
+                guard let payload, !payload.isEmpty, payload.count <= saminHlsMaxPlaylistBytes else {
+                    // A failed playlist fetch would park playback on /playlist
+                    // forever. Degrade like an unsupported playlist instead:
+                    // waiters get a 302 to the upstream playlist, which is
+                    // exactly pre-feature behavior (mpv still buffers via its
+                    // own demuxer cache on the direct URL).
+                    LocalCacheProxyLog.shared.log("HLS [\(self.session.key)]: playlist fetch failed (HTTP \(status)); falling back to upstream redirect \(errText ?? "")")
+                    self.enterPassthrough("playlist fetch failed (HTTP \(status))")
+                    completion?()
+                    return
+                }
+                self.applyPlaylistData(payload, base: base)
+                completion?()
+            }
+        }.resume()
+    }
+
+    private func applyPlaylistData(_ data: Data, base: URL) {
+        guard let text = String(data: data, encoding: .utf8) else {
+            enterPassthrough("playlist is not UTF-8 text")
+            return
+        }
+        switch HLSPlaylistParser.parse(text, base: base) {
+        case .media(let playlist):
+            var refs: [SegmentRef] = []
+            refs.reserveCapacity(playlist.segments.count)
+            for (i, seg) in playlist.segments.enumerated() {
+                refs.append(SegmentRef(index: i, url: seg.url, start: seg.start, duration: seg.duration, disco: seg.disco))
+            }
+            segments = refs
+            keysBySegment = playlist.keys
+            mapsBySegment = playlist.maps
+            totalDuration = playlist.totalDuration
+            cachedSegments = cachedSegments.intersection(Set(refs.indices))
+            LocalCacheProxyLog.shared.log("HLS [\(session.key)]: parsed media playlist (\(refs.count) segments, \(String(format: "%.0f", totalDuration))s, keys=\(playlist.keys.count), maps=\(playlist.maps.count))")
+            prefetchAhead()
+        case .master(let variantUrl):
+            guard bestVariantUrl != variantUrl else {
+                enterPassthrough("master playlist does not lead to a media playlist")
+                return
+            }
+            bestVariantUrl = variantUrl
+            upstreamPlaylistUrl = variantUrl
+            LocalCacheProxyLog.shared.log("HLS [\(session.key)]: master playlist -> chasing variant \(variantUrl.lastPathComponent)")
+            ensurePlaylist(force: true)
+        case .unsupported(let why):
+            enterPassthrough(why)
+        }
+    }
+
+    private func enterPassthrough(_ why: String) {
+        guard passthroughReason == nil else { return }
+        passthroughReason = why
+        segments = []
+        keysBySegment = [:]
+        mapsBySegment = [:]
+        LocalCacheProxyLog.shared.log("HLS [\(session.key)]: segment cache inactive (\(why)) - playlist requests redirect to upstream")
+        flushPlaylistWaiters()
+    }
+
+    // MARK: Playhead + prefetch
+
+    func playheadUpdated() {
+        guard passthroughReason == nil, !segments.isEmpty, totalDuration > 0 else { return }
+        guard let (posMs, durMs) = session.playheadMs, durMs > 0 else { return }
+        let fraction = min(1.0, max(0.0, Double(posMs) / Double(durMs)))
+        playheadSeconds = fraction * totalDuration
+        prefetchAhead()
+    }
+
+    private func currentSegmentIndex() -> Int {
+        guard !segments.isEmpty else { return 0 }
+        for seg in segments where playheadSeconds < seg.start + seg.duration {
+            return seg.index
+        }
+        return segments[segments.count - 1].index
+    }
+
+    private func prefetchAhead() {
+        guard passthroughReason == nil, !segments.isEmpty else { return }
+        let current = currentSegmentIndex()
+        evictWatchedIfNeeded(current: current)
+        let last = min(segments.count - 1, current + saminHlsPrefetchSegments)
+        for index in current...last {
+            ensureSegmentFetch(index: index, reason: index == current ? "playhead" : "prefetch+\(index - current)")
+        }
+    }
+
+    /// Only watched segments well behind the playhead are evicted, and only
+    /// under the same low-space threshold the progressive cache uses.
+    private func evictWatchedIfNeeded(current: Int) {
+        guard session.server.freeSpaceBytes() < saminProxyLowSpaceBytes else { return }
+        let keepBehind = 6
+        for seg in segments where seg.index < current - keepBehind {
+            guard cachedSegments.contains(seg.index) else { continue }
+            let url = session.dir.appendingPathComponent("seg_\(seg.index).bin")
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+               let size = (attrs[.size] as? NSNumber)?.int64Value {
+                cachedBytesTotal = max(0, cachedBytesTotal - size)
+            }
+            try? FileManager.default.removeItem(at: url)
+            cachedSegments.remove(seg.index)
+            evictedSegments += 1
+        }
+    }
+
+    // MARK: Reporting
+
+    func cachedTimeRangesJson() -> String {
+        guard passthroughReason == nil, !segments.isEmpty, totalDuration > 0 else { return "[]" }
+        var spans: [(Double, Double)] = []
+        for seg in segments where cachedSegments.contains(seg.index) {
+            let s = min(1.0, max(0.0, seg.start / totalDuration))
+            let e = min(1.0, max(0.0, (seg.start + seg.duration) / totalDuration))
+            if e > s { spans.append((s, e)) }
+        }
+        guard !spans.isEmpty else { return "[]" }
+        spans.sort { $0.0 < $1.0 }
+        var merged: [(Double, Double)] = []
+        for span in spans {
+            if let last = merged.last, last.1 >= span.0 - 0.0005 {
+                merged[merged.count - 1] = (last.0, max(last.1, span.1))
+            } else {
+                merged.append(span)
+            }
+        }
+        let parts = merged.prefix(32).map { "[\($0.0),\($0.1)]" }
+        return "[\(parts.joined(separator: ","))]"
+    }
+
+    func statsJson() -> String {
+        let total = segments.count
+        let cached = cachedSegments.count
+        let complete = passthroughReason == nil && total > 0 && cached >= total
+        let ranges = cachedTimeRangesJson()
+        return "{\"speedBps\":\(currentSpeedBps),\"cachedBytes\":\(cachedBytesTotal),\"totalBytes\":0,\"isComplete\":\(complete),\"ranges\":\(ranges)}"
+    }
+
+    func diagnosticLines() -> [String] {
+        var lines: [String] = []
+        let host = upstreamPlaylistUrl?.host ?? "unknown"
+        let status = lastPlaylistStatus.map(String.init) ?? "none"
+        lines.append("HLS playlist: \(host) (HTTP \(status))\(lastPlaylistError.map { " \($0)" } ?? "")")
+        if let reason = passthroughReason {
+            lines.append("HLS caching INACTIVE - pass-through redirect: \(reason)")
+            return lines
+        }
+        lines.append("HLS segments: \(cachedSegments.count)/\(segments.count) cached, \(String(format: "%.0f", totalDuration))s total, \(cachedBytesTotal / 1024 / 1024) MB on disk, evicted=\(evictedSegments)")
+        if !activeFetches.isEmpty {
+            let keys = activeFetches.keys.sorted().map(String.init).joined(separator: ",")
+            lines.append("HLS fetches in flight: \(activeFetches.count) (segments \(keys))")
+        } else {
+            lines.append("HLS fetches in flight: 0")
+        }
+        let parkedCount = segmentWaiters.values.reduce(0) { $0 + $1.count }
+        lines.append("HLS playhead: segment \(currentSegmentIndex()) (\(String(format: "%.0f", playheadSeconds))s), parked: segments=\(parkedCount), playlist=\(playlistWaiters.count), small=\(smallWaiters.count)")
+        if let variant = bestVariantUrl {
+            lines.append("HLS master variant: \(variant.lastPathComponent)")
+        }
+        return lines
+    }
+
+    // MARK: Helpers
+
+    private func recordBytes(_ count: Int64) {
+        let now = saminNow()
+        speedBytesAccumulator += count
+        let elapsed = now - lastSpeedUpdateUptime
+        if elapsed >= 0.5 {
+            currentSpeedBps = Int64(Double(speedBytesAccumulator) / elapsed)
+            speedBytesAccumulator = 0
+            lastSpeedUpdateUptime = now
+        }
+    }
+
+    private static func makeRequest(url: URL, headers: [String: String]) -> URLRequest {
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 60)
+        request.httpMethod = "GET"
+        headers.forEach { request.setValue($1, forHTTPHeaderField: $0) }
+        if request.value(forHTTPHeaderField: "User-Agent") == nil {
+            request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
+        }
+        if request.value(forHTTPHeaderField: "Accept") == nil {
+            request.setValue("*/*", forHTTPHeaderField: "Accept")
+        }
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        return request
     }
 }
 
