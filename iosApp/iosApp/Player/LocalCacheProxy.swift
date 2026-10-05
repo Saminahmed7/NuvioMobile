@@ -2965,25 +2965,42 @@ final class HLSStreamState {
             return
         }
         let port = session.server.port
+        let maxDuration = segments.map { $0.duration }.max() ?? 0.0
         var text = "#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-PLAYLIST-TYPE:VOD\n"
+        text += "#EXT-X-TARGETDURATION:\(Int(ceil(maxDuration)))\n"
+        text += "#EXT-X-MEDIA-SEQUENCE:0\n"
+        var emittedMap = false
+        var emittedKey = false
+        var lastKeyUri: String? = nil
         for seg in segments {
             let eraStart = seg.index == 0 || segments[seg.index - 1].disco != seg.disco
             if eraStart && seg.disco > 0 {
                 text += "#EXT-X-DISCONTINUITY\n"
+                emittedMap = false
+                emittedKey = false
+                lastKeyUri = nil
             }
-            if let key = keysBySegment[seg.index] {
-                text += "#EXT-X-KEY:METHOD=AES-128,URI=\"http://127.0.0.1:\(port)/s/\(session.key)/key/\(seg.index)\""
-                if let iv = key.iv { text += ",IV=\(iv)" }
-                text += "\n"
-            } else {
-                text += "#EXT-X-KEY:METHOD=NONE\n"
+            let currentKey = keysBySegment[seg.index]
+            let currentKeyUri = currentKey?.uri.absoluteString
+            if !emittedKey || currentKeyUri != lastKeyUri {
+                if let key = currentKey {
+                    text += "#EXT-X-KEY:METHOD=AES-128,URI=\"http://127.0.0.1:\(port)/s/\(session.key)/key/\(seg.index)\""
+                    if let iv = key.iv { text += ",IV=\(iv)" }
+                    text += "\n"
+                } else {
+                    text += "#EXT-X-KEY:METHOD=NONE\n"
+                }
+                emittedKey = true
+                lastKeyUri = currentKeyUri
             }
-            if let map = mapsBySegment[seg.index] {
+            if let _ = mapsBySegment[seg.index], !emittedMap {
                 text += "#EXT-X-MAP:URI=\"http://127.0.0.1:\(port)/s/\(session.key)/map/\(seg.index)\"\n"
+                emittedMap = true
             }
             text += "#EXTINF:\(String(format: "%.3f", seg.duration)),\n"
             text += "http://127.0.0.1:\(port)/s/\(session.key)/seg/\(seg.index)\n"
         }
+        text += "#EXT-X-ENDLIST\n"
         connection.respondNow(
             status: 200,
             headers: [
