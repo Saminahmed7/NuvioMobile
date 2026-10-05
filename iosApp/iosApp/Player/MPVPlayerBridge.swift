@@ -524,6 +524,7 @@ final class MPVPlayerViewController: UIViewController {
         checkError(mpv_set_option_string(mpv, "demuxer-max-bytes", "67108864"))
         checkError(mpv_set_option_string(mpv, "demuxer-readahead-secs", "30"))
         checkError(mpv_set_option_string(mpv, "cache", "yes"))
+        checkError(mpv_set_option_string(mpv, "network-timeout", "5"))
 
         checkError(mpv_initialize(mpv))
         applyAudioLanguagePreferences(preferredAudioLanguages)
