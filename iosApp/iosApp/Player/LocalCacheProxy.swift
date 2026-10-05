@@ -3192,15 +3192,15 @@ final class HLSStreamState {
                     completion?()
                     return
                 }
-                self.applyPlaylistData(payload, base: base)
-                completion?()
+                self.applyPlaylistData(payload, base: base, completion: completion)
             }
         }.resume()
     }
 
-    private func applyPlaylistData(_ data: Data, base: URL) {
+    private func applyPlaylistData(_ data: Data, base: URL, completion: (() -> Void)? = nil) {
         guard let text = String(data: data, encoding: .utf8) else {
             enterPassthrough("playlist is not UTF-8 text")
+            completion?()
             return
         }
         switch HLSPlaylistParser.parse(text, base: base) {
@@ -3217,17 +3217,24 @@ final class HLSStreamState {
             cachedSegments = cachedSegments.intersection(Set(refs.indices))
             LocalCacheProxyLog.shared.log("HLS [\(session.key)]: parsed media playlist (\(refs.count) segments, \(String(format: "%.0f", totalDuration))s, keys=\(playlist.keys.count), maps=\(playlist.maps.count))")
             prefetchAhead()
+            completion?()
         case .master(let variantUrl):
             guard bestVariantUrl != variantUrl else {
                 enterPassthrough("master playlist does not lead to a media playlist")
+                completion?()
                 return
             }
             bestVariantUrl = variantUrl
             upstreamPlaylistUrl = variantUrl
             LocalCacheProxyLog.shared.log("HLS [\(session.key)]: master playlist -> chasing variant \(variantUrl.lastPathComponent)")
-            ensurePlaylist(force: true)
+            // Defer the completion until the chased variant resolves. Flushing parked
+            // /playlist waiters here (while segments is still empty for a master) would
+            // hit servePlaylist's empty-segments guard and return an empty 404, which mpv
+            // reports as "Failed to open .../playlist".
+            ensurePlaylist(force: true, completion: completion)
         case .unsupported(let why):
             enterPassthrough(why)
+            completion?()
         }
     }
 
