@@ -806,6 +806,7 @@ final class ProxySession {
         if kind != .hls && kind != .passThrough {
             probeTotalSizeIfNeeded()
         }
+    }
 
     func claimChunkWrite(chunkIndex: Int64, owner: String) -> Bool {
         if let currentOwner = activeChunkWriters[chunkIndex] {
