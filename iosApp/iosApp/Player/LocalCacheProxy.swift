@@ -1001,15 +1001,17 @@ final class ProxySession {
     /// pass-through is used.
     let kind: ProxySessionKind
     /// Samin: HLS segment cache state. nil for non-HLS sessions.
-    var hls: HLSStreamState?    var totalSize: Int64?    var contentType: String?    var playheadMs: (Int64, Int64)? {      didSet {        onPlayheadUpdated()      }    }    var playheadStreamPos: Int64?    /// Byte anchor the forward prefetcher should follow. The playhead bar is
-    /// drawn in time, but the cache only knows bytes; without an anchor the
-    /// forward write head starts at the seek/reconnect anchor and leaps ahead
-    /// of the live playhead, leaving the visible bar ahead of the cached
-    /// window and forcing one-off fetches instead of sequential streaming.
-    /// Updated on every playhead report and each time the prefetcher is
-    /// repositioned, so the cached window tracks the actual playback position
-    /// and the bar no longer leads the cached bytes.
-    var cacheAnchorByte: Int64 {      guard valid else { return 0 }      if let streamPos = playheadStreamPos, streamPos > 0 {        return streamPos      }      guard let (pos, dur) = playheadMs, dur > 0, let total = totalSize, total > 0 else {        return 0      }      return max(0, min(total, Int64((Double(pos) / Double(dur)) * Double(total))))    }    var valid = true
+    var hls: HLSStreamState?
+
+    var totalSize: Int64?
+    var contentType: String?
+    var playheadMs: (Int64, Int64)? {
+        didSet {
+            onPlayheadUpdated()
+        }
+    }
+    var playheadStreamPos: Int64?
+    var valid = true
     private(set) var cachedChunks: Set<Int64> = []
     var bytesWrittenByChunk: [Int64: Int64] = [:]
 
@@ -1188,14 +1190,21 @@ final class ProxySession {
 
     /// Adaptive lookahead window: for high-bitrate files (e.g. 4K remuxes),
     /// scale up from 32 MB to up to 128 MB (roughly 30s of buffer) so MPV's
-    /// natural sequential readahead doesn't trigger one-off chunk fetchers.    var aheadWindowBytes: Int64 {        if let total = totalSize, total > 0, let (_, dur) = playheadMs, dur > 10_000 {            let bytesPerSec = Double(total) / (Double(dur) / 1000.0)            let adaptive = Int64(bytesPerSec * 30.0)            return max(saminProxyAheadWindowBytes, min(128 * 1024 * 1024, adaptive))        }        return saminProxyAheadWindowBytes    }        func chunkURL(_ index: Int64) -> URL {      dir.appendingPathComponent("c\(index).bin")    }        /// Anchor the forward write head to where the player actually is. When
-    /// we are less than `aheadWindowBytes` ahead of the live cache window, use
-    /// the anchor (playhead byte position, time-mapped) instead of the stored
-    /// `streamOffset`, so the cached window does not sit behind the playhead
-    /// bar during a fresh stream / reconnect.
-    private func anchorForWindow() -> Int64 {      let total = totalSize ?? 0      let pos = max(0, min(total, cacheAnchorByte))      let avail = total > 0 ? min(cacheAnchorByte, bytesWrittenByChunk.values.max() ?? 0) : 0      // The window head advances with the anchor but never jumps past the
-      // written tail, so a fresh stream fills it sequentially instead of
-      // waiting for a one-off fetch at the far edge.      return max(0, min(pos, avail + saminProxyAheadWindowBytes))    }        func markCached(_ index: Int64) {
+    /// natural sequential readahead doesn't trigger one-off chunk fetchers.
+    var aheadWindowBytes: Int64 {
+        if let total = totalSize, total > 0, let (_, dur) = playheadMs, dur > 10_000 {
+            let bytesPerSec = Double(total) / (Double(dur) / 1000.0)
+            let adaptive = Int64(bytesPerSec * 30.0)
+            return max(saminProxyAheadWindowBytes, min(128 * 1024 * 1024, adaptive))
+        }
+        return saminProxyAheadWindowBytes
+    }
+
+    func chunkURL(_ index: Int64) -> URL {
+        dir.appendingPathComponent("c\(index).bin")
+    }
+
+    func markCached(_ index: Int64) {
         cachedChunks.insert(index)
         bytesWrittenByChunk.removeValue(forKey: index)
         notifyDataAvailable(chunkIndex: index)
@@ -1244,7 +1253,14 @@ final class ProxySession {
 
     /// Re-pumps any client parked on a chunk that is not the one just completed,
     /// so a freed fetch-pool slot (or a newly cached chunk) is picked up instead
-    /// of leaving the client waiting forever.    func nudgeWaitingClients() {        for conn in activeConnections.values where conn.isWaitingForData {            conn.onDataAvailable(chunkIndex: conn.waitingChunkIndex)        }    }        func bytesAvailable(for chunkIndex: Int64) -> Int64 {
+    /// of leaving the client waiting forever.
+    func nudgeWaitingClients() {
+        for conn in activeConnections.values where conn.isWaitingForData {
+            conn.onDataAvailable(chunkIndex: conn.waitingChunkIndex)
+        }
+    }
+
+    func bytesAvailable(for chunkIndex: Int64) -> Int64 {
         if cachedChunks.contains(chunkIndex) {
             if let total = totalSize {
                 let cStart = chunkIndex * saminProxyChunkBytes
@@ -1315,6 +1331,7 @@ final class ProxySession {
             LocalCacheProxyLog.shared.log("Session [\(key)]: Foreground wake, stream healthy (idle=\(String(format: "%.1f", idle))s); leaving it alone")
         }
     }
+
     /// Serves a client request for [startByte]. The forward prefetcher follows
     /// sequential reads and the live playhead; requests behind its write head,
     /// or far-ahead one-off probes, are handed to a dedicated range fetch.
@@ -1398,17 +1415,16 @@ final class ProxySession {
             startNewForwardDownloader(targetStartByte: chunkIdx * saminProxyChunkBytes, reason: "client request at \(startByte)")
         }
     }
-    
-    private func startNewForwardDownloader(targetStartByte: Int64, reason: String) {      lastForwardDownloaderStartTime = saminNow()      let fd = ForwardDownloader(session: self, startByte: targetStartByte)      self.forwardDownloader = fd
-      fd.start()
-      LocalCacheProxyLog.shared.log("Session [\(key)]: Started FD at \(targetStartByte) (\(reason))")
-    }
-    
-    /// Refresh the live anchor from the currently reported playhead. Called
-    /// from the Swift player bridge when the player reports a seek or a
-    /// position change that should be reflected immediately.
-    func refreshAnchor() {      // The anchor is derived live from playheadMs / playheadStreamPos on
-      // every access, so no state needs to change here.
+
+    private func startNewForwardDownloader(targetStartByte: Int64, reason: String) {
+        lastForwardDownloaderStartTime = saminNow()
+        // Remember where this (re)position points so the next playhead report
+        // can anchor the byte<->time mapping for the saved bar.
+        pendingSeekByte = (byte: targetStartByte, at: saminNow())
+        let fd = ForwardDownloader(session: self, startByte: targetStartByte)
+        self.forwardDownloader = fd
+        fd.start()
+        LocalCacheProxyLog.shared.log("Session [\(key)]: Started FD at \(targetStartByte) (\(reason))")
     }
 
     /// Starts a short-lived range fetch for one chunk if one is not already in
