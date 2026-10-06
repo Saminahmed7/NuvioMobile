@@ -183,6 +183,10 @@ final class LocalCacheProxyServer {
     // not throw when a port is unavailable — the failure arrives later as
     // .failed — so creating a listener is not proof that anything is listening.
     private var listenerReady = false
+    // True between tearing an old listener down and binding its replacement:
+    // the fixed port is briefly unbound, so no other caller may start another
+    // bind while the old socket is still being released.
+    private var rebuildInProgress = false
     // Set when the app really left the foreground (screen lock, app switch).
     private var wentToBackground = false
     // Guards one-time registration of the background notification observer.
@@ -232,7 +236,12 @@ final class LocalCacheProxyServer {
             // rebuild once: skip while the fresh bind from the first notification
             // is still coming up.
             if fromBackground || (!listenerComingUp && (self.listener == nil || self.listener?.state != .ready || !self.listenerReady)) {
-                self.forceRebuildListener()
+                // Returning from a suspension the socket may really be gone (iOS
+                // reclaims it while NWListener still reports .ready), but tearing
+                // down a still-serving listener would unbind the fixed port under
+                // any session mpv is already playing. Probe first, rebuild only
+                // when the port is genuinely not accepting.
+                self.rebuildListenerIfNotServing(reason: "foreground")
             }
             for session in self.sessions.values {
                 session.handleForegroundWake()
@@ -244,19 +253,111 @@ final class LocalCacheProxyServer {
     /// bound socket may have died underneath us (return from background, or a
     /// probe that found the port refusing connections).
     private func forceRebuildListener() {
-        listener?.cancel()
-        listener = nil
+        // willEnterForeground + didBecomeActive fire back-to-back, and the
+        // player's recovery can race a background rebind: tearing down twice
+        // would leave the fixed port unbindable for even longer.
+        guard !rebuildInProgress else { return }
         listenerReady = false
         port = 0
-        ensureListener()
+        guard let old = listener else {
+            ensureListener()
+            return
+        }
+        listener = nil
+        rebuildInProgress = true
+        // `cancel()` releases the fixed port asynchronously. Binding the
+        // replacement before the kernel drops the old socket fails with
+        // EADDRINUSE, which costs an extra 0.2 s rebind cycle — and every
+        // moment the port is unbound is a "Connection refused" for the player.
+        // Wait for the real .cancelled callback (this handler runs on `queue`),
+        // with a short timer as a safety net.
+        let rebind: () -> Void = { [weak self] in
+            guard let self, self.rebuildInProgress else { return }
+            self.rebuildInProgress = false
+            self.ensureListener()
+        }
+        old.stateUpdateHandler = { state in
+            switch state {
+            case .cancelled, .failed:
+                rebind()
+            default:
+                break
+            }
+        }
+        old.cancel()
+        queue.asyncAfter(deadline: .now() + 0.15) { rebind() }
     }
 
     /// Recovery entry point for the player: a request to the loopback URL just
-    /// failed, so rebuild the listener on the same (fixed) port before the
-    /// player retries. Safe because the port never changes, so the URL MPV
-    /// already holds becomes valid again.
+    /// failed, so make sure the port is really being served before the player
+    /// retries. A verified-healthy listener is left ALONE: cancelling it would
+    /// briefly unbind the fixed port under every live session and turn the
+    /// player's next retry into "Connection refused" — the exact first-load
+    /// failure this used to produce. Only a dead/stale port is rebuilt, and
+    /// waitUntilVerifiedReady then gates the player's retry on the fresh bind
+    /// actually accepting (the port never changes, so MPV's URL stays valid).
     func recoverListener() {
-        queue.async { [weak self] in self?.forceRebuildListener() }
+        queue.async { [weak self] in self?.rebuildListenerIfNotServing(reason: "recoverListener") }
+    }
+
+    /// On `queue`: verify the fixed port really accepts connections and rebuild
+    /// the listener only when it does not. A verified-healthy listener is left
+    /// ALONE — cancelling it would unbind the fixed port under every live
+    /// session and turn the player's next retry into "Connection refused", the
+    /// exact first-load failure this used to produce. The probe runs off `queue`
+    /// (and off the caller's thread) because it blocks for up to 0.8 s and the
+    /// queue also carries live segment traffic.
+    private func rebuildListenerIfNotServing(reason: String) {
+        guard listenerReady, port != 0, listener?.state == .ready else {
+            // Nothing worth preserving: recreate the socket straight away rather
+            // than probe a port we already know is gone.
+            LocalCacheProxyLog.shared.log("Server: \(reason) - no ready listener; rebuilding on \(activeBoundPort)")
+            forceRebuildListener()
+            return
+        }
+        let probedPort = port
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let healthy = self.probeAccepting(port: probedPort, timeout: 0.4)
+                || self.probeAccepting(port: probedPort, timeout: 0.4)
+            self.queue.async {
+                // The listener can change while we probe, so re-validate the
+                // verdict before acting on it.
+                if healthy, self.listenerReady, self.port == probedPort, self.listener?.state == .ready {
+                    LocalCacheProxyLog.shared.log("Server: \(reason) - port \(probedPort) verified healthy; leaving listener alone")
+                    return
+                }
+                LocalCacheProxyLog.shared.log("Server: \(reason) - port \(probedPort) not accepting; rebuilding on \(self.activeBoundPort)")
+                self.forceRebuildListener()
+            }
+        }
+    }
+
+    /// Blocks the calling thread until the loopback port provably accepts
+    /// connections (or the timeout elapses). The server rebinds on its own
+    /// while we poll (resetListener), so no teardown happens here. Player
+    /// recovery paths wait on this instead of a blind fixed delay that could
+    /// fire while a rebuilt listener was still binding.
+    func waitUntilVerifiedReady(timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            if isPortVerifiedHealthy() { return true }
+            if Date() >= deadline { return false }
+            // Nudge the server: if the listener is missing (cancelled and not
+            // yet rebound) this recreates it now instead of leaving us to spin
+            // until resetListener's delayed retry fires. It never touches a live
+            // or still-binding listener, and it runs on the queue, not here.
+            _ = queue.sync { ensureListener() }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+    }
+
+    private func isPortVerifiedHealthy() -> Bool {
+        let snapshot = queue.sync { () -> (ready: Bool, port: UInt16) in
+            (self.listenerReady, self.port)
+        }
+        guard snapshot.ready, snapshot.port != 0 else { return false }
+        return probeAccepting(port: snapshot.port, timeout: 0.4)
     }
 
     static func parseHeadersJson(_ json: String?) -> [String: String] {
@@ -321,6 +422,11 @@ final class LocalCacheProxyServer {
     func ensureListener() -> Bool {
         if listenerReady, let current = listener, current.state == .ready, port != 0 { return true }
 
+        // A rebuild is mid-flight: the old socket is still being released, so
+        // binding here would collide with it and fail with EADDRINUSE. The
+        // pending rebind performs the bind; callers just wait for it.
+        if rebuildInProgress { return false }
+
         // A listener that is still coming up must be left alone: cancelling it
         // to create another would restart the bind on every caller (the
         // willEnterForeground + didBecomeActive pair fires back-to-back).
@@ -355,7 +461,14 @@ final class LocalCacheProxyServer {
     /// cheap and lets us rebind before the URL is handed out.
     private func probeAccepting(timeout: TimeInterval = 0.75) -> Bool {
         let snapshotPort = queue.sync { self.port }
-        guard snapshotPort != 0, let nwPort = NWEndpoint.Port(rawValue: snapshotPort) else { return false }
+        guard snapshotPort != 0 else { return false }
+        return probeAccepting(port: snapshotPort, timeout: timeout)
+    }
+
+    /// Probes a specific port without reading server state, so it can run on
+    /// any thread with a snapshot port (the wrapper above does the queue.sync).
+    private func probeAccepting(port snapshotPort: UInt16, timeout: TimeInterval) -> Bool {
+        guard let nwPort = NWEndpoint.Port(rawValue: snapshotPort) else { return false }
         let probeQueue = DispatchQueue(label: "nuvio-cache-proxy-probe")
         let connection = NWConnection(host: "127.0.0.1", port: nwPort, using: .tcp)
         let semaphore = DispatchSemaphore(value: 0)
@@ -441,7 +554,11 @@ final class LocalCacheProxyServer {
                 // .ready does not guarantee the OS still serves the port (iOS
                 // reclaims the socket during suspension), so prove it with a real
                 // loopback connect before handing the URL to the player.
-                if probeAccepting() {
+                // Double probe before tearing anything down: a single probe can
+                // time out spuriously on a busy first launch, and forceRebuild
+                // briefly unbinds the port — stranding any session mpv is
+                // already playing (the URL never changes, only the socket).
+                if probeAccepting() || probeAccepting() {
                     var url = ""
                     queue.sync {
                         guard listenerReady, port != 0 else { return }
@@ -2874,7 +2991,7 @@ final class HLSStreamState {
 
     init(session: ProxySession) {
         self.session = session
-        self.upstreamHeaders = session.headers
+        self.upstreamHeaders = HLSStreamState.headersWithDefaultReferer(session.headers, for: session.sourceUrl)
         self.upstreamPlaylistUrl = URL(string: session.sourceUrl)
         LocalCacheProxyLog.shared.log("HLS [\(session.key)]: segment-cache session created for \(URL(string: session.sourceUrl)?.host ?? "?")")
         ensurePlaylist()
@@ -2885,13 +3002,33 @@ final class HLSStreamState {
         segmentWatchdog = nil
     }
 
+    /// Hotlink-gated CDNs reject a request that carries no Referer at all: the
+    /// HiAnime `hls.dramahot.top` family answers 403 for every Referer except
+    /// its own origin (verified on a live episode: absent, a page referer, an
+    /// unrelated subdomain and the loopback URL all 403; the playlist origin
+    /// 200s for the playlist and for the segments). Extractors normally supply
+    /// that header, and their value always wins here; when they do not, fall
+    /// back to the playlist origin so our playlist/segment/key fetches are not
+    /// rejected outright.
+    private static func headersWithDefaultReferer(_ headers: [String: String], for sourceUrl: String) -> [String: String] {
+        if headers.keys.contains(where: { $0.caseInsensitiveCompare("Referer") == .orderedSame }) {
+            return headers
+        }
+        guard let url = URL(string: sourceUrl), let scheme = url.scheme, let host = url.host else {
+            return headers
+        }
+        var out = headers
+        out["Referer"] = "\(scheme)://\(host)/"
+        return out
+    }
+
     /// New upstream for the same session key (debrid re-resolve). Runs on the
     /// server queue; also gives a previously-unsupported playlist one more
     /// chance with the new URL before falling back to the redirect.
     func setUpstream(_ sourceUrl: String, _ headers: [String: String]) {
         session.server.queue.async { [weak self] in
             guard let self, self.session.valid else { return }
-            self.upstreamHeaders = headers
+            self.upstreamHeaders = HLSStreamState.headersWithDefaultReferer(headers, for: sourceUrl)
             self.upstreamPlaylistUrl = URL(string: sourceUrl)
             self.playlistFetchedOnce = false
             self.bestVariantUrl = nil

@@ -35,12 +35,16 @@ data class TempCacheRange(
  * part is kept. Only progressive http(s) files are mirrored; torrents and
  * magnet links are skipped.
  *
- * HLS (.m3u8) is cached differently: on platforms with the loopback proxy
- * (iOS) it routes through the proxy, which fetches the playlist, rewrites
- * every segment/key/init URI back to localhost and disk-caches the segments
- * (see LocalCacheProxy.swift HLSStreamState). See [shouldProxy]. DASH (.mpd)
- * and unparseable playlists still bypass the proxy. Without a proxy bridge
- * (Android) HLS plays directly from the remote URL with no caching.
+ * HLS (.m3u8) plays directly from the remote URL with the extractor's own
+ * headers, exactly as it did before the segment cache existed. Routing it
+ * through the loopback proxy regressed first-play: hotlink-gated CDNs
+ * (HiAnime's hls.dramahot.top answers 403 unless the Referer is exactly its
+ * own origin) made the playlist fetch fail, and the 302 fallback then handed
+ * MPV an upstream URL it could not fetch, so the load died and the recovery
+ * retries surfaced as "Connection refused" on the loopback port. The Swift
+ * HLSStreamState segment cache is intact and unreachable; flip
+ * [HLS_SEGMENT_PROXY_ENABLED] to route HLS through it again. DASH (.mpd) and
+ * unparseable playlists bypass the proxy as well.
  */
 data class TempCacheStatus(
     val launchId: Long,
@@ -90,6 +94,15 @@ object TempPlaybackCache {
     const val HEAD_SPACE_MARGIN_BYTES = 500L * 1024L * 1024L
     // How often (downloaded bytes) free space is re-checked mid-download.
     const val SPACE_CHECK_INTERVAL_BYTES = 32L * 1024L * 1024L
+    // Samin: send HLS (.m3u8) through the iOS loopback segment cache. Off
+    // because proxying HLS broke first play for hotlink-gated CDNs: the proxy
+    // fetch 403s when the extractor's Referer is not exactly the playlist's own
+    // origin, the HLS layer then degrades to a 302 to the upstream playlist,
+    // and MPV - handed no headers for a loopback URL - 403s on that redirect,
+    // which the recovery retries report as "Connection refused". With this off
+    // HLS plays from the remote URL with the extractor's headers, the
+    // behaviour that shipped before the segment cache.
+    const val HLS_SEGMENT_PROXY_ENABLED = false
 
     private val _status = MutableStateFlow<Map<Long, TempCacheStatus>>(emptyMap())
     val status: StateFlow<Map<Long, TempCacheStatus>> = _status.asStateFlow()
@@ -119,8 +132,8 @@ object TempPlaybackCache {
 
     /**
      * True for HLS media/master playlists (.m3u8). These cannot use the
-     * progressive byte-chunk cache, but on iOS the loopback proxy implements
-     * a segment-level HLS cache for them.
+     * progressive byte-chunk cache; the loopback proxy has a segment-level
+     * cache for them, currently bypassed - see [HLS_SEGMENT_PROXY_ENABLED].
      */
     fun isAdaptivePlaylist(url: String?): Boolean {
         val lower = url?.trim()?.lowercase().orEmpty()
@@ -130,13 +143,15 @@ object TempPlaybackCache {
 
     /**
      * What may go through the platform cache proxy (iOS): everything
-     * [shouldMirror] accepts (progressive files) plus HLS playlists, which
-     * the proxy handles with its own segment cache. DASH (.mpd) stays out:
-     * its init segments are commonly byte-range addressed, which the proxy
-     * does not support yet. On platforms without a proxy bridge this gate is
-     * irrelevant — [resolveProxiedSource] returns the remote URL unchanged.
+     * [shouldMirror] accepts (progressive files). HLS is excluded while
+     * [HLS_SEGMENT_PROXY_ENABLED] is false, so .m3u8 keeps loading the remote
+     * URL directly. DASH (.mpd) stays out too: its init segments are commonly
+     * byte-range addressed, which the proxy does not support yet. On platforms
+     * without a proxy bridge this gate is irrelevant — [resolveProxiedSource]
+     * returns the remote URL unchanged.
      */
-    fun shouldProxy(url: String?): Boolean = shouldMirror(url) || isAdaptivePlaylist(url)
+    fun shouldProxy(url: String?): Boolean =
+        shouldMirror(url) || (HLS_SEGMENT_PROXY_ENABLED && isAdaptivePlaylist(url))
 
     /**
      * Same as [resolvePlayUrl] but also returns the headers the player

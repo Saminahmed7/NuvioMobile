@@ -598,9 +598,17 @@ final class MPVPlayerViewController: UIViewController {
             clearPlaybackError()
             foregroundReloadCount = 0
             pendingResumePosition = savedPositionBeforeBackground
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-                guard let self, self.mpv != nil else { return }
-                self.startLoad(request)
+            // Returning from background the loopback socket may be stale (iOS
+            // reclaims it while the app is suspended) or mid-rebind, so wait for
+            // a port that provably accepts instead of a blind 0.15 s that could
+            // fire before the bind lands. Off-main: the wait blocks.
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let ready = LocalCacheProxyServer.shared.waitUntilVerifiedReady(timeout: 2.0)
+                LocalCacheProxyLog.shared.log("Player: foreground recovery port verified=\(ready); reloading")
+                DispatchQueue.main.async {
+                    guard let self, self.mpv != nil else { return }
+                    self.startLoad(request)
+                }
             }
             return
         }
@@ -632,6 +640,11 @@ final class MPVPlayerViewController: UIViewController {
     }
 
     private func queueLoad(_ request: PendingLoadRequest) {
+        // A fresh user-initiated load deserves the full recovery budget. The
+        // counter is what decides whether a loopback failure ends in the
+        // playback-error dialog, so it must not still be spent by an earlier
+        // stream in this same player instance.
+        foregroundReloadCount = 0
         pendingLoadRequest = request
         attemptStartPendingLoad()
     }
@@ -1322,9 +1335,23 @@ final class MPVPlayerViewController: UIViewController {
                                     // Rebuild the loopback socket on its fixed port so the
                                     // retry does not hit the stale, refused address again.
                                     LocalCacheProxyServer.shared.recoverListener()
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-                                        guard let self, let req = self.activeLoadedRequest, self.mpv != nil else { return }
-                                        self.startLoad(req)
+                                    // Wait for the port to really accept before reloading. A
+                                    // blind 0.2 s fired while a freshly rebuilt listener was
+                                    // still binding, mpv got "Connection refused" against our
+                                    // own port, and each self-inflicted failure burned one of the
+                                    // three retries until the playback-error dialog appeared on
+                                    // the very first HLS load. Off-main: the wait blocks.
+                                    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                                        LocalCacheProxyLog.shared.log("Player: loopback END_FILE recovery (reason=\(reason), error=\(errorCode)) - waiting for verified port (attempt \(self?.foregroundReloadCount ?? -1))")
+                                        let ready = LocalCacheProxyServer.shared.waitUntilVerifiedReady(timeout: 2.0)
+                                        LocalCacheProxyLog.shared.log("Player: loopback port verified=\(ready); reloading")
+                                        DispatchQueue.main.async {
+                                            guard let self, let req = self.activeLoadedRequest, self.mpv != nil else { return }
+                                            if !ready {
+                                                print("[MPV] Loopback proxy still not serving after 2s; reloading anyway (attempt \(self.foregroundReloadCount))")
+                                            }
+                                            self.startLoad(req)
+                                        }
                                     }
                                     return
                                 }
