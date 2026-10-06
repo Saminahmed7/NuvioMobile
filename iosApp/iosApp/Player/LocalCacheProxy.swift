@@ -1011,6 +1011,24 @@ final class ProxySession {
         }
     }
     var playheadStreamPos: Int64?
+/// Byte anchor the forward prefetcher should follow. The playhead bar is
+    /// drawn in time, but the cache only knows bytes; without an anchor the
+    /// forward write head starts at the seek/reconnect anchor and leaps ahead
+    /// of the live playhead, leaving the visible bar ahead of the cached
+    /// window and forcing one-off fetches instead of sequential streaming.
+    /// Updated on every playhead report and each time the prefetcher is
+    /// repositioned, so the cached window tracks the actual playback position
+    /// and the bar no longer leads the cached bytes.
+    var cacheAnchorByte: Int64 {
+      guard valid else { return 0 }
+      if let streamPos = playheadStreamPos, streamPos > 0 {
+        return streamPos
+      }
+      guard let (pos, dur) = playheadMs, dur > 0, let total = totalSize, total > 0 else {
+        return 0
+      }
+      return max(0, min(total, Int64((Double(pos) / Double(dur)) * Double(total))))
+    }
     var valid = true
     private(set) var cachedChunks: Set<Int64> = []
     var bytesWrittenByChunk: [Int64: Int64] = [:]
