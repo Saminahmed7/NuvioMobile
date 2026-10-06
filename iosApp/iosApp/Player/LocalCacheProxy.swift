@@ -43,7 +43,8 @@ func saminNow() -> TimeInterval {
 // 5. Watched data behind the playhead is evicted only under storage pressure.
 // 6. Ephemeral: everything is deleted when playback closes (stopSession).
 
-private let saminProxyChunkBytes: Int64 = 2 * 1024 * 1024 // 2 MB chunks
+// Visible to MediaIndex.swift (same module): session chunk file layout.
+let saminProxyChunkBytes: Int64 = 2 * 1024 * 1024 // 2 MB chunks
 private let saminProxyLowSpaceBytes: Int64 = 300 * 1024 * 1024 // 300 MB (aligned with Kotlin LOW_SPACE_STOP_BYTES)
 private let saminProxyMaxRanges = 32
 private let saminProxyPieceBytes: Int = 256 * 1024 // 256 KB socket send slices
@@ -81,22 +82,38 @@ final class LocalCacheProxyLog {
     private let maxEntries = 150
 
     func log(_ message: String) {
+        append("[\(timestamp())] \(message)")
+        // Mirrored into the playback trace so player and proxy events can be
+        // read back on one timeline (see PlaybackTrace).
+        PlaybackTrace.shared.add(source: "proxy", message)
+        #if DEBUG
+        print("[CacheProxy] [\(timestamp())] \(message)")
+        #endif
+    }
+
+    /// Event-log only: for hot-path waits that fire per socket slice. These
+    /// would otherwise flood the playback trace (hundreds/sec) and evict the
+    /// useful history, leaving the report with seconds of context.
+    func logEventOnly(_ message: String) {
+        append("[\(timestamp())] \(message)")
+        #if DEBUG
+        print("[CacheProxy] [\(timestamp())] \(message)")
+        #endif
+    }
+
+    private func timestamp() -> String {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss.SSS"
-        let ts = formatter.string(from: Date())
-        let line = "[\(ts)] \(message)"
+        return formatter.string(from: Date())
+    }
+
+    private func append(_ line: String) {
         lock.lock()
         if entries.count >= maxEntries {
             entries.removeFirst()
         }
         entries.append(line)
         lock.unlock()
-        // Mirrored into the playback trace so player and proxy events can be
-        // read back on one timeline (see PlaybackTrace).
-        PlaybackTrace.shared.add(source: "proxy", message)
-        #if DEBUG
-        print("[CacheProxy] \(line)")
-        #endif
     }
 
     func snapshot() -> [String] {
@@ -821,6 +838,11 @@ final class LocalCacheProxyServer {
                 let sizeStr = s.totalSize.map { "\($0) bytes (\(String(format: "%.1f", Double($0) / 1024.0 / 1024.0)) MB, \(s.totalChunks()) x 2 MB chunks)" } ?? "unknown"
                 lines.append("Total Size: \(sizeStr)")
                 lines.append("Cached: \(s.cachedChunks.count) full chunks + \(s.bytesWrittenByChunk.count) partial (\(String(format: "%.1f", Double(s.totalCachedBytes()) / 1024.0 / 1024.0)) MB logical, \(s.cacheDirBytes() / 1024 / 1024) MB on disk, \(String(format: "%.1f", s.percentComplete()))%)")
+                if let idx = s.mediaIndex {
+                    lines.append("Timeline index: EXACT (\(idx.source), \(idx.points.count) points, \(String(format: "%.0f", idx.durationSec))s) — grey bar maps bytes exactly")
+                } else {
+                    lines.append("Timeline index: estimated (\(s.rateSampleCount()) anchor samples) — grey bar is interpolated until the file's index (cues/moov) is cached")
+                }
                 lines.append("Evicted (watched, low space): \(s.evictedChunksCount) chunks | Write errors: \(s.writeErrorCount)\(s.lastWriteError.map { " (last: \($0))" } ?? "")")
                 lines.append("Speed: \(s.currentSpeed() / 1024) KB/s")
                 if s.isRateLimited {
@@ -832,6 +854,14 @@ final class LocalCacheProxyServer {
                 if let fd = s.forwardDownloader {
                     let elapsed = saminNow() - fd.startedUptime
                     lines.append("Forward Downloader: active, start=\(fd.startByte) (\(fd.startByte / 1024 / 1024) MB), offset=\(fd.streamOffset) (\(fd.streamOffset / 1024 / 1024) MB), received=\(fd.totalBytesReceived / 1024 / 1024) MB in \(String(format: "%.0f", elapsed))s, retries=\(fd.retryCount), reconnects=\(s.forwardReconnects), finished=\(fd.isFinished)\(fd.lastErrorMessage.map { ", lastError='\($0)'" } ?? "")")
+                    // Samin: the stall signature from slow-link resumes — the
+                    // prefetcher filling an unwatched prefix while playback
+                    // waits gigabytes ahead on one-off chunk fetches. Surfaced
+                    // here so the report explains itself.
+                    let gapBytes = s.cacheAnchorByte - fd.streamOffset
+                    if !fd.isFinished, gapBytes > 128 * 1024 * 1024 {
+                        lines.append("NOTE: forward downloader is \(gapBytes / 1024 / 1024) MB behind the playhead (anchor=\(s.cacheAnchorByte / 1024 / 1024) MB). Bandwidth is filling an unwatched prefix while playback starves on one-off chunk fetches — the prefetcher should jump to the playhead.")
+                    }
                 } else {
                     lines.append("Forward Downloader: none / idle")
                 }
@@ -850,21 +880,65 @@ final class LocalCacheProxyServer {
             }
 
             let logEntries = LocalCacheProxyLog.shared.snapshot()
-            lines.append("\n--- Event Log (Last \(logEntries.count) events) ---")
-            lines.append(contentsOf: logEntries)
+            let collapsedLog = Self.collapseWaitLines(logEntries)
+            lines.append("\n--- Event Log (Last \(collapsedLog.count) shown, \(logEntries.count) stored) ---")
+            lines.append(contentsOf: collapsedLog)
 
             // Samin: unified player + proxy timeline. Source tags: "player" is
             // a decision made by MPVPlayerBridge, "mpv/<prefix>" is libmpv's own
             // log, "proxy" mirrors the event log above, "sample" is the 2s
-            // playback state line.
+            // playback state line. Only the tail is shown: the full ring holds
+            // 1200 lines, but pasting thousands of lines by hand is what made
+            // the report unreadable.
             let trace = PlaybackTrace.shared.snapshot()
             if !trace.isEmpty {
-                lines.append("\n--- Playback Trace (last \(trace.count) lines, oldest first) ---")
-                lines.append(contentsOf: trace)
+                let tail = Array(trace.suffix(250))
+                let skipped = trace.count - tail.count
+                if skipped > 0 {
+                    lines.append("\n--- Playback Trace (last \(tail.count) of \(trace.count) lines, oldest first) ---")
+                } else {
+                    lines.append("\n--- Playback Trace (last \(tail.count) lines, oldest first) ---")
+                }
+                lines.append(contentsOf: tail)
             }
             lines.append("=== END REPORT ===")
             return lines.joined(separator: "\n")
         }
+    }
+
+    /// Collapses runs of hot-path wait lines ("Waiting for data…", "Still
+    /// waiting…") into one summary per run, so a starved minute does not paste
+    /// as hundreds of near-identical lines. Old reports that predate wait
+    /// throttling still collapse here.
+    private static func collapseWaitLines(_ entries: [String]) -> [String] {
+        var out: [String] = []
+        out.reserveCapacity(entries.count)
+        var runCount = 0
+        var runFirst: String?
+        var runLast: String?
+        func flush() {
+            guard runCount > 0 else { return }
+            if runCount == 1, let single = runLast {
+                out.append(single)
+            } else if let first = runFirst, let last = runLast {
+                out.append("\(first)  …[\(runCount - 1) similar wait lines collapsed]…  \(last)")
+            }
+            runCount = 0
+            runFirst = nil
+            runLast = nil
+        }
+        for line in entries {
+            if line.contains("Waiting for data at chunk") || line.contains("Still waiting at chunk") {
+                runCount += 1
+                if runFirst == nil { runFirst = line }
+                runLast = line
+            } else {
+                flush()
+                out.append(line)
+            }
+        }
+        flush()
+        return out
     }
 
     fileprivate func addConnection(_ handler: ProxyConnection) {
@@ -927,17 +1001,15 @@ final class ProxySession {
     /// pass-through is used.
     let kind: ProxySessionKind
     /// Samin: HLS segment cache state. nil for non-HLS sessions.
-    var hls: HLSStreamState?
-
-    var totalSize: Int64?
-    var contentType: String?
-    var playheadMs: (Int64, Int64)? {
-        didSet {
-            onPlayheadUpdated()
-        }
-    }
-    var playheadStreamPos: Int64?
-    var valid = true
+    var hls: HLSStreamState?    var totalSize: Int64?    var contentType: String?    var playheadMs: (Int64, Int64)? {      didSet {        onPlayheadUpdated()      }    }    var playheadStreamPos: Int64?    /// Byte anchor the forward prefetcher should follow. The playhead bar is
+    /// drawn in time, but the cache only knows bytes; without an anchor the
+    /// forward write head starts at the seek/reconnect anchor and leaps ahead
+    /// of the live playhead, leaving the visible bar ahead of the cached
+    /// window and forcing one-off fetches instead of sequential streaming.
+    /// Updated on every playhead report and each time the prefetcher is
+    /// repositioned, so the cached window tracks the actual playback position
+    /// and the bar no longer leads the cached bytes.
+    var cacheAnchorByte: Int64 {      guard valid else { return 0 }      if let streamPos = playheadStreamPos, streamPos > 0 {        return streamPos      }      guard let (pos, dur) = playheadMs, dur > 0, let total = totalSize, total > 0 else {        return 0      }      return max(0, min(total, Int64((Double(pos) / Double(dur)) * Double(total))))    }    var valid = true
     private(set) var cachedChunks: Set<Int64> = []
     var bytesWrittenByChunk: [Int64: Int64] = [:]
 
@@ -976,11 +1048,20 @@ final class ProxySession {
     // Timeline mapping. The played bar is drawn in *time* (position/duration),
     // but the cache only knows *byte* offsets; on a VBR file the two drift, so
     // a raw byte fraction lands ahead of the playhead and leaves a visible gap.
-    // We anchor (timeFraction, byteFraction) pairs taken whenever the forward
-    // downloader is repositioned for a seek and the player reports the new
-    // position, then map saved byte ranges into time before drawing them.
+    // First choice is the exact container index (MediaIndex.swift: MKV cues /
+    // MP4 sample tables read from the file itself). While its bytes are still
+    // downloading, we fall back to anchored (timeFraction, byteFraction) pairs
+    // taken whenever the player reports a new position, mapping saved byte
+    // ranges into time before drawing them.
     private var rateSamples: [(t: Double, b: Double)] = []
     private var pendingSeekByte: (byte: Int64, at: TimeInterval)?
+    // Exact index state (see MediaIndex.swift). Built once the index bytes are
+    // on disk; index chunks are prefetched on demand so resumed streams do not
+    // wait for the forward downloader to reach the end of the file.
+    var mediaIndex: MediaIndexTable?
+    private var mediaIndexDone = false
+    private var mediaIndexCachedCount = -1
+    private var mediaIndexTailChunk: Int64 = -1
 
     var isRateLimited: Bool {
         if let until = rateLimitedUntil { return Date() < until }
@@ -1107,37 +1188,63 @@ final class ProxySession {
 
     /// Adaptive lookahead window: for high-bitrate files (e.g. 4K remuxes),
     /// scale up from 32 MB to up to 128 MB (roughly 30s of buffer) so MPV's
-    /// natural sequential readahead doesn't trigger one-off chunk fetchers.
-    var aheadWindowBytes: Int64 {
-        if let total = totalSize, total > 0, let (_, dur) = playheadMs, dur > 10_000 {
-            let bytesPerSec = Double(total) / (Double(dur) / 1000.0)
-            let adaptive = Int64(bytesPerSec * 30.0)
-            return max(saminProxyAheadWindowBytes, min(128 * 1024 * 1024, adaptive))
-        }
-        return saminProxyAheadWindowBytes
-    }
-
-    func chunkURL(_ index: Int64) -> URL {
-        dir.appendingPathComponent("c\(index).bin")
-    }
-
-    func markCached(_ index: Int64) {
+    /// natural sequential readahead doesn't trigger one-off chunk fetchers.    var aheadWindowBytes: Int64 {        if let total = totalSize, total > 0, let (_, dur) = playheadMs, dur > 10_000 {            let bytesPerSec = Double(total) / (Double(dur) / 1000.0)            let adaptive = Int64(bytesPerSec * 30.0)            return max(saminProxyAheadWindowBytes, min(128 * 1024 * 1024, adaptive))        }        return saminProxyAheadWindowBytes    }        func chunkURL(_ index: Int64) -> URL {      dir.appendingPathComponent("c\(index).bin")    }        /// Anchor the forward write head to where the player actually is. When
+    /// we are less than `aheadWindowBytes` ahead of the live cache window, use
+    /// the anchor (playhead byte position, time-mapped) instead of the stored
+    /// `streamOffset`, so the cached window does not sit behind the playhead
+    /// bar during a fresh stream / reconnect.
+    private func anchorForWindow() -> Int64 {      let total = totalSize ?? 0      let pos = max(0, min(total, cacheAnchorByte))      let avail = total > 0 ? min(cacheAnchorByte, bytesWrittenByChunk.values.max() ?? 0) : 0      // The window head advances with the anchor but never jumps past the
+      // written tail, so a fresh stream fills it sequentially instead of
+      // waiting for a one-off fetch at the far edge.      return max(0, min(pos, avail + saminProxyAheadWindowBytes))    }        func markCached(_ index: Int64) {
         cachedChunks.insert(index)
         bytesWrittenByChunk.removeValue(forKey: index)
         notifyDataAvailable(chunkIndex: index)
         nudgeWaitingClients()
+        maybeBuildMediaIndex()
     }
 
-    /// Re-pumps any client parked on a chunk that is not the one just completed,
-    /// so a freed fetch-pool slot (or a newly cached chunk) is picked up instead
-    /// of leaving the client waiting forever.
-    func nudgeWaitingClients() {
-        for conn in activeConnections.values where conn.isWaitingForData {
-            conn.onDataAvailable(chunkIndex: conn.waitingChunkIndex)
+    /// Tries to build the exact byte->time index (MediaIndex.swift) once its
+    /// bytes are on disk. Retries only when the cache actually grew; asks the
+    /// chunk-fetcher pool for the specific index chunks (header/cues/moov) so
+    /// resumed streams get an exact bar within seconds instead of when the
+    /// forward downloader finally reaches the end of the file.
+    func maybeBuildMediaIndex() {
+        guard valid, !mediaIndexDone, mediaIndex == nil else { return }
+        guard kind == .progressive else { return }
+        guard let total = totalSize, total > 0 else { return }
+        let cachedCount = cachedChunks.count
+        let maxChunk = cachedChunks.max() ?? -1
+        if cachedCount == mediaIndexCachedCount && maxChunk <= mediaIndexTailChunk { return }
+        switch MediaIndexBuilder.build(dir: dir, chunkBytes: saminProxyChunkBytes, totalSize: total) {
+        case .ready(let table):
+            mediaIndex = table
+            mediaIndexDone = true
+            LocalCacheProxyLog.shared.log("Session [\(key)]: Timeline index exact (\(table.source), \(table.points.count) points) — grey bar now maps bytes exactly")
+        case .needChunks(let idxs):
+            mediaIndexCachedCount = cachedCount
+            mediaIndexTailChunk = maxChunk
+            var room = saminProxyMaxChunkFetchers - chunkFetchers.count
+            for idx in idxs {
+                guard room > 0 else { break }
+                if !cachedChunks.contains(idx), chunkFetchers[idx] == nil {
+                    ensureChunkFetcher(chunkIndex: idx)
+                    room -= 1
+                }
+            }
+        case .needMoreData:
+            mediaIndexCachedCount = cachedCount
+            mediaIndexTailChunk = maxChunk
+        case .unsupported(let why):
+            mediaIndexDone = true
+            LocalCacheProxyLog.shared.log("Session [\(key)]: No exact timeline index (\(why)) — grey bar stays estimated")
         }
     }
 
-    func bytesAvailable(for chunkIndex: Int64) -> Int64 {
+    func rateSampleCount() -> Int { rateSamples.count }
+
+    /// Re-pumps any client parked on a chunk that is not the one just completed,
+    /// so a freed fetch-pool slot (or a newly cached chunk) is picked up instead
+    /// of leaving the client waiting forever.    func nudgeWaitingClients() {        for conn in activeConnections.values where conn.isWaitingForData {            conn.onDataAvailable(chunkIndex: conn.waitingChunkIndex)        }    }        func bytesAvailable(for chunkIndex: Int64) -> Int64 {
         if cachedChunks.contains(chunkIndex) {
             if let total = totalSize {
                 let cStart = chunkIndex * saminProxyChunkBytes
@@ -1208,12 +1315,11 @@ final class ProxySession {
             LocalCacheProxyLog.shared.log("Session [\(key)]: Foreground wake, stream healthy (idle=\(String(format: "%.1f", idle))s); leaving it alone")
         }
     }
-
-    /// Serves a client request for [startByte]. The forward prefetcher is never
-    /// cancelled here: a request behind its write head, or far ahead of it, is
-    /// handed to a dedicated one-off range fetch. Only a session with no live
-    /// prefetcher starts one. This removes the reposition ping-pong between
-    /// MPV's index probe and its playback read that the old heuristics fought.
+    /// Serves a client request for [startByte]. The forward prefetcher follows
+    /// sequential reads and the live playhead; requests behind its write head,
+    /// or far-ahead one-off probes, are handed to a dedicated range fetch.
+    /// A prefetcher parked gigabytes behind live playback is jumped forward
+    /// (see below) instead of starving playback on one-off 2 MB fetches.
     func ensureForwardDownloading(from startByte: Int64) {
         guard valid else { return }
 
@@ -1231,16 +1337,52 @@ final class ProxySession {
         }
 
         if let fd = forwardDownloader, !fd.isFinished {
-            let ahead = startByte - fd.streamOffset
-            // Sequential read just ahead of the write head: let the running
-            // stream reach it.
-            if ahead >= 0 && ahead <= aheadWindowBytes {
-                return
-            }
-            // Behind the head (seek back / evicted chunk) or far ahead (index
-            // probe): fetch this chunk on its own without touching the stream.
-            ensureChunkFetcher(chunkIndex: chunkIdx)
+            let ahead = startByte - fd.streamOffset        // Sequential read just ahead of the write head: let the running
+        // stream reach it.
+        if ahead >= 0 && ahead <= aheadWindowBytes {
+          return
+        }
+        // Anchor the window head to the live playhead so a fresh stream /
+        // reconnect does not sit behind the visible bar. If the anchor is
+        // right at the write head, do not reposition the stream; let it
+        // continue streaming forward from where it is.
+        if cacheAnchorByte >= fd.streamOffset &&
+           cacheAnchorByte - fd.streamOffset <= saminProxyAheadWindowBytes {
+          return
+        }
+
+        // Playback far ahead of a prefetcher that is still filling an
+        // unwatched prefix: the session's first client request is usually the
+        // container header/moov probe at byte 0, which parks the FD at 0
+        // while real playback resumes gigabytes ahead. Playhead pushes are
+        // throttled (and freeze entirely while buffering, since the position
+        // stops moving), so the playhead-driven reposition below never fires
+        // and playback starves on one-off 2 MB fetches that share throttled
+        // upstream bandwidth with the useless prefix — 1 s play / 3 s buffer.
+        // Jump the continuous stream to live playback instead. Both the
+        // request AND the anchor must be far ahead so a lone far-ahead index
+        // probe can never drag the stream away from real playback.
+        if startByte - fd.streamOffset > saminProxyForwardSeekBytes &&
+           cacheAnchorByte - fd.streamOffset > saminProxyForwardSeekBytes &&
+           saminNow() - lastForwardDownloaderStartTime > 3.0 {
+            // Start at the earlier of request/anchor: the anchor is a
+            // time-ratio estimate on VBR files and can sit ahead of the bytes
+            // mpv actually needs, which would strand the waiting chunk behind
+            // the new write head.
+            let targetByte = min(startByte, cacheAnchorByte)
+            let target = (targetByte / saminProxyChunkBytes) * saminProxyChunkBytes
+            LocalCacheProxyLog.shared.log("Session [\(key)]: Playback \(((startByte - fd.streamOffset) / 1024 / 1024)) MB ahead of prefetcher (offset=\(fd.streamOffset / 1024 / 1024) MB, anchor=\(cacheAnchorByte / 1024 / 1024) MB) -> jumping prefetcher to \(target / 1024 / 1024) MB")
+            cancelAllChunkFetchers()
+            fd.cancel()
+            forwardDownloader = nil
+            startNewForwardDownloader(targetStartByte: target, reason: "playback ahead at \(startByte)")
             return
+        }
+
+        // Behind the head (seek back / evicted chunk) or far ahead (index
+        // probe): fetch this chunk on its own without touching the stream.
+        ensureChunkFetcher(chunkIndex: chunkIdx)
+        return
         }
 
         // 3. No live prefetcher.
@@ -1256,16 +1398,17 @@ final class ProxySession {
             startNewForwardDownloader(targetStartByte: chunkIdx * saminProxyChunkBytes, reason: "client request at \(startByte)")
         }
     }
-
-    private func startNewForwardDownloader(targetStartByte: Int64, reason: String) {
-        lastForwardDownloaderStartTime = saminNow()
-        // Remember where this (re)position points so the next playhead report
-        // can anchor the byte<->time mapping for the saved bar.
-        pendingSeekByte = (byte: targetStartByte, at: saminNow())
-        let fd = ForwardDownloader(session: self, startByte: targetStartByte)
-        self.forwardDownloader = fd
-        fd.start()
-        LocalCacheProxyLog.shared.log("Session [\(key)]: Started FD at \(targetStartByte) (\(reason))")
+    
+    private func startNewForwardDownloader(targetStartByte: Int64, reason: String) {      lastForwardDownloaderStartTime = saminNow()      let fd = ForwardDownloader(session: self, startByte: targetStartByte)      self.forwardDownloader = fd
+      fd.start()
+      LocalCacheProxyLog.shared.log("Session [\(key)]: Started FD at \(targetStartByte) (\(reason))")
+    }
+    
+    /// Refresh the live anchor from the currently reported playhead. Called
+    /// from the Swift player bridge when the player reports a seek or a
+    /// position change that should be reflected immediately.
+    func refreshAnchor() {      // The anchor is derived live from playheadMs / playheadStreamPos on
+      // every access, so no state needs to change here.
     }
 
     /// Starts a short-lived range fetch for one chunk if one is not already in
@@ -1491,11 +1634,14 @@ final class ProxySession {
         rateSamples = monotonic
     }
 
-    /// Maps a byte fraction to a timeline (time) fraction using the observed
-    /// anchors. Falls back to the raw byte fraction when nothing has been
-    /// sampled yet, and to a constant shift with a single anchor.
+    /// Maps a byte fraction to a timeline (time) fraction. Prefers the exact
+    /// container index when built; falls back to the observed anchor
+    /// interpolation, then to the raw byte fraction when nothing was sampled.
     func byteFractionToTime(_ b: Double) -> Double {
         let bb = min(max(b, 0.0), 1.0)
+        if let index = mediaIndex, let total = totalSize, total > 0 {
+            return index.fraction(forByte: Int64(bb * Double(total)), totalSize: total)
+        }
         guard let anchor = rateSamples.first else { return bb }
         if rateSamples.count == 1 {
             return min(max(bb + (anchor.t - anchor.b), 0.0), 1.0)
@@ -1566,6 +1712,7 @@ final class ProxySession {
                         self.contentType = type
                     }
                     self.notifyHeadersAvailable()
+                    self.maybeBuildMediaIndex()
                 } else if self.totalSize == nil {
                     // HEAD gave no usable size (common on debrid/CDN links for
                     // very large files): still wake waiting clients so the
@@ -1987,6 +2134,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
                 }
                 if let discoveredSize {
                     self.session.totalSize = discoveredSize
+                    self.session.maybeBuildMediaIndex()
                 }
 
                 if code == 200 && self.streamOffset > 0 {
@@ -2409,6 +2557,13 @@ final class ProxyConnection {
     // Waiting for live data from forward downloader
     fileprivate(set) var isWaitingForData = false
     fileprivate(set) var waitingChunkIndex: Int64 = -1
+    // Throttle for the hot-path wait log: the pump flips waiting->sending on
+    // every ~1 KB socket slice while starved, which used to emit hundreds of
+    // log lines per second and drown the report. At most one line per chunk
+    // per interval; the report collapses the rest into a summary.
+    private var lastWaitLogChunk: Int64 = -1
+    private var lastWaitLogUptime: TimeInterval = 0
+    private var waitLogCountForChunk: Int = 0
 
     // Pending parameters while waiting for initial HEAD/GET headers
     private var pendingStart: Int64 = 0
@@ -2674,9 +2829,20 @@ final class ProxyConnection {
                 }
             })
         } else {
-            // Reached current downloaded boundary; wait for forward downloader
-            if !isWaitingForData {
-                LocalCacheProxyLog.shared.log("Client [\(sessionKey)]: Waiting for data at chunk \(chunkIdx) (offset=\(streamOffset), available=\(available))")
+            // Reached current downloaded boundary; wait for the downloaders.
+            // Throttled: while starved this fires per ~1 KB socket slice, so
+            // log at most one line per chunk per 2 s (event log only, never
+            // the playback trace) and let the report collapse the rest.
+            let now = saminNow()
+            if chunkIdx != lastWaitLogChunk {
+                lastWaitLogChunk = chunkIdx
+                waitLogCountForChunk = 0
+                lastWaitLogUptime = now
+                LocalCacheProxyLog.shared.logEventOnly("Client [\(sessionKey)]: Waiting for data at chunk \(chunkIdx) (offset=\(streamOffset), available=\(available))")
+            } else if !isWaitingForData || now - lastWaitLogUptime >= 2.0 {
+                waitLogCountForChunk += 1
+                lastWaitLogUptime = now
+                LocalCacheProxyLog.shared.logEventOnly("Client [\(sessionKey)]: Still waiting at chunk \(chunkIdx) x\(waitLogCountForChunk) (offset=\(streamOffset), available=\(available))")
             }
             isWaitingForData = true
             waitingChunkIndex = chunkIdx
