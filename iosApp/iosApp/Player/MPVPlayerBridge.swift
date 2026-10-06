@@ -494,7 +494,10 @@ final class MPVPlayerViewController: UIViewController {
             return
         }
 
-        checkError(mpv_request_log_messages(mpv, "warn"))
+        // Samin: "info" rather than "warn" so the trace sees the playlist and
+        // segment opens plus HTTP failures; the error dialog still only takes
+        // warn/error/fatal (see appendPlaybackLog).
+        checkError(mpv_request_log_messages(mpv, "info"))
 
         var layerPointer = Int64(Int(bitPattern: Unmanaged.passUnretained(metalLayer).toOpaque()))
         checkError(mpv_set_option(mpv, "wid", MPV_FORMAT_INT64, &layerPointer))
@@ -685,6 +688,11 @@ final class MPVPlayerViewController: UIViewController {
             print("[MPV] Queued initial resume position \(request.startPositionMsSeconds)s")
         }
         applyDemuxerCacheProfile(for: request.urlString)
+        let loadAudioFlag = request.audioUrl == nil ? "none" : "yes"
+        PlaybackTrace.shared.add(
+            source: "player",
+            "load \(PlaybackTrace.describe(url: request.urlString)) headers=[\(PlaybackTrace.describe(headers: sanitizedHeaders))] audio=\(loadAudioFlag) subs=\(request.subtitles.count) resume=\(String(format: "%.1f", request.startPositionMsSeconds))s"
+        )
         command("loadfile", args: [request.urlString, "replace"])
         if let audioUrl = request.audioUrl, !audioUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
@@ -784,6 +792,7 @@ final class MPVPlayerViewController: UIViewController {
             clearPlaybackError()
             applyRequestHeaders(activeRequestHeaders)
             let pos = getDouble("time-pos")
+            PlaybackTrace.shared.add(source: "player", "retryPlayback \(PlaybackTrace.describe(url: path)) at \(String(format: "%.1f", pos))s headers=[\(PlaybackTrace.describe(headers: activeRequestHeaders))]")
             command("loadfile", args: [path, "replace"])
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                 // Only re-seek if there was real progress; a 0-position retry
@@ -1048,6 +1057,18 @@ final class MPVPlayerViewController: UIViewController {
         streamPosBytes = Int64(max(streamPos, 0))
         currentSpeed = Float(speed > 0 ? speed : 1.0)
 
+        // Samin: how the stream is actually behaving between discrete events.
+        // This runs on Kotlin's 250ms poll, so the gate below turns it into a
+        // steady 2s timeline without needing a timer.
+        if PlaybackTrace.shared.sampleIsDue() {
+            let cacheSeconds = getDouble("demuxer-cache-duration")
+            let path = getString("path") ?? "no-path"
+            PlaybackTrace.shared.add(
+                source: "sample",
+                "\(PlaybackTrace.describe(url: path)) pos=\(String(format: "%.1f", position))s dur=\(String(format: "%.1f", duration))s buffered=\(String(format: "%.1f", position + cached))s cache=\(String(format: "%.1f", cacheSeconds))s speed=\(String(format: "%.2f", speed)) paused=\(paused) idle=\(idle) eof=\(eofReached) seeking=\(seeking) pausedForCache=\(bufferingCache) streamPos=\(Int64(max(streamPos, 0)))"
+            )
+        }
+
         let shouldPublishNowPlayingState = !isPlayerLoading || isPlayerPlaying || durationMs > 0 || positionMs > 0
         if shouldPublishNowPlayingState {
             syncNowPlayingPlaybackState(isPlaying: isPlayerPlaying)
@@ -1254,6 +1275,9 @@ final class MPVPlayerViewController: UIViewController {
     private func appendPlaybackLog(prefix: String, level: String, text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        // Samin: kept unfiltered here. The line that kills a load is often a
+        // single warn ("Connection refused"), and info carries the opens/fetches.
+        PlaybackTrace.shared.add(source: "mpv/\(prefix)", "\(level): \(trimmed)")
         guard level == "warn" || level == "error" || level == "fatal" else { return }
 
         let formatted = "[\(prefix)] \(trimmed)"
@@ -1272,8 +1296,11 @@ final class MPVPlayerViewController: UIViewController {
         if !trimmedFallback.isEmpty && !parts.contains(trimmedFallback) {
             parts.append(trimmedFallback)
         }
-        _currentErrorMessage = parts.isEmpty ? "Unable to play this stream." : parts.joined(separator: "\n")
+        let message = parts.isEmpty ? "Unable to play this stream." : parts.joined(separator: "\n")
+        _currentErrorMessage = message
         errorStateLock.unlock()
+        // Outside the lock: the trace takes its own.
+        PlaybackTrace.shared.add(source: "player", "playback error surfaced to the user: \(message)")
     }
 
     // MARK: - Event Loop
@@ -1292,6 +1319,7 @@ final class MPVPlayerViewController: UIViewController {
                     DispatchQueue.main.async { self.updateState() }
                 case MPV_EVENT_FILE_LOADED:
                     DispatchQueue.main.async {
+                        PlaybackTrace.shared.add(source: "player", "FILE_LOADED \(PlaybackTrace.describe(url: self.activeLoadedRequest?.urlString ?? "?")) pos=\(String(format: "%.1f", Double(self.positionMs) / 1000.0))s dur=\(String(format: "%.1f", Double(self.durationMs) / 1000.0))s")
                         self.foregroundReloadCount = 0
                         self.clearPlaybackError()
                         self.isPlayerLoading = false
@@ -1324,6 +1352,7 @@ final class MPVPlayerViewController: UIViewController {
                             let isRecentForeground = (now - self.lastForegroundUptime) < 5.0
                             let isPremature = self.durationMs > 10000 && self.positionMs < (self.durationMs - 10000)
                             let isLoopback = self.activeLoadedRequest?.urlString.contains("127.0.0.1") == true
+                            PlaybackTrace.shared.add(source: "player", "END_FILE reason=\(reason) error=\(errorCode) (\(String(cString: mpv_error_string(errorCode)))) loopback=\(isLoopback) pos=\(String(format: "%.1f", Double(self.positionMs) / 1000.0))s dur=\(String(format: "%.1f", Double(self.durationMs) / 1000.0))s loading=\(self.isPlayerLoading) reloads=\(self.foregroundReloadCount)")
 
                             if isLoopback && (reason == MPV_END_FILE_REASON_ERROR || (reason == MPV_END_FILE_REASON_EOF && (isRecentForeground || isPremature))) {
                                 if self.foregroundReloadCount < 3 {

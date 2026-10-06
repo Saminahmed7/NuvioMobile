@@ -91,9 +91,72 @@ final class LocalCacheProxyLog {
         }
         entries.append(line)
         lock.unlock()
+        // Mirrored into the playback trace so player and proxy events can be
+        // read back on one timeline (see PlaybackTrace).
+        PlaybackTrace.shared.add(source: "proxy", message)
         #if DEBUG
         print("[CacheProxy] \(line)")
         #endif
+    }
+
+    func snapshot() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries
+    }
+
+}
+
+/// Samin: on-device playback trace.
+///
+/// A bounded, timestamped ring buffer that interleaves the player's own
+/// decisions, libmpv's log, the cache proxy's events and a 2s state sample, so
+/// a failure that only shows up on device can be read back afterwards instead
+/// of guessed at from a screenshot. It rides along in the diagnostics report,
+/// which the player can copy to the clipboard.
+///
+/// Entries arrive from the mpv event queue, the main queue and the proxy queue,
+/// so every access is behind a lock. In-memory only: no file, no UI.
+final class PlaybackTrace {
+    static let shared = PlaybackTrace()
+
+    // Bounded by lines and characters: the report is rendered in one Compose
+    // Text and pasted by hand, so a long steady-state run and a chatty burst
+    // both have to stay small. The newest lines are kept.
+    private static let maxEntries = 1200
+    private static let maxCharacters = 96 * 1024
+    // Cadence of the "how is the stream doing" sample line.
+    private static let sampleInterval: TimeInterval = 2.0
+
+    private let lock = NSLock()
+    private var entries: [String] = []
+    private var characters = 0
+    private var lastSampleUptime: TimeInterval = 0
+
+    func add(source: String, _ message: String) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss.SSS"
+        let line = "[\(formatter.string(from: Date()))] \(source): \(message)"
+        lock.lock()
+        entries.append(line)
+        characters += line.count
+        while entries.count > Self.maxEntries || (characters > Self.maxCharacters && entries.count > 1) {
+            characters -= entries.removeFirst().count
+        }
+        lock.unlock()
+    }
+
+    /// True at most once per sampleInterval, so Kotlin's 250ms state poll turns
+    /// into a steady timeline without a timer of its own.
+    func sampleIsDue() -> Bool {
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        defer { lock.unlock() }
+        if lastSampleUptime > 0, now - lastSampleUptime < Self.sampleInterval {
+            return false
+        }
+        lastSampleUptime = now
+        return true
     }
 
     func snapshot() -> [String] {
@@ -106,6 +169,30 @@ final class LocalCacheProxyLog {
         lock.lock()
         defer { lock.unlock() }
         entries.removeAll()
+        characters = 0
+        lastSampleUptime = 0
+    }
+
+    /// Host and path, with the query summarised: the report already treats a
+    /// query as an auth token, and the host is what says which CDN answered.
+    static func describe(url: String) -> String {
+        guard let parsed = URL(string: url), let host = parsed.host else {
+            return "<unparseable string, \(url.count) chars>"
+        }
+        let query = parsed.query.map { "?<\($0.count) chars redacted>" } ?? ""
+        return "\(parsed.scheme ?? "?")://\(host)\(parsed.path)\(query)"
+    }
+
+    /// Header names, plus the value of the headers that decide hotlink gates
+    /// (the question this trace exists to answer). Authorization and cookies
+    /// stay out.
+    static func describe(headers: [String: String]) -> String {
+        guard !headers.isEmpty else { return "none" }
+        let gated: Set<String> = ["referer", "origin"]
+        return headers.keys.sorted().map { key -> String in
+            guard gated.contains(key.lowercased()), let value = headers[key] else { return key }
+            return "\(key)=\(value)"
+        }.joined(separator: ", ")
     }
 }
 
@@ -765,6 +852,16 @@ final class LocalCacheProxyServer {
             let logEntries = LocalCacheProxyLog.shared.snapshot()
             lines.append("\n--- Event Log (Last \(logEntries.count) events) ---")
             lines.append(contentsOf: logEntries)
+
+            // Samin: unified player + proxy timeline. Source tags: "player" is
+            // a decision made by MPVPlayerBridge, "mpv/<prefix>" is libmpv's own
+            // log, "proxy" mirrors the event log above, "sample" is the 2s
+            // playback state line.
+            let trace = PlaybackTrace.shared.snapshot()
+            if !trace.isEmpty {
+                lines.append("\n--- Playback Trace (last \(trace.count) lines, oldest first) ---")
+                lines.append(contentsOf: trace)
+            }
             lines.append("=== END REPORT ===")
             return lines.joined(separator: "\n")
         }
