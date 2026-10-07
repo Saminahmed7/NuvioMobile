@@ -128,7 +128,8 @@ object TempPlaybackCache {
         launchId: Long,
         sourceUrl: String,
         headers: Map<String, String> = emptyMap(),
-    ): String = resolveProxiedSource(launchId, sourceUrl, headers).first
+        forceNewSession: Boolean = false,
+    ): String = resolveProxiedSource(launchId, sourceUrl, headers, forceNewSession).first
 
     /**
      * True for HLS media/master playlists (.m3u8). These cannot use the
@@ -163,22 +164,36 @@ object TempPlaybackCache {
         launchId: Long?,
         sourceUrl: String,
         headers: Map<String, String> = emptyMap(),
+        forceNewSession: Boolean = false,
     ): Pair<String, Map<String, String>> {
-        if (launchId == null || !shouldProxy(sourceUrl)) return sourceUrl to headers
+        if (launchId == null) return sourceUrl to headers
+        if (!shouldProxy(sourceUrl)) {
+            // Stream cannot be proxied (e.g. HLS or direct). If this launch had an
+            // active proxy session, cleanly stop and delete it so previous episode's
+            // downloaders and cache files don't linger.
+            val oldKey = activeSessionKeys.remove(launchId)
+            if (oldKey != null) {
+                runCatching { NuvioCacheProxyBridgeFactory.create()?.stopSession(oldKey) }
+            }
+            proxied.remove(launchId)
+            _status.update { current -> current - launchId }
+            return sourceUrl to headers
+        }
         val bridge = NuvioCacheProxyBridgeFactory.create() ?: return sourceUrl to headers
-        // Reuse existing session for the same launchId (same episode) to preserve
-        // the on-disk cache. Only teardown on a genuinely different stream (new
-        // launchId). The Swift proxy will update its upstream URL in-place.
+
         val existingKey = activeSessionKeys[launchId]
-        if (existingKey != null) {
-            // Reuse the session key; proxy updates upstream URL without deleting cache
+        if (!forceNewSession && existingKey != null) {
+            // Reuse existing session for genuine debrid credential re-resolves of the
+            // same stream. The Swift proxy updates upstream URL in-place without deleting cache.
             val local = runCatching {
                 bridge.startSession(existingKey, sourceUrl, encodeHeaders(headers))
             }.getOrNull().orEmpty()
             if (local.isNotBlank()) return local to emptyMap()
             // Fall through to create new session if reuse failed
         }
-        // New session (different launchId or reuse failed)
+
+        // New session (forceNewSession = true for next episode / stream switch,
+        // different launchId, or reuse failed): tear down old session and disk directory.
         val oldKey = activeSessionKeys.remove(launchId)
         if (oldKey != null) {
             runCatching { bridge.stopSession(oldKey) }
@@ -282,7 +297,7 @@ object TempPlaybackCache {
                     downloadSpeedBps = speed,
                     totalBytes = total ?: prev.totalBytes,
                     isComplete = isComplete,
-                    ranges = if (ranges.isNotEmpty()) ranges else prev.ranges,
+                    ranges = if (rangesElement != null) ranges else prev.ranges,
                 ))
             }
         }

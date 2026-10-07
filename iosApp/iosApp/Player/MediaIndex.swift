@@ -62,6 +62,24 @@ struct MediaIndexTable {
         }
         return min(max(p.seconds / durationSec, 0.0), 1.0)
     }
+
+    /// File byte offset for media time in seconds.
+    /// Returns the exact cue/sample point at or immediately before `seconds`.
+    func byte(forSeconds seconds: Double) -> Int64 {
+        guard durationSec > 0, points.count >= 2 else { return 0 }
+        let s = min(max(seconds, 0.0), durationSec)
+        var lo = 0
+        var hi = points.count - 1
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            if points[mid].seconds <= s {
+                lo = mid
+            } else {
+                hi = mid - 1
+            }
+        }
+        return points[lo].byte
+    }
 }
 
 enum MediaIndexBuildResult {

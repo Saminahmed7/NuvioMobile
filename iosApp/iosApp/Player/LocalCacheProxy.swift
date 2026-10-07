@@ -1027,6 +1027,9 @@ final class ProxySession {
       guard let (pos, dur) = playheadMs, dur > 0, let total = totalSize, total > 0 else {
         return 0
       }
+      if let index = mediaIndex {
+        return index.byte(forSeconds: Double(pos) / 1000.0)
+      }
       return max(0, min(total, Int64((Double(pos) / Double(dur)) * Double(total))))
     }
     var valid = true
@@ -1203,6 +1206,9 @@ final class ProxySession {
             return streamPos
         }
         guard let (pos, dur) = playheadMs, dur > 0, let total = totalSize, total > 0 else { return nil }
+        if let index = mediaIndex {
+            return index.byte(forSeconds: Double(pos) / 1000.0)
+        }
         return max(0, min(total, Int64((Double(pos) / Double(dur)) * Double(total))))
     }
 
@@ -1594,8 +1600,18 @@ final class ProxySession {
         guard let ph = playheadByte, let fd = forwardDownloader, !fd.isFinished else { return }
         guard !isRateLimited else { return }
 
-        if ph > fd.streamOffset + saminProxyForwardSeekBytes {
-            let target = (ph / saminProxyChunkBytes) * saminProxyChunkBytes
+        // If an active client is waiting for data or reading at an earlier byte,
+        // clamp to that client's streamOffset so the prefetcher never leaps ahead
+        // of MPV's active read head on VBR files.
+        var effectivePh = ph
+        for conn in activeConnections.values {
+            if conn.streamOffset > 0 && conn.streamOffset < effectivePh {
+                effectivePh = conn.streamOffset
+            }
+        }
+
+        if effectivePh > fd.streamOffset + saminProxyForwardSeekBytes {
+            let target = (effectivePh / saminProxyChunkBytes) * saminProxyChunkBytes
             LocalCacheProxyLog.shared.log("Session [\(key)]: Forward seek -> moving prefetcher \(fd.streamOffset) -> \(target)")
             fd.cancel()
             forwardDownloader = nil
@@ -1607,10 +1623,10 @@ final class ProxySession {
         // can be off by tens of MB on VBR files), and debounce right after a
         // (re)start so a settling seek can't bounce the stream around.
         guard playheadStreamPos != nil,
-              ph + saminProxyBackwardSeekBytes < fd.streamOffset,
+              effectivePh + saminProxyBackwardSeekBytes < fd.streamOffset,
               saminNow() - lastForwardDownloaderStartTime > 3.0 else { return }
 
-        let phChunk = ph / saminProxyChunkBytes
+        let phChunk = effectivePh / saminProxyChunkBytes
         let totalChunks = totalSize.map { ($0 + saminProxyChunkBytes - 1) / saminProxyChunkBytes } ?? Int64.max
         var gap: Int64 = 0
         while gap < saminProxyBackwardGapChunks,

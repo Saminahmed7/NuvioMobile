@@ -167,6 +167,7 @@ internal fun PlayerScreenRuntime.switchToP2pSourceStream(stream: StreamItem) {
     val currentPositionMs = playbackSnapshot.positionMs.coerceAtLeast(0L)
     flushWatchProgress()
     stopActiveP2pStream()
+    args.launchId?.let { TempPlaybackCache.cancelAndDelete(it) }
     saveP2pStreamForReuse(
         stream = stream,
         videoId = activeVideoId,
@@ -210,6 +211,7 @@ internal fun PlayerScreenRuntime.switchToP2pEpisodeStream(
     resetEpisodePanelAndNextEpisodeState()
     flushWatchProgress()
     stopActiveP2pStream()
+    args.launchId?.let { TempPlaybackCache.cancelAndDelete(it) }
     val epVideoId = episode.id
     val resume = resolveEpisodeResume(epVideoId, episode)
     saveP2pStreamForReuse(
@@ -277,10 +279,12 @@ internal fun PlayerScreenRuntime.switchToSource(stream: StreamItem) {
     // Samin: route remote streams through the loopback cache proxy so the
     // player reads from disk (instant replays, offline survival). Without
     // this, every stream switch silently bypasses the proxy session.
+    // Switching sources forces a fresh proxy session and deletes old chunks.
     val (playUrl, playHeaders) = TempPlaybackCache.resolveProxiedSource(
         launchId = args.launchId,
         sourceUrl = url,
         headers = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request),
+        forceNewSession = true,
     )
     activeSourceUrl = playUrl
     activeSourceAudioUrl = null
@@ -333,11 +337,13 @@ internal fun PlayerScreenRuntime.switchToEpisodeStream(stream: StreamItem, episo
         saveDirectStreamForReuse(stream, url, epVideoId, episode.season, episode.episode)
     }
     externalSubtitles = stream.externalSubtitles
-    // Samin: same proxy routing as switchToSource (see above).
+    // Samin: switching episode forces a clean session, teardown of previous
+    // episode directory and downloaders, and pristine cache state.
     val (playUrl, playHeaders) = TempPlaybackCache.resolveProxiedSource(
         launchId = args.launchId,
         sourceUrl = url,
         headers = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request),
+        forceNewSession = true,
     )
     activeSourceUrl = playUrl
     activeSourceAudioUrl = null
@@ -352,6 +358,7 @@ internal fun PlayerScreenRuntime.switchToDownloadedEpisode(downloadItem: Downloa
     resetEpisodePanelAndNextEpisodeState()
     flushWatchProgress()
     stopActiveP2pStream()
+    args.launchId?.let { TempPlaybackCache.cancelAndDelete(it) }
 
     val fallbackVideoId = buildPlaybackVideoId(
         parentMetaId = parentMetaId,
