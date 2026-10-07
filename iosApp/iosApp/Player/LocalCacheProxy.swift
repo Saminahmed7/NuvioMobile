@@ -1955,6 +1955,8 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
     // Watchdog
     private(set) var lastByteUptime: TimeInterval = 0
     private var watchdogTimer: DispatchSourceTimer?
+    private var receivedBytesInCurrentTask = false
+    private var lastReconnectUptime: TimeInterval = 0
 
     init(session: ProxySession, startByte: Int64) {
         self.session = session
@@ -1995,6 +1997,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
 
         self.streamOffset = effectiveOffset
         lastByteUptime = saminNow()
+        receivedBytesInCurrentTask = false
 
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 60)
         request.httpMethod = "GET"
@@ -2037,6 +2040,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         task = nil
         urlSession?.invalidateAndCancel()
         urlSession = nil
+        receivedBytesInCurrentTask = false
         cleanupFileHandle()
         if currentChunkIndex >= 0 {
             session.releaseChunkWrite(chunkIndex: currentChunkIndex, owner: "forward")
@@ -2090,7 +2094,8 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         guard currentChunkIndex == chunkIndex else { return }
 
         let idle = saminNow() - lastByteUptime
-        if idle >= 3.0 {
+        let threshold: TimeInterval = receivedBytesInCurrentTask ? 15.0 : 25.0
+        if idle >= threshold {
             LocalCacheProxyLog.shared.log("FD [\(startByte)]: Client waiting on chunk \(chunkIndex) and idle \(String(format: "%.1f", idle))s -> reconnecting continuous stream")
             reconnect(reason: "client waiting & idle")
         }
@@ -2099,12 +2104,18 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
     private func reconnect(reason: String) {
         guard !isCancelled, !isFinished, session.valid else { return }
         guard !session.isRateLimited else { return } // backoff timer owns the retry
+        let now = saminNow()
+        // Prevent reconnect storms: enforce at least 6s cooldown between reconnects
+        guard now - lastReconnectUptime >= 6.0 else { return }
+        lastReconnectUptime = now
+
         session.forwardReconnects += 1
         LocalCacheProxyLog.shared.log("FD [\(startByte)]: Reconnecting from \(streamOffset) (reason: \(reason))...")
         task?.cancel()
         task = nil
         urlSession?.invalidateAndCancel()
         urlSession = nil
+        receivedBytesInCurrentTask = false
         cleanupFileHandle()
         if currentChunkIndex >= 0 {
             session.releaseChunkWrite(chunkIndex: currentChunkIndex, owner: "forward")
@@ -2122,6 +2133,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         task = nil
         urlSession?.invalidateAndCancel()
         urlSession = nil
+        receivedBytesInCurrentTask = false
         cleanupFileHandle()
         if currentChunkIndex >= 0 {
             session.releaseChunkWrite(chunkIndex: currentChunkIndex, owner: "forward")
@@ -2154,10 +2166,21 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         let idle = now - lastByteUptime
 
         let clientIsWaiting = session.activeConnections.values.contains { $0.isWaitingForData }
-        let threshold = clientIsWaiting ? 4.0 : 20.0
+        let threshold: TimeInterval
+        if !receivedBytesInCurrentTask {
+            // Handshake / TLS / TTFB phase: allow time for remote worker/origin to deliver first byte
+            threshold = 25.0
+        } else if clientIsWaiting {
+            // Active playback waiting: allow TCP packet jitter and CDN buffer flushes to recover
+            // without resetting TCP CWND, while still recovering if the socket actually died.
+            threshold = 15.0
+        } else {
+            // Prefetching ahead of playhead: match request timeout
+            threshold = 30.0
+        }
 
         if idle >= threshold {
-            LocalCacheProxyLog.shared.log("FD [\(startByte)]: Watchdog stall (idle=\(String(format: "%.1f", idle))s, clientWaiting=\(clientIsWaiting)). Reconnecting from \(streamOffset)...")
+            LocalCacheProxyLog.shared.log("FD [\(startByte)]: Watchdog stall (idle=\(String(format: "%.1f", idle))s, clientWaiting=\(clientIsWaiting), receivedBytes=\(receivedBytesInCurrentTask)). Reconnecting from \(streamOffset)...")
             reconnect(reason: "watchdog idle stall")
         }
     }
@@ -2280,6 +2303,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         session.recordBytesReceived(data.count)
         totalBytesReceived += Int64(data.count)
         lastByteUptime = saminNow()
+        receivedBytesInCurrentTask = true
 
         var cursor = streamOffset
         var remaining = data
@@ -2437,6 +2461,7 @@ final class ForwardDownloader: NSObject, URLSessionDataDelegate {
         }
         urlSession?.invalidateAndCancel()
         urlSession = nil
+        receivedBytesInCurrentTask = false
 
         if !failed {
             LocalCacheProxyLog.shared.log("FD [\(startByte)]: Continuous forward download finished successfully at EOF")
