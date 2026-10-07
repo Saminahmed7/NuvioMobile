@@ -1420,8 +1420,33 @@ final class ProxySession {
             return
         }
 
-        // Behind the head (seek back / evicted chunk) or far ahead (index
-        // probe): fetch this chunk on its own without touching the stream.
+        // Backward seek: playback is far behind the prefetcher in an uncached region.
+        // The forward downloader is filling the far future while playback starves on
+        // one-off 2 MB chunk fetches. Jump the prefetcher back to the live read head.
+        if fd.streamOffset - startByte > saminProxyBackwardSeekBytes &&
+           !cachedChunks.contains(chunkIdx) &&
+           saminNow() - lastForwardDownloaderStartTime > 2.0 {
+            let phChunk = chunkIdx
+            let totalChunks = totalSize.map { ($0 + saminProxyChunkBytes - 1) / saminProxyChunkBytes } ?? Int64.max
+            var gap: Int64 = 0
+            while gap < saminProxyBackwardGapChunks,
+                  phChunk + gap < totalChunks,
+                  !cachedChunks.contains(phChunk + gap) {
+                gap += 1
+            }
+            if gap >= 2 {
+                let target = phChunk * saminProxyChunkBytes
+                LocalCacheProxyLog.shared.log("Session [\(key)]: Playback \(((fd.streamOffset - startByte) / 1024 / 1024)) MB behind prefetcher (offset=\(fd.streamOffset / 1024 / 1024) MB, target=\(target / 1024 / 1024) MB, gap=\(gap)) -> jumping prefetcher backward to chunk \(phChunk)")
+                cancelAllChunkFetchers()
+                fd.cancel()
+                forwardDownloader = nil
+                startNewForwardDownloader(targetStartByte: target, reason: "playback behind at \(startByte)")
+                return
+            }
+        }
+
+        // Single missing chunk (evicted or short gap): fetch this chunk on its own
+        // without touching the main forward stream.
         ensureChunkFetcher(chunkIndex: chunkIdx)
         return
         }
@@ -1619,12 +1644,12 @@ final class ProxySession {
             return
         }
 
-        // Backward: only trust MPV's real read position (a time-ratio estimate
-        // can be off by tens of MB on VBR files), and debounce right after a
-        // (re)start so a settling seek can't bounce the stream around.
-        guard playheadStreamPos != nil,
+        // Backward: trust MPV's real read position, parsed container cues, or
+        // active client socket offsets, and debounce after a restart.
+        let hasReliablePosition = playheadStreamPos != nil || mediaIndex != nil || activeConnections.values.contains(where: { $0.streamOffset > 0 })
+        guard hasReliablePosition,
               effectivePh + saminProxyBackwardSeekBytes < fd.streamOffset,
-              saminNow() - lastForwardDownloaderStartTime > 3.0 else { return }
+              saminNow() - lastForwardDownloaderStartTime > 2.0 else { return }
 
         let phChunk = effectivePh / saminProxyChunkBytes
         let totalChunks = totalSize.map { ($0 + saminProxyChunkBytes - 1) / saminProxyChunkBytes } ?? Int64.max
@@ -1634,12 +1659,12 @@ final class ProxySession {
               !cachedChunks.contains(phChunk + gap) {
             gap += 1
         }
-        // A short gap before already-cached data (or EOF) is cheaper to fill
-        // with the dedicated chunk fetchers than to tear down the stream.
-        guard gap >= saminProxyBackwardGapChunks else { return }
+        // Only jump if there is an uncached gap of at least 2 chunks.
+        guard gap >= 2 else { return }
 
         let target = phChunk * saminProxyChunkBytes
         LocalCacheProxyLog.shared.log("Session [\(key)]: Backward seek -> moving prefetcher \(fd.streamOffset) -> \(target)")
+        cancelAllChunkFetchers()
         fd.cancel()
         forwardDownloader = nil
         startNewForwardDownloader(targetStartByte: target, reason: "backward seek")

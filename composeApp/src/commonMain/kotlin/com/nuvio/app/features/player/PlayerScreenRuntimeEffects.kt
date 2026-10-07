@@ -154,7 +154,8 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
             TempPlaybackCache.refreshRanges(lid)
             val pos = playbackSnapshot.positionMs.coerceAtLeast(0L)
             val dur = playbackSnapshot.durationMs
-            if (dur > 0L && (lastPushedMs < 0L || kotlin.math.abs(pos - lastPushedMs) > 30_000L)) {
+            val jumped = lastPushedMs >= 0L && (pos < lastPushedMs - 2000L || pos > lastPushedMs + 10_000L)
+            if (dur > 0L && (lastPushedMs < 0L || jumped || kotlin.math.abs(pos - lastPushedMs) >= 5000L)) {
                 lastPushedMs = pos
                 TempPlaybackCache.pushPlayhead(lid, pos, dur, playbackSnapshot.streamPos, playbackSnapshot.isPlaying)
             }
