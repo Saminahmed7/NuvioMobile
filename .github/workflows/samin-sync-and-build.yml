@@ -17,6 +17,13 @@ on:
         default: false
   schedule:
     - cron: 0 3 * * *
+  push:
+    branches:
+      - samin-temp-cache
+    paths-ignore:
+      - 'store-samin.json'
+      - 'Docs/**'
+      - 'README.md'
 
 permissions:
   contents: write
@@ -30,10 +37,10 @@ concurrency:
 jobs:
   sync-build-publish:
     name: Sync upstream, build Samin IPA, update source
-    runs-on: macos-26
-    timeout-minutes: 90
+    runs-on: xcode-27
+    timeout-minutes: 120
     env:
-      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
       GRADLE_OPTS: -Dfile.encoding=UTF-8
       IOS_CONFIGURATION: Release
       KOTLIN_DAEMON_JVMARGS: -Xmx2048M
@@ -66,6 +73,17 @@ jobs:
               exit 1
             }
             git push origin "HEAD:${BRANCH}"
+          fi
+
+      - name: Sync official releases to store-samin.json
+        run: |
+          python3 scripts/sync-store-samin.py
+          if [[ "${{ inputs.skip_build }}" == "true" ]]; then
+            if ! git diff --quiet store-samin.json; then
+              git add store-samin.json
+              git commit -m "chore(store): sync official releases into store-samin.json [skip ci]"
+              git push origin "HEAD:${BRANCH}"
+            fi
           fi
 
       - name: Set up Java
@@ -153,7 +171,7 @@ jobs:
           # The build number mirrors the patch core: fully deterministic, so
           # concurrent runs compute the same numbers and collapse idempotently
           # instead of publishing duplicate builds.
-          SAMIN_REV="$(( $(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq '[.[] | select(.tag_name | startswith("samin-v"))] | length') + 1 ))"
+          SAMIN_REV="$(( $(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" --jq '[.[] | select(.tag_name | startswith("samin-v"))] | length') + 1 ))"
           PATCH_NUM="$(echo "${BASE_VERSION}" | awk -F. '{print $3 + 0}')"
           MAJOR_MINOR="$(echo "${BASE_VERSION}" | awk -F. '{print $1 "." $2}')"
           SAMIN_PATCH="$((PATCH_NUM * 1000 + SAMIN_REV))"
@@ -272,7 +290,7 @@ jobs:
             --download-url "${DOWNLOAD_URL}"
           git checkout -- iosApp/Configuration/Version.xcconfig
           git add store-samin.json
-          git commit -m "chore(samin): publish ${MARKETING_VERSION} (${SAMIN_BUILD})" || exit 0
+          git commit -m "chore(samin): publish ${MARKETING_VERSION} (${SAMIN_BUILD}) [skip ci]" || exit 0
           git push origin "HEAD:${BRANCH}"
 
       - name: Summarize
