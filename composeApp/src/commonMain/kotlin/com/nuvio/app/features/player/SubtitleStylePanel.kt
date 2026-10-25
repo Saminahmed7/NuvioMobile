@@ -28,31 +28,21 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.nuvio.app.core.ui.nuvio
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.compose_action_off
 import nuvio.composeapp.generated.resources.compose_action_on
-import nuvio.composeapp.generated.resources.compose_player_auto_sync
 import nuvio.composeapp.generated.resources.compose_player_bold
 import nuvio.composeapp.generated.resources.compose_player_bottom_offset
-import nuvio.composeapp.generated.resources.compose_player_capture_line
 import nuvio.composeapp.generated.resources.compose_player_color
 import nuvio.composeapp.generated.resources.compose_player_font_size
 import nuvio.composeapp.generated.resources.compose_player_font_size_value
-import nuvio.composeapp.generated.resources.compose_player_loading_lines
-import nuvio.composeapp.generated.resources.compose_player_no_subtitle_lines_found
 import nuvio.composeapp.generated.resources.compose_player_outline
 import nuvio.composeapp.generated.resources.compose_player_outline_color
-import nuvio.composeapp.generated.resources.compose_player_reload
-import nuvio.composeapp.generated.resources.compose_player_reset
 import nuvio.composeapp.generated.resources.compose_player_reset_defaults
-import nuvio.composeapp.generated.resources.compose_player_select_addon_subtitle_first
 import nuvio.composeapp.generated.resources.compose_player_style
-import nuvio.composeapp.generated.resources.compose_player_subtitle_delay
 import nuvio.composeapp.generated.resources.compose_player_text_opacity
 import org.jetbrains.compose.resources.stringResource
 import kotlin.math.abs
@@ -61,17 +51,9 @@ import kotlin.math.roundToInt
 @Composable
 fun SubtitleStylePanel(
     style: SubtitleStyleState,
-    subtitleDelayMs: Int,
-    selectedAddonSubtitle: AddonSubtitle?,
-    subtitleAutoSyncState: SubtitleAutoSyncUiState,
     isCompact: Boolean,
     showHeader: Boolean = true,
     onStyleChanged: (SubtitleStyleState) -> Unit,
-    onSubtitleDelayChanged: (Int) -> Unit,
-    onSubtitleDelayReset: () -> Unit,
-    onAutoSyncCapture: () -> Unit,
-    onAutoSyncCueSelected: (SubtitleSyncCue) -> Unit,
-    onAutoSyncReload: () -> Unit,
 ) {
     val sectionGap = if (isCompact) 12.dp else 16.dp
 
@@ -84,26 +66,6 @@ fun SubtitleStylePanel(
                 text = stringResource(Res.string.compose_player_style),
                 color = Color.White,
                 style = MaterialTheme.typography.titleMedium,
-            )
-        }
-
-        SubtitleStyleSection(title = stringResource(Res.string.compose_player_subtitle_delay)) {
-            SubtitleStyleStepper(
-                value = formatSubtitleDelay(subtitleDelayMs),
-                onDecrease = {
-                    onSubtitleDelayChanged(
-                        (subtitleDelayMs - SUBTITLE_DELAY_STEP_MS).coerceAtLeast(SUBTITLE_DELAY_MIN_MS),
-                    )
-                },
-                onIncrease = {
-                    onSubtitleDelayChanged(
-                        (subtitleDelayMs + SUBTITLE_DELAY_STEP_MS).coerceAtMost(SUBTITLE_DELAY_MAX_MS),
-                    )
-                },
-            )
-            SubtitleTextAction(
-                label = stringResource(Res.string.compose_player_reset),
-                onClick = onSubtitleDelayReset,
             )
         }
 
@@ -182,14 +144,6 @@ fun SubtitleStylePanel(
                 },
             )
         }
-
-        SubtitleAutoSyncSection(
-            selectedAddonSubtitle = selectedAddonSubtitle,
-            state = subtitleAutoSyncState,
-            onCapture = onAutoSyncCapture,
-            onCueSelected = onAutoSyncCueSelected,
-            onReload = onAutoSyncReload,
-        )
 
         SubtitleResetAction(
             label = stringResource(Res.string.compose_player_reset_defaults),
@@ -333,112 +287,6 @@ private fun SubtitleColorPicker(
 }
 
 @Composable
-private fun SubtitleAutoSyncSection(
-    selectedAddonSubtitle: AddonSubtitle?,
-    state: SubtitleAutoSyncUiState,
-    onCapture: () -> Unit,
-    onCueSelected: (SubtitleSyncCue) -> Unit,
-    onReload: () -> Unit,
-) {
-    val tokens = MaterialTheme.nuvio
-    val capturedPositionMs = state.capturedPositionMs
-    val nearestCues = if (capturedPositionMs == null) {
-        emptyList()
-    } else {
-        state.cues.sortedBy { abs(it.startTimeMs - capturedPositionMs) }.take(5)
-    }
-
-    SubtitleStyleSection(title = stringResource(Res.string.compose_player_auto_sync)) {
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            SubtitleTextAction(
-                label = stringResource(Res.string.compose_player_reload),
-                enabled = selectedAddonSubtitle != null,
-                onClick = onReload,
-            )
-            SubtitleTextAction(
-                label = stringResource(Res.string.compose_player_capture_line),
-                enabled = selectedAddonSubtitle != null,
-                onClick = onCapture,
-            )
-        }
-
-        when {
-            selectedAddonSubtitle == null -> {
-                SubtitleHelperText(stringResource(Res.string.compose_player_select_addon_subtitle_first))
-            }
-
-            state.isLoading -> {
-                SubtitleHelperText(stringResource(Res.string.compose_player_loading_lines))
-            }
-
-            state.errorMessage != null -> {
-                Text(
-                    text = state.errorMessage,
-                    color = tokens.colors.danger,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
-
-            capturedPositionMs != null && nearestCues.isEmpty() -> {
-                SubtitleHelperText(stringResource(Res.string.compose_player_no_subtitle_lines_found))
-            }
-        }
-
-        nearestCues.forEach { cue ->
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(Color.White.copy(alpha = 0.06f))
-                    .clickable { onCueSelected(cue) }
-                    .padding(horizontal = 10.dp, vertical = 8.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.Top,
-            ) {
-                Text(
-                    text = formatCueTimestamp(cue.startTimeMs),
-                    color = tokens.colors.accent,
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.SemiBold,
-                )
-                Text(
-                    text = cue.text,
-                    modifier = Modifier.weight(1f),
-                    color = Color.White,
-                    style = MaterialTheme.typography.bodySmall,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun SubtitleTextAction(
-    label: String,
-    onClick: () -> Unit,
-    enabled: Boolean = true,
-) {
-    val tokens = MaterialTheme.nuvio
-
-    Box(
-        modifier = Modifier
-            .alpha(if (enabled) 1f else tokens.opacity.disabled)
-            .clip(RoundedCornerShape(12.dp))
-            .background(Color.White.copy(alpha = 0.08f))
-            .clickable(enabled = enabled, onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 10.dp),
-    ) {
-        Text(
-            text = label,
-            color = Color.White,
-            style = MaterialTheme.typography.labelLarge,
-        )
-    }
-}
-
-@Composable
 private fun SubtitleResetAction(
     label: String,
     onClick: () -> Unit,
@@ -454,34 +302,10 @@ private fun SubtitleResetAction(
     )
 }
 
-@Composable
-private fun SubtitleHelperText(text: String) {
-    Text(
-        text = text,
-        color = Color.White.copy(alpha = 0.7f),
-        style = MaterialTheme.typography.bodySmall,
-    )
-}
-
 private fun sameRgb(first: Color, second: Color): Boolean =
     abs(first.red - second.red) < 0.01f &&
         abs(first.green - second.green) < 0.01f &&
         abs(first.blue - second.blue) < 0.01f
-
-private fun formatSubtitleDelay(delayMs: Int): String {
-    val sign = if (delayMs >= 0) "+" else "-"
-    val absoluteMs = abs(delayMs)
-    val seconds = absoluteMs / 1000
-    val millis = absoluteMs % 1000
-    return "$sign$seconds.${millis.toString().padStart(3, '0')}s"
-}
-
-private fun formatCueTimestamp(timeMs: Long): String {
-    val totalSeconds = (timeMs / 1000L).coerceAtLeast(0L)
-    val minutes = totalSeconds / 60L
-    val seconds = totalSeconds % 60L
-    return "$minutes:${seconds.toString().padStart(2, '0')}"
-}
 
 private val SubtitleOutlineColorSwatches = listOf(
     Color.Black,

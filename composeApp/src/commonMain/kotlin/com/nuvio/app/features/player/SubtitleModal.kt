@@ -55,6 +55,7 @@ import nuvio.composeapp.generated.resources.compose_player_built_in
 import nuvio.composeapp.generated.resources.compose_player_fetch_subtitles
 import nuvio.composeapp.generated.resources.compose_player_languages
 import nuvio.composeapp.generated.resources.compose_player_none
+import nuvio.composeapp.generated.resources.compose_player_auto_sync
 import nuvio.composeapp.generated.resources.compose_player_style
 import nuvio.composeapp.generated.resources.compose_player_subtitles
 import nuvio.composeapp.generated.resources.settings_playback_option_forced
@@ -291,6 +292,34 @@ fun SubtitleModal(
                         exit = fadeOut(),
                     ) {
                         SubtitleRail(
+                            title = stringResource(Res.string.compose_player_auto_sync),
+                            width = 300.dp,
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .heightIn(max = railMaxHeight)
+                                    .verticalScroll(rememberScrollState()),
+                            ) {
+                                SubtitleSyncPanel(
+                                    subtitleDelayMs = subtitleDelayMs,
+                                    selectedAddonSubtitle = effectiveSelectedAddonSubtitle,
+                                    subtitleAutoSyncState = subtitleAutoSyncState,
+                                    onSubtitleDelayChanged = onSubtitleDelayChanged,
+                                    onSubtitleDelayReset = onSubtitleDelayReset,
+                                    onAutoSyncCapture = onAutoSyncCapture,
+                                    onAutoSyncCueSelected = onAutoSyncCueSelected,
+                                    onAutoSyncReload = onAutoSyncReload,
+                                )
+                            }
+                        }
+                    }
+
+                    AnimatedVisibility(
+                        visible = styleVisible,
+                        enter = fadeIn(),
+                        exit = fadeOut(),
+                    ) {
+                        SubtitleRail(
                             title = stringResource(Res.string.compose_player_style),
                             width = 280.dp,
                         ) {
@@ -301,17 +330,9 @@ fun SubtitleModal(
                             ) {
                                 SubtitleStylePanel(
                                     style = subtitleStyle,
-                                    subtitleDelayMs = subtitleDelayMs,
-                                    selectedAddonSubtitle = effectiveSelectedAddonSubtitle,
-                                    subtitleAutoSyncState = subtitleAutoSyncState,
                                     isCompact = railMaxHeight < 420.dp,
                                     showHeader = false,
                                     onStyleChanged = onStyleChanged,
-                                    onSubtitleDelayChanged = onSubtitleDelayChanged,
-                                    onSubtitleDelayReset = onSubtitleDelayReset,
-                                    onAutoSyncCapture = onAutoSyncCapture,
-                                    onAutoSyncCueSelected = onAutoSyncCueSelected,
-                                    onAutoSyncReload = onAutoSyncReload,
                                 )
                             }
                         }
