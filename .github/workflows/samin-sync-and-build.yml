@@ -16,7 +16,7 @@ on:
         type: boolean
         default: false
   schedule:
-    - cron: 0 3 * * *
+    - cron: '0 */3 * * *'
   push:
     branches:
       - samin-temp-cache
@@ -78,12 +78,10 @@ jobs:
       - name: Sync official releases to store-samin.json
         run: |
           python3 scripts/sync-store-samin.py
-          if [[ "${{ inputs.skip_build }}" == "true" ]]; then
-            if ! git diff --quiet store-samin.json; then
-              git add store-samin.json
-              git commit -m "chore(store): sync official releases into store-samin.json [skip ci]"
-              git push origin "HEAD:${BRANCH}"
-            fi
+          if ! git diff --quiet store-samin.json; then
+            git add store-samin.json
+            git commit -m "chore(store): sync official releases into store-samin.json [skip ci]"
+            git push origin "HEAD:${BRANCH}"
           fi
 
       - name: Set up Java
