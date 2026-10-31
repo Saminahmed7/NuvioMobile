@@ -8,6 +8,7 @@ even when custom builds are pending, skipped, or in progress.
 import argparse
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -29,17 +30,40 @@ def ver_key(v_dict):
     return tuple(parts)
 
 
+def load_official_data(official_source: Path):
+    # Try reading from upstream/cmp-rewrite git tree first (most up-to-date)
+    for ref in ["upstream/cmp-rewrite:store.json", "HEAD:store.json"]:
+        try:
+            res = subprocess.run(
+                ["git", "show", ref],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            data = json.loads(res.stdout)
+            if data.get("apps"):
+                return data
+        except Exception:
+            pass
+
+    if official_source.is_file():
+        with official_source.open(encoding="utf-8") as f:
+            return json.load(f)
+
+    return None
+
+
 def main():
     args = parse_args()
-    if not args.official_source.is_file():
-        print(f"Error: {args.official_source} not found", file=sys.stderr)
-        return 1
     if not args.samin_source.is_file():
         print(f"Error: {args.samin_source} not found", file=sys.stderr)
         return 1
 
-    with args.official_source.open(encoding="utf-8") as f:
-        official_data = json.load(f)
+    official_data = load_official_data(args.official_source)
+    if not official_data:
+        print(f"Error: Could not load official store data from git or {args.official_source}", file=sys.stderr)
+        return 1
+
     with args.samin_source.open(encoding="utf-8") as f:
         samin_data = json.load(f)
 
