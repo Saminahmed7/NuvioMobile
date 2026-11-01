@@ -1,4 +1,4 @@
-name: Nuvio Samin sync and build
+﻿name: Nuvio Samin sync and build
 
 # Private "Nuvio Samin" SideStore source: pulls official Nuvio updates,
 # keeps the Samin temp-playback-cache patch, rebuilds the IPA and
@@ -6,6 +6,17 @@ name: Nuvio Samin sync and build
 #
 # SideStore source URL (add in SideStore -> Settings -> Sources):
 #   https://raw.githubusercontent.com/Saminahmed7/NuvioMobile/samin-temp-cache/store-samin.json
+#
+# Build policy:
+#   push             -> always build (you or a merged upstream commit landed)
+#   workflow_dispatch -> respects the skip_build input as before
+#   schedule (cron)  -> build ONLY when something actually changed since the
+#                       last published Samin release:
+#                         • upstream/cmp-rewrite has new commits, OR
+#                         • you pushed new commits to samin-temp-cache
+#                       This stops the 8 identical builds per day that
+#                       appeared when nothing changed, while guaranteeing
+#                       upstream changes still ship within 3 hours.
 
 on:
   workflow_dispatch:
@@ -84,19 +95,96 @@ jobs:
             git push origin "HEAD:${BRANCH}"
           fi
 
+      - name: Check whether a build is actually needed
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # ------------------------------------------------------------------
+          # push: the branch just changed (user commit or upstream merge that
+          #       the Merge step above pushed) — always build immediately.
+          # workflow_dispatch: manual run — delegate to skip_build input.
+          # schedule (cron): compare current state against the last release.
+          # ------------------------------------------------------------------
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "Push trigger — build needed."
+            echo "needed=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "Manual dispatch — build needed (skip_build handled by later step conditions)."
+            echo "needed=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # ---- Scheduled cron only from here --------------------------------
+
+          # 1. Upstream SHA recorded in the last Samin release notes.
+          #    Release body contains the line:
+          #      "Official upstream: NuvioMedia/NuvioMobile@<40-char sha>"
+          LAST_RELEASE_BODY="$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/releases" \
+            --jq '[.[] | select(.tag_name | startswith("samin-v"))] | first | .body // ""' \
+            2>/dev/null || true)"
+          LAST_UPSTREAM_SHA="$(echo "${LAST_RELEASE_BODY}" \
+            | grep -oE 'NuvioMedia/NuvioMobile@[a-f0-9]{40}' \
+            | head -1 | cut -d'@' -f2 || true)"
+
+          # 2. Current upstream HEAD (already fetched by the Merge step).
+          CURRENT_UPSTREAM_SHA="${UPSTREAM_SHA}"
+
+          # 3. Last Samin release tag — baseline for user-commit detection.
+          LAST_TAG="$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/releases" \
+            --jq '[.[] | select(.tag_name | startswith("samin-v"))] | first | .tag_name // ""' \
+            2>/dev/null || true)"
+
+          # 4. New user (non-bot) commits on samin-temp-cache since last release.
+          #    Both bot commit types carry "[skip ci]" in their message:
+          #      chore(store): sync official releases ... [skip ci]
+          #      chore(samin): publish ... [skip ci]
+          #    Real user commits never contain [skip ci], so filtering on that
+          #    string cleanly separates bot noise from genuine changes without
+          #    relying on committer email matching.
+          if [[ -n "${LAST_TAG}" ]]; then
+            USER_COMMITS="$(git log "${LAST_TAG}..HEAD" --oneline \
+              | grep -v '\[skip ci\]' \
+              | wc -l | tr -d ' ')"
+          else
+            # No previous Samin release — this is the very first build ever.
+            USER_COMMITS=1
+          fi
+
+          echo "Last upstream SHA in release : ${LAST_UPSTREAM_SHA:-<none>}"
+          echo "Current upstream SHA         : ${CURRENT_UPSTREAM_SHA}"
+          echo "Last Samin release tag       : ${LAST_TAG:-<none>}"
+          echo "New non-bot commits          : ${USER_COMMITS}"
+
+          if [[ "${CURRENT_UPSTREAM_SHA}" != "${LAST_UPSTREAM_SHA}" ]]; then
+            echo "Upstream changed — build needed."
+            echo "needed=true"  >> "${GITHUB_OUTPUT}"
+          elif [[ "${USER_COMMITS}" -gt 0 ]]; then
+            echo "New commits on Samin branch — build needed."
+            echo "needed=true"  >> "${GITHUB_OUTPUT}"
+          else
+            echo "Nothing changed since last release — skipping build."
+            echo "needed=false" >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Set up Java
-        if: ${{ !inputs.skip_build }}
+        if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
 
       - name: Set up Gradle
-        if: ${{ !inputs.skip_build }}
+        if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
         uses: gradle/actions/setup-gradle@v6
 
       - name: Cache Kotlin Native
-        if: ${{ !inputs.skip_build }}
+        if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
         uses: actions/cache@v5
         with:
           path: ~/.konan
@@ -105,7 +193,7 @@ jobs:
             konan-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Restore Xcode DerivedData & SwiftPM
-        if: ${{ !inputs.skip_build }}
+        if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
         id: xcode-derived
         uses: actions/cache/restore@v5
         with:
@@ -121,7 +209,7 @@ jobs:
       # and task history keyed on exactly those. A Swift-only change restores an
       # exact match, Gradle marks the link UP-TO-DATE, and it is skipped.
       - name: Restore Kotlin build outputs
-        if: ${{ !inputs.skip_build }}
+        if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
         id: kotlin-outputs
         uses: actions/cache/restore@v5
         with:
@@ -133,7 +221,7 @@ jobs:
             kotlin-outputs-${{ runner.os }}-
 
       - name: Verify Apple toolchain
-        if: ${{ !inputs.skip_build }}
+        if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
         run: |
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
@@ -150,7 +238,7 @@ jobs:
           fi
 
       - name: Bump custom build number (ephemeral, not committed)
-        if: ${{ !inputs.skip_build }}
+        if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -187,11 +275,11 @@ jobs:
           echo "Building Nuvio Samin ${SAMIN_VERSION} (${SAMIN_BUILD}) from upstream ${UPSTREAM_SHA}."
 
       - name: Prepare iOS dependencies
-        if: ${{ !inputs.skip_build }}
+        if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
         run: ./scripts/prepare-ios-dependencies.sh
 
       - name: Fast pre-flight verification
-        if: ${{ !inputs.skip_build }}
+        if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
         run: |
           echo "--> Validating Swift syntax..."
           xcrun --sdk iphoneos swiftc -parse iosApp/iosApp/Player/LocalCacheProxy.swift
@@ -201,13 +289,13 @@ jobs:
           ./gradlew :composeApp:compileKotlinIosArm64 --parallel
 
       - name: Build unsigned Samin IPA
-        if: ${{ !inputs.skip_build }}
+        if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
         run: ./scripts/build-ios-ipa.sh "${MARKETING_VERSION}"
 
       # Saved even when the Xcode step fails (e.g. a Swift error), so the next
       # run doesn't redo the finished Kotlin link. Skipped on cancellation.
       - name: Save Kotlin build outputs
-        if: ${{ !cancelled() && !inputs.skip_build && steps.kotlin-outputs.outputs.cache-hit != 'true' }}
+        if: ${{ !cancelled() && !inputs.skip_build && steps.check.outputs.needed == 'true' && steps.kotlin-outputs.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v5
         with:
           path: |
@@ -216,7 +304,7 @@ jobs:
           key: ${{ steps.kotlin-outputs.outputs.cache-primary-key }}
 
       - name: Save Xcode DerivedData & SwiftPM
-        if: ${{ !cancelled() && !inputs.skip_build && steps.xcode-derived.outputs.cache-hit != 'true' }}
+        if: ${{ !cancelled() && !inputs.skip_build && steps.check.outputs.needed == 'true' && steps.xcode-derived.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v5
         with:
           path: |
@@ -225,7 +313,7 @@ jobs:
           key: ${{ steps.xcode-derived.outputs.cache-primary-key }}
 
       - name: Publish release and update store-samin.json
-        if: ${{ !inputs.skip_build }}
+        if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -238,7 +326,7 @@ jobs:
           cp "${IPA_PATH}" "${IPA_NAME}"
           TAG="samin-v${MARKETING_VERSION}-${SAMIN_BUILD}"
           RELEASE_EXISTS="false"
-          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
             echo "Release ${TAG} already exists; reusing its IPA for the source update."
             RELEASE_EXISTS="true"
             mkdir -p samin-ipa
@@ -292,7 +380,7 @@ jobs:
           git push origin "HEAD:${BRANCH}"
 
       - name: Summarize
-        if: ${{ !inputs.skip_build }}
+        if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
         run: |
           echo "## Nuvio Samin" >> "${GITHUB_STEP_SUMMARY}"
           echo >> "${GITHUB_STEP_SUMMARY}"

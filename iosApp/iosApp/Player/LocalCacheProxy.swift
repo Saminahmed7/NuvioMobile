@@ -1,4 +1,4 @@
-import Foundation
+﻿import Foundation
 import UIKit
 import Network
 import Darwin
@@ -53,9 +53,18 @@ private let saminProxyMinResumeBytes: Int64 = 0 // Intentionally 0 (no hold-back
 // probe (index/moov atom) rather than sequential playback, so it is served by a
 // dedicated range fetch instead of dragging the prefetcher forward.
 private let saminProxyAheadWindowBytes: Int64 = 32 * 1024 * 1024
-// The prefetcher only jumps forward when the playhead lands this far beyond it
-// (a genuine seek). Smaller gaps are served by the running stream.
-private let saminProxyForwardSeekBytes: Int64 = 64 * 1024 * 1024
+// The prefetcher only jumps forward when playhead+anchor are this far beyond the
+// write head (a genuine seek with a reliable position). Lowered from 64 -> 32 MB
+// so any real seek on 4K content triggers a jump without waiting for the anchor
+// to settle, while still ignoring small sequential readahead overshoots.
+private let saminProxyForwardSeekBytes: Int64 = 32 * 1024 * 1024
+// Minimum gap between startByte and fd.streamOffset to trigger a jump using the
+// client request alone, without requiring a settled anchor. Used when
+// playheadStreamPos = 0 (mpv is mid-seek) so the anchor is unreliable. Must be
+// large enough to never fire on a lone moov/index probe but small enough to fire
+// before mpv's first timeout. 128 MB ~40 s of 4K - any genuine seek lands
+// further than this while a stray probe never does.
+private let saminProxyRequestOnlyJumpBytes: Int64 = 128 * 1024 * 1024
 // Max concurrent short-lived range fetches for client-requested chunks.
 private let saminProxyMaxChunkFetchers = 3
 // The prefetcher jumps back to the playhead when it lands this far behind the
@@ -1400,19 +1409,43 @@ final class ProxySession {
         // stops moving), so the playhead-driven reposition below never fires
         // and playback starves on one-off 2 MB fetches that share throttled
         // upstream bandwidth with the useless prefix — 1 s play / 3 s buffer.
-        // Jump the continuous stream to live playback instead. Both the
-        // request AND the anchor must be far ahead so a lone far-ahead index
-        // probe can never drag the stream away from real playback.
-        if startByte - fd.streamOffset > saminProxyForwardSeekBytes &&
-           cacheAnchorByte - fd.streamOffset > saminProxyForwardSeekBytes &&
-           saminNow() - lastForwardDownloaderStartTime > 3.0 {
+        // Jump the continuous stream to live playback instead.
+        //
+        // Two-tier trigger:
+        // • Normal path: both request AND settled anchor are far ahead (original
+        //   guard against lone index probes dragging the stream):
+        //   gap > saminProxyForwardSeekBytes (32 MB)  — fires fast on any real seek.
+        // • Seek-state path: mpv is mid-seek so playheadStreamPos = 0 and
+        //   cacheAnchorByte = 0; the anchor check always fails. Instead, fire when
+        //   the request alone is > saminProxyRequestOnlyJumpBytes (128 MB) away from
+        //   the write head. 128 MB is ~40 s of 4K content — any genuine seek lands
+        //   further than this while a lone moov/index probe never does.
+        let requestGap = startByte - fd.streamOffset
+        let anchorGap = cacheAnchorByte - fd.streamOffset
+        // anchorIsReliable: false while mpv is mid-seek (streamPos = 0) and the
+        // exact container index has not been built yet.
+        let anchorIsReliable = (playheadStreamPos ?? 0) > 0 || mediaIndex != nil
+        let jumpConditionMet: Bool
+        if anchorIsReliable {
+            // Normal path: both request and settled anchor must be far ahead.
+            jumpConditionMet = requestGap > saminProxyForwardSeekBytes &&
+                               anchorGap  > saminProxyForwardSeekBytes
+        } else {
+            // Seek-state path: anchor is zero; trust the request position alone
+            // when it is unambiguously a genuine seek (> 128 MB from write head).
+            jumpConditionMet = requestGap > saminProxyRequestOnlyJumpBytes
+        }
+        if jumpConditionMet && saminNow() - lastForwardDownloaderStartTime > 3.0 {
             // Start at the earlier of request/anchor: the anchor is a
             // time-ratio estimate on VBR files and can sit ahead of the bytes
             // mpv actually needs, which would strand the waiting chunk behind
-            // the new write head.
-            let targetByte = min(startByte, cacheAnchorByte)
+            // the new write head. When the anchor is unreliable (zero), use
+            // startByte directly so we land exactly where mpv is reading.
+            let targetByte = anchorIsReliable && cacheAnchorByte > 0
+                ? min(startByte, cacheAnchorByte)
+                : startByte
             let target = (targetByte / saminProxyChunkBytes) * saminProxyChunkBytes
-            LocalCacheProxyLog.shared.log("Session [\(key)]: Playback \(((startByte - fd.streamOffset) / 1024 / 1024)) MB ahead of prefetcher (offset=\(fd.streamOffset / 1024 / 1024) MB, anchor=\(cacheAnchorByte / 1024 / 1024) MB) -> jumping prefetcher to \(target / 1024 / 1024) MB")
+            LocalCacheProxyLog.shared.log("Session [\(key)]: Playback \(requestGap / 1024 / 1024) MB ahead of prefetcher (offset=\(fd.streamOffset / 1024 / 1024) MB, anchor=\(cacheAnchorByte / 1024 / 1024) MB, anchorReliable=\(anchorIsReliable)) -> jumping prefetcher to \(target / 1024 / 1024) MB")
             cancelAllChunkFetchers()
             fd.cancel()
             forwardDownloader = nil
@@ -1622,13 +1655,34 @@ final class ProxySession {
     ///   stream would otherwise keep filling the far future while playback
     ///   crawls through one-off 2 MB chunk fetches).
     private func maybeRepositionForward() {
-        guard let ph = playheadByte, let fd = forwardDownloader, !fd.isFinished else { return }
+        guard let fd = forwardDownloader, !fd.isFinished else { return }
         guard !isRateLimited else { return }
+
+        // Derive an effective playhead byte.
+        //
+        // While mpv is mid-seek, playheadStreamPos = 0 and playheadByte = 0
+        // (or nil), so the usual guard guard let ph = playheadByte exits early
+        // and the reposition never fires — even though active client connections
+        // already carry the real read position as their streamOffset. Fall back
+        // to the highest active connection offset so a seek can be detected and
+        // acted on immediately without waiting for the playhead to settle.
+        let candidatePh: Int64
+        if let ph = playheadByte, ph > 0 {
+            candidatePh = ph
+        } else {
+            // No reliable playhead yet — use the furthest active connection offset.
+            let bestConnOffset = activeConnections.values
+                .filter { $0.streamOffset > 0 }
+                .map { $0.streamOffset }
+                .max() ?? 0
+            guard bestConnOffset > 0 else { return }
+            candidatePh = bestConnOffset
+        }
 
         // If an active client is waiting for data or reading at an earlier byte,
         // clamp to that client's streamOffset so the prefetcher never leaps ahead
         // of MPV's active read head on VBR files.
-        var effectivePh = ph
+        var effectivePh = candidatePh
         for conn in activeConnections.values {
             if conn.streamOffset > 0 && conn.streamOffset < effectivePh {
                 effectivePh = conn.streamOffset
