@@ -20,6 +20,46 @@
       "category": "entertainment",
       "versions": [
         {
+          "version": "0.6.7057",
+          "buildVersion": "7057",
+          "date": "2026-11-04T19:11:20Z",
+          "localizedDescription": "Nuvio Samin 0.6.7057 (7057)\n\nOfficial upstream: NuvioMedia/NuvioMobile@3e156936ec246a6ae3ffb7bf6b015dd191d3cf04\n\nSamin changes on top of official:\n- Temp playback cache: progressive HTTP streams are mirrored to\n  app Caches while playing (instant start on slow connections)\n  and deleted when the player closes.\n- MPV disk-backed readahead cache for slow connections.\n",
+          "downloadURL": "https://github.com/Saminahmed7/NuvioMobile/releases/download/samin-v0.6.7057-7057/nuvio-samin-0.6.7057-full-release.ipa",
+          "size": 69283415,
+          "sha256": "0feb2f189fcb4f7bca23e68bde08ee166bdc0c4fc5d249ea43250d218ea1ebb5",
+          "minOSVersion": "16.1"
+        },
+        {
+          "version": "0.6.6056",
+          "buildVersion": "6056",
+          "date": "2026-11-04T02:20:30Z",
+          "localizedDescription": "Nuvio Samin 0.6.6056 (6056)\n\nOfficial upstream: NuvioMedia/NuvioMobile@9f18bfee1b06ccb4eeb10d7a9ba7fc9b9475f2bd\n\nSamin changes on top of official:\n- Temp playback cache: progressive HTTP streams are mirrored to\n  app Caches while playing (instant start on slow connections)\n  and deleted when the player closes.\n- MPV disk-backed readahead cache for slow connections.\n",
+          "downloadURL": "https://github.com/Saminahmed7/NuvioMobile/releases/download/samin-v0.6.6056-6056/nuvio-samin-0.6.6056-full-release.ipa",
+          "size": 69283411,
+          "sha256": "a75063ec7c49f1c60031592930dd565515b1d022a7b2f2fac43bdd43c3941bdf",
+          "minOSVersion": "16.1"
+        },
+        {
+          "version": "0.6.6055",
+          "buildVersion": "6055",
+          "date": "2026-11-03T21:58:01Z",
+          "localizedDescription": "Nuvio Samin 0.6.6055 (6055)\n\nOfficial upstream: NuvioMedia/NuvioMobile@0377f86e6f255437e1f9aa6d0f239c080d8ea02e\n\nSamin changes on top of official:\n- Temp playback cache: progressive HTTP streams are mirrored to\n  app Caches while playing (instant start on slow connections)\n  and deleted when the player closes.\n- MPV disk-backed readahead cache for slow connections.\n",
+          "downloadURL": "https://github.com/Saminahmed7/NuvioMobile/releases/download/samin-v0.6.6055-6055/nuvio-samin-0.6.6055-full-release.ipa",
+          "size": 69282032,
+          "sha256": "62f15ce4dc6a96dc169a59d8fc524a1fcf038476b7739bcea70a787bd689b72e",
+          "minOSVersion": "16.1"
+        },
+        {
+          "version": "0.6.6054",
+          "buildVersion": "6054",
+          "date": "2026-11-01T18:37:51Z",
+          "localizedDescription": "Nuvio Samin 0.6.6054 (6054)\n\nOfficial upstream: NuvioMedia/NuvioMobile@46febb568348aa5e135bff0d4d5c914933aff5a0\n\nSamin changes on top of official:\n- Temp playback cache: progressive HTTP streams are mirrored to\n  app Caches while playing (instant start on slow connections)\n  and deleted when the player closes.\n- MPV disk-backed readahead cache for slow connections.\n",
+          "downloadURL": "https://github.com/Saminahmed7/NuvioMobile/releases/download/samin-v0.6.6054-6054/nuvio-samin-0.6.6054-full-release.ipa",
+          "size": 69206984,
+          "sha256": "ec22bcc73cfc80d5c07d00886ea84ff077cc88752cf511d26ce0ff8fdce401da",
+          "minOSVersion": "16.1"
+        },
+        {
           "version": "0.6.6053",
           "buildVersion": "6053",
           "date": "2026-11-01T13:21:22Z",
@@ -87,6 +127,26 @@
           "downloadURL": "https://github.com/Saminahmed7/NuvioMobile/releases/download/samin-v0.6.4047-4047/nuvio-samin-0.6.4047-full-release.ipa",
           "size": 68285022,
           "sha256": "d8266f4a4586ceb9d5506041957675bcfdcea7d6623f1a16eb94412dfe488f29",
+          "minOSVersion": "16.1"
+        },
+        {
+          "version": "0.6.8",
+          "buildVersion": "151",
+          "date": "2026-11-05T18:26:56Z",
+          "localizedDescription": "- 0403e6f6 fix(player): detach mpv surfaces on the playback thread @tapframe  \r\n- 68c815b2 feat(streams): update blur @tapframe  \r\n- b90454d7 feat(details): update blur @tapframe  \r\n- [fix(ios): keep an add-on subtitle selected before mpv loads the file (#2517)](https://github.com/NuvioMedia/NuvioMobile/pull/2517) @skoruppa  \r\n- [sync ASS/SSA add-on subtitles drawn by libass (#2515)](https://github.com/NuvioMedia/NuvioMobile/pull/2515) @skoruppa  \r\n- [fix(i18n): drop trailing period from two pt-BR descriptions (#2506)](https://github.com/NuvioMedia/NuvioMobile/pull/2506) @jhojhocraazy  \r\n- [fix(player): stop Exo/libmpv auto-switch ping-pong on the same source (#2485)](https://github.com/NuvioMedia/NuvioMobile/pull/2485) @halibiram  \r\n- [fix(player): resume a closed torrent stream at the stalled frame (#2479)](https://github.com/NuvioMedia/NuvioMobile/pull/2479) @halibiram  \r\n- [feat(player): audio downmix and center mix on Android (#2456)](https://github.com/NuvioMedia/NuvioMobile/pull/2456) @kernexshadow  \r\n",
+          "downloadURL": "https://github.com/NuvioMedia/NuvioMobile/releases/download/0.6.8-beta/nuvio-0.6.8-full-release.ipa",
+          "size": 68872061,
+          "sha256": "9eceec453ad23433909fec5d1c9029e21283d70f4bb191baca9c0dc85d7725c2",
+          "minOSVersion": "16.1"
+        },
+        {
+          "version": "0.6.7",
+          "buildVersion": "150",
+          "date": "2026-11-04T02:57:36Z",
+          "localizedDescription": "- 9f18bfee feat(player): resize video beside watch party panel @tapframe  \r\n- [Fix addon ASS subtitles not rendering with libass on Android (#2507)](https://github.com/NuvioMedia/NuvioMobile/pull/2507) @skoruppa  \r\n- [fix(ios): declare long-form video audio so playback is not shown as music (#2419)](https://github.com/NuvioMedia/NuvioMobile/pull/2419) @WhiteGiso  \r\n- [locales: add and update Arabic settings translations (#2498)](https://github.com/NuvioMedia/NuvioMobile/pull/2498) @aliabdoxd14  \r\n- [Add missing Polish translations (#2495)](https://github.com/NuvioMedia/NuvioMobile/pull/2495) @skoruppa  \r\n- [Keep stream info and current stream marker with reused links (#2494)](https://github.com/NuvioMedia/NuvioMobile/pull/2494) @skoruppa  \r\n- [i18n: harmonize French terminology with Nuvio TV (#2481)](https://github.com/NuvioMedia/NuvioMobile/pull/2481) @SK-Gits  \r\n- [l10n: complete missing Italian translations (#2482)](https://github.com/NuvioMedia/NuvioMobile/pull/2482) @WhiteGiso  \r\n- [Add mark as watched to continue watching menu (#2493)](https://github.com/NuvioMedia/NuvioMobile/pull/2493) @skoruppa  \r\n- [fix(player): prevent auto failover loop and fix anime engine selection (#2467)](https://github.com/NuvioMedia/NuvioMobile/pull/2467) @guuilp  \r\n- [feat(i18n): complete and update Turkish (tr) localization (#2472)](https://github.com/NuvioMedia/NuvioMobile/pull/2472) @stuntsnakee  \r\n- [Fix line breaks in the Spanish P2P consent text (#2470)](https://github.com/NuvioMedia/NuvioMobile/pull/2470) @IberianSoldierPC  \r\n- [Update Spanish mobile translations (#2468)](https://github.com/NuvioMedia/NuvioMobile/pull/2468) @IberianSoldierPC  \r\n- [i18n(el): sync the Greek locale with 0.6.6 (settings realignment, chapters, subtitle appearance) (#2466)](https://github.com/NuvioMedia/NuvioMobile/pull/2466) @nosvasedis  \r\n- [Update Bulgarian strings for clarity and accuracy after latest update (#2463)](https://github.com/NuvioMedia/NuvioMobile/pull/2463) @viiktr  \r\n- [i18n(vi): update latest Vietnamese strings (#2460)](https://github.com/NuvioMedia/NuvioMobile/pull/2460) @blueocean2308  \r\n- [feat(i18n): refine fr translations and align Nuvio Mobile with Nuvio TV (#2459)](https://github.com/NuvioMedia/NuvioMobile/pull/2459) @SK-Gits  \r\n- [fix(i18n): pt-BR wording follow-up to #2435 (#2455)](https://github.com/NuvioMedia/NuvioMobile/pull/2455) @jhojhocraazy  \r\n- [Skip button timer resets when chapters replace API intervals (#2457)](https://github.com/NuvioMedia/NuvioMobile/pull/2457) @skoruppa  \r\n- [add video hash computation and subtitle extras parity with TV (#2450)](https://github.com/NuvioMedia/NuvioMobile/pull/2450) @skoruppa  \r\n- [i18n(ar): complete the Arabic mobile translations (#2368)](https://github.com/NuvioMedia/NuvioMobile/pull/2368) @abdulamalik  \r\n- [fix(ios): publish Now Playing only on playback changes (#2420)](https://github.com/NuvioMedia/NuvioMobile/pull/2420) @WhiteGiso  \r\n- [fix(i18n): localize Episode N on remaining UI (#2254)](https://github.com/NuvioMedia/NuvioMobile/pull/2254) @blueocean2308  \r\n",
+          "downloadURL": "https://github.com/NuvioMedia/NuvioMobile/releases/download/0.6.7-beta/nuvio-0.6.7-full-release.ipa",
+          "size": 68798444,
+          "sha256": "9c86af618fc388ff1441505cc8fc1135b13e10b7818d7eaad03439f89e315463",
           "minOSVersion": "16.1"
         },
         {
