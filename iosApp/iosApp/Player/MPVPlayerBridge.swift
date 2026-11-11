@@ -171,6 +171,9 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge {
     }
     func selectSubtitleTrack(trackId: Int32) { playerVC?.selectSubtitle(Int(trackId)) }
     func setSubtitleUrl(url: String) { playerVC?.addSubtitleUrl(url) }
+    func replaceExternalSubtitle(replacedUrl: String, path: String) {
+        playerVC?.replaceExternalSubtitle(replacedUrl, path: path)
+    }
     func clearExternalSubtitle() { playerVC?.removeExternalSubtitles() }
     func clearExternalSubtitleAndSelect(trackId: Int32) { playerVC?.removeExternalSubtitlesAndSelect(Int(trackId)) }
     func setSubtitleDelayMs(delayMs: Int32) { playerVC?.setSubtitleDelayMs(Int(delayMs)) }
@@ -295,6 +298,10 @@ final class MPVPlayerViewController: UIViewController {
     private var pendingSurfaceLayoutWorkItems: [DispatchWorkItem] = []
     private var pendingLoadRequest: PendingLoadRequest?
     private var startupSubtitles: [PluginSubtitle] = []
+    /// mpv's sub-add needs a loaded file. An add-on subtitle selected before that (Nuvio restores
+    /// the remembered one as soon as add-ons answer, often while the stream still opens) waits here.
+    private var pendingSubtitleUrl: String?
+    private var isFileLoaded = false
     private var pendingLoadRetryWorkItem: DispatchWorkItem?
     private var mpv: OpaquePointer?
     private var cachedNowPlayingMetadata: CachedNowPlayingMetadata?
@@ -741,6 +748,7 @@ final class MPVPlayerViewController: UIViewController {
         applyRequestHeaders(sanitizedHeaders)
         isPlayerLoading = true
         isPlayerEnded = false
+        isFileLoaded = false
         applyAudioLanguagePreferences(preferredAudioLanguages)
         // Samin: initial resume position. loadFile can be queued/deferred
         // (viewport-ready retry loop), so a seek issued at load-call time is
@@ -868,6 +876,7 @@ final class MPVPlayerViewController: UIViewController {
             applyRequestHeaders(activeRequestHeaders)
             let pos = getDouble("time-pos")
             PlaybackTrace.shared.add(source: "player", "retryPlayback \(PlaybackTrace.describe(url: path)) at \(String(format: "%.1f", pos))s headers=[\(PlaybackTrace.describe(headers: activeRequestHeaders))]")
+            isFileLoaded = false
             command("loadfile", args: [path, "replace"])
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                 // Only re-seek if there was real progress; a 0-position retry
@@ -978,8 +987,50 @@ final class MPVPlayerViewController: UIViewController {
     }
 
     func addSubtitleUrl(_ url: String) {
-        guard mpv != nil else { return }
+        guard mpv != nil, isFileLoaded else {
+            pendingSubtitleUrl = url
+            return
+        }
         command("sub-add", args: [url, "select"])
+    }
+
+    /// Loads the local file at `path` in place of the external track loaded from `replacedUrl`,
+    /// under that track's title and language, then drops the replaced track and earlier AutoSync
+    /// copies (files named `autosync_*` next to `path`).
+    func replaceExternalSubtitle(_ replacedUrl: String, path: String) {
+        guard mpv != nil, isFileLoaded else {
+            pendingSubtitleUrl = path
+            return
+        }
+        var title: String?
+        var language: String?
+        let count = getInt("track-list/count")
+        for i in stride(from: count - 1, through: 0, by: -1) {
+            guard (getString("track-list/\(i)/type") ?? "") == "sub",
+                  getFlag("track-list/\(i)/external"),
+                  getString("track-list/\(i)/external-filename") == replacedUrl else { continue }
+            title = getString("track-list/\(i)/title") ?? (replacedUrl as NSString).lastPathComponent
+            language = getString("track-list/\(i)/lang")
+            break
+        }
+        var args: [String?] = [path, "cached"]
+        if let title {
+            args.append(title)
+            if let language { args.append(language) }
+        }
+        command("sub-add", args: args, checkForErrors: false)
+
+        let earlierCopyPrefix = (path as NSString).deletingLastPathComponent + "/autosync_"
+        let updatedCount = getInt("track-list/count")
+        for i in stride(from: updatedCount - 1, through: 0, by: -1) {
+            guard (getString("track-list/\(i)/type") ?? "") == "sub",
+                  getFlag("track-list/\(i)/external"),
+                  let filename = getString("track-list/\(i)/external-filename"),
+                  filename != path,
+                  filename == replacedUrl || filename.hasPrefix(earlierCopyPrefix) else { continue }
+            let id = getInt("track-list/\(i)/id")
+            command("sub-remove", args: ["\(id)"], checkForErrors: false)
+        }
     }
 
     private func addSubtitle(_ subtitle: PluginSubtitle, mode: String) {
@@ -1003,6 +1054,7 @@ final class MPVPlayerViewController: UIViewController {
     }
 
     func removeExternalSubtitles() {
+        pendingSubtitleUrl = nil
         guard mpv != nil else { return }
         let count = getInt("track-list/count")
         for i in stride(from: count - 1, through: 0, by: -1) {
@@ -1017,6 +1069,7 @@ final class MPVPlayerViewController: UIViewController {
     }
 
     func removeExternalSubtitlesAndSelect(_ trackId: Int) {
+        pendingSubtitleUrl = nil
         guard mpv != nil else { return }
         let count = getInt("track-list/count")
         for i in stride(from: count - 1, through: 0, by: -1) {
@@ -1101,6 +1154,8 @@ final class MPVPlayerViewController: UIViewController {
         pendingSurfaceLayoutWorkItems.removeAll(keepingCapacity: false)
         pendingLoadRequest = nil
         startupSubtitles = []
+        pendingSubtitleUrl = nil
+        isFileLoaded = false
         nowPlayingController.invalidate()
         clearPlaybackError()
         deactivateAudioSession()
@@ -1161,13 +1216,14 @@ final class MPVPlayerViewController: UIViewController {
         }
     }
 
-    private func syncNowPlayingPlaybackState(isPlaying: Bool) {
+    private func syncNowPlayingPlaybackState(isPlaying: Bool, force: Bool = false) {
         pictureInPictureController?.updatePlaybackState()
         nowPlayingController.syncPlayback(
             positionMs: positionMs,
             durationMs: durationMs,
             isPlaying: isPlaying,
-            playbackSpeed: currentSpeed
+            playbackSpeed: currentSpeed,
+            force: force
         )
     }
 
@@ -1417,6 +1473,7 @@ final class MPVPlayerViewController: UIViewController {
                         self.foregroundReloadCount = 0
                         self.clearPlaybackError()
                         self.isPlayerLoading = false
+                        self.isFileLoaded = true
                         let subtitles = self.startupSubtitles
                         self.startupSubtitles = []
                         subtitles.forEach { self.addSubtitle($0, mode: "auto") }
@@ -1430,6 +1487,10 @@ final class MPVPlayerViewController: UIViewController {
                                 self.playPlayback()
                             }
                         }
+                        if let url = self.pendingSubtitleUrl {
+                            self.pendingSubtitleUrl = nil
+                            self.addSubtitleUrl(url)
+                        }
                         self.updateState()
                         self.publishNowPlayingForPlaybackSession()
                         self.logCurrentAudioOutput()
@@ -1438,6 +1499,7 @@ final class MPVPlayerViewController: UIViewController {
                     DispatchQueue.main.async {
                         self.updateState()
                         self.publishNowPlayingForPlaybackSession()
+                        self.syncNowPlayingPlaybackState(isPlaying: self.isPlayerPlaying, force: true)
                     }
                 case MPV_EVENT_END_FILE:
                     if let data = eventPtr.pointee.data {
