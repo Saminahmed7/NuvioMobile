@@ -58,6 +58,44 @@ private const val STEPPER_HOLD_REPEAT_MS = 100L
 @Composable
 fun SubtitleStylePanel(
     style: SubtitleStyleState,
+    isCompact: Boolean,
+    showHeader: Boolean = true,
+    onStyleChanged: (SubtitleStyleState) -> Unit,
+) {
+    val sectionGap = if (isCompact) 12.dp else 16.dp
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(sectionGap),
+    ) {
+        if (showHeader) {
+            Text(
+                text = stringResource(Res.string.compose_player_style),
+                color = Color.White,
+                style = MaterialTheme.typography.titleMedium,
+            )
+        }
+
+        SubtitleAppearanceControls(
+            style = style,
+            spacing = sectionGap,
+            onStyleChanged = onStyleChanged,
+        )
+
+        Text(
+            text = stringResource(Res.string.subtitle_reset_appearance),
+            modifier = Modifier.clip(RoundedCornerShape(12.dp))
+                .clickable { onStyleChanged(style.resetAppearance()) }
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            color = Color.White,
+            style = MaterialTheme.typography.bodyMedium,
+        )
+    }
+}
+
+@Composable
+fun SubtitleStylePanel(
+    style: SubtitleStyleState,
     subtitleDelayMs: Int,
     selectedAddonSubtitle: AddonSubtitle?,
     subtitleAutoSyncState: SubtitleAutoSyncUiState,
