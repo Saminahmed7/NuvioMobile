@@ -27,7 +27,7 @@ on:
         type: boolean
         default: false
   schedule:
-    - cron: '0 */3 * * *'
+    - cron: '17 */3 * * *'
   push:
     branches:
       - samin-temp-cache
