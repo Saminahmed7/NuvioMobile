@@ -49,14 +49,14 @@ jobs:
   sync-build-publish:
     name: Sync upstream, build Samin IPA, update source
     runs-on: xcode-27
-    timeout-minutes: 120
+    timeout-minutes: 180
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
       GRADLE_OPTS: -Dfile.encoding=UTF-8
       IOS_CONFIGURATION: Release
-      KOTLIN_DAEMON_JVMARGS: -Xmx2048M
-      NUVIO_GRADLE_JVMARGS: -Xmx4608M -Dfile.encoding=UTF-8 -XX:MaxMetaspaceSize=768M
-      NUVIO_KOTLIN_NATIVE_JVMARGS: -Xmx8192M
+      KOTLIN_DAEMON_JVMARGS: -Xmx1024M
+      NUVIO_GRADLE_JVMARGS: -Xmx2048M -Dfile.encoding=UTF-8 -XX:MaxMetaspaceSize=768M -XX:+UseG1GC
+      NUVIO_KOTLIN_NATIVE_JVMARGS: -Xmx9216M -XX:+UseG1GC
       RELEASE_PROPERTIES_BASE64: ${{ secrets.NUVIO_LOCAL_PROPERTIES_BASE64 }}
       BRANCH: samin-temp-cache
 
@@ -274,6 +274,22 @@ jobs:
           echo "SAMIN_BUILD=${SAMIN_BUILD}" >> "${GITHUB_ENV}"
           echo "Building Nuvio Samin ${SAMIN_VERSION} (${SAMIN_BUILD}) from upstream ${UPSTREAM_SHA}."
 
+      - name: Constrain Gradle memory for the hosted runner
+        if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
+        run: |
+          gradle_user_home="${GRADLE_USER_HOME:-${HOME}/.gradle}"
+          mkdir -p "${gradle_user_home}"
+          {
+            echo "org.gradle.jvmargs=${NUVIO_GRADLE_JVMARGS}"
+            echo "kotlin.daemon.jvmargs=${KOTLIN_DAEMON_JVMARGS}"
+            echo "kotlin.native.jvmArgs=${NUVIO_KOTLIN_NATIVE_JVMARGS}"
+            echo "org.gradle.parallel=false"
+            echo "org.gradle.workers.max=1"
+            echo "kotlin.native.disableCompilerDaemon=true"
+            echo "nuvio.ios.releaseDisablePhases=DevirtualizationAnalysis,Devirtualization,RemoveRedundantCallsToStaticInitializersPhase"
+          } >> "${gradle_user_home}/gradle.properties"
+          cat "${gradle_user_home}/gradle.properties"
+
       - name: Prepare iOS dependencies
         if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
         run: ./scripts/prepare-ios-dependencies.sh
@@ -290,7 +306,19 @@ jobs:
 
       - name: Build unsigned Samin IPA
         if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
-        run: ./scripts/build-ios-ipa.sh "${MARKETING_VERSION}"
+        run: |
+          (
+            while sleep 60; do
+              echo "::group::Build resources $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+              uptime
+              vm_stat
+              ps -Ao pid,etime,%cpu,rss,command -r | head -n 12 || true
+              echo "::endgroup::"
+            done
+          ) &
+          monitor_pid=$!
+          trap 'kill "${monitor_pid}" 2>/dev/null || true' EXIT
+          ./scripts/build-ios-ipa.sh "${MARKETING_VERSION}"
 
       # Saved even when the Xcode step fails (e.g. a Swift error), so the next
       # run doesn't redo the finished Kotlin link. Skipped on cancellation.
