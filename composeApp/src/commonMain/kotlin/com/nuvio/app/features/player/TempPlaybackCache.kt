@@ -58,6 +58,9 @@ data class TempCacheStatus(
     val cachedBytes: Long = 0L,
     val downloadSpeedBps: Long = 0L,
 ) {
+    val cachedRanges: List<TempCacheRange>
+        get() = ranges
+
     val totalCachedBytes: Long
         get() = if (cachedBytes > 0L) cachedBytes else (downloadedBytes + headDownloadedBytes)
 
@@ -349,6 +352,8 @@ object TempPlaybackCache {
     }
 
     fun statusFor(launchId: Long): TempCacheStatus? = _status.value[launchId]
+
+    fun status(launchId: Long?): TempCacheStatus? = launchId?.let { _status.value[it] }
 
     fun start(
         launchId: Long,

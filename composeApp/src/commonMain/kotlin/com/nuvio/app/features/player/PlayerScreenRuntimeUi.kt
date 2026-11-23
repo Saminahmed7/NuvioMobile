@@ -540,7 +540,7 @@ private fun PlayerScreenRuntime.RenderPlayerControls(
         if (!controlsFadingOut) shownBeforeExit[0] = controlsVisible
         val displayedPositionMs = effectivePlaybackPositionMs
         val saminCacheStatus = TempPlaybackCache.status(args.launchId)
-        val saminCachedRanges = saminCacheStatus?.cachedRanges ?: emptyList()
+        val saminCachedRanges: List<TempCacheRange> = saminCacheStatus?.ranges ?: emptyList()
         val orientationToggleSupported = rememberPlayerOrientationToggleSupported()
         val portraitPlayback by PlayerOrientationPreference.portrait.collectAsStateWithLifecycle()
         val pipAvailable = isIos && playerSettingsUiState.miniPlayerEnabled &&
@@ -829,7 +829,7 @@ private fun BoxScope.RenderPlaybackOverlays(
         val snapshotDurationMs by remember(runtime) { derivedStateOf { playbackSnapshot.durationMs } }
         val displayedPositionMs = effectivePlaybackPositionMs
         val saminCacheStatus = TempPlaybackCache.status(args.launchId)
-        val saminCachedRanges = saminCacheStatus?.cachedRanges ?: emptyList()
+        val saminCachedRanges: List<TempCacheRange> = saminCacheStatus?.ranges ?: emptyList()
         val openingOverlayVisible = playerSettingsUiState.showLoadingOverlay && !initialLoadCompleted && errorMessage == null
         val showNetworkSpeed = openingOverlayVisible &&
             playerSettingsUiState.showPlayerLoadingStatus &&
