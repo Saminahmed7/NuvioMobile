@@ -35,11 +35,15 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge {
 
     func loadFile(url: String) { ensurePlayerViewController().loadFile(url) }
     func loadFileWithAudio(videoUrl: String, audioUrl: String?, headersJson: String?, subtitlesJson: String?) {
+        loadFileWithAudio(videoUrl: videoUrl, audioUrl: audioUrl, headersJson: headersJson, subtitlesJson: subtitlesJson, startPositionMs: 0)
+    }
+    func loadFileWithAudio(videoUrl: String, audioUrl: String?, headersJson: String?, subtitlesJson: String?, startPositionMs: Int64) {
         ensurePlayerViewController().loadFile(
             videoUrl,
             audioUrl: audioUrl,
             requestHeaders: parseRequestHeaders(headersJson),
-            subtitles: parseSubtitles(subtitlesJson)
+            subtitles: parseSubtitles(subtitlesJson),
+            startPositionMs: startPositionMs
         )
     }
 
@@ -249,6 +253,7 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge {
     func getPositionMs() -> Int64 { return playerVC?.positionMs ?? 0 }
     func networkSpeedBytesPerSecond() -> Int64 { return playerVC?.networkSpeedBytesPerSecond ?? -1 }
     func getBufferedMs() -> Int64 { return playerVC?.bufferedMs ?? 0 }
+    func getStreamPos() -> Int64 { return playerVC?.streamPosBytes ?? 0 }
     func getPlaybackSpeed() -> Float { playerVC?.currentSpeed ?? 1.0 }
     func getVideoWidth() -> Int32 { Int32(playerVC?.currentVideoWidth ?? 0) }
     func getVideoHeight() -> Int32 { Int32(playerVC?.currentVideoHeight ?? 0) }
@@ -308,6 +313,9 @@ private struct PendingLoadRequest {
     let requestHeaders: [String: String]
     let subtitles: [PluginSubtitle]
     let queuedAtUptime: TimeInterval
+    // Resume/watch-progress position (seconds) to apply once the file is
+    // loaded. Issuing the seek before mpv has a file is silently dropped.
+    let startPositionMsSeconds: Double
 }
 
 // MARK: - MPV Player View Controller
@@ -422,6 +430,12 @@ final class MPVPlayerViewController: UIViewController {
     private var activeRequestHeaders: [String: String] = [:]
     private var keyboardShortcutsEnabled: Bool = true
     private var keyboardShortcutHandler: ((String) -> Void)?
+    private var activeLoadedRequest: PendingLoadRequest?
+    private var lastForegroundUptime: TimeInterval = 0
+    private var foregroundReloadCount: Int = 0
+    private var savedPositionBeforeBackground: Double = 0
+    private var wasPlayingBeforeBackground: Bool = false
+    private var pendingResumePosition: Double?
 
     struct VideoOutputSettings {
         let hardwareDecoder: String
@@ -504,6 +518,7 @@ final class MPVPlayerViewController: UIViewController {
     var positionMs: Int64 = 0
     var networkSpeedBytesPerSecond: Int64 = -1
     var bufferedMs: Int64 = 0
+    var streamPosBytes: Int64 = 0
     var currentSpeed: Float = 1.0
     var currentErrorMessage: String {
         errorStateLock.lock()
@@ -809,7 +824,7 @@ final class MPVPlayerViewController: UIViewController {
         }
 
         InAppLogBridge.shared.info(tag: "MPV/iOS", message: "Initializing mpv vo=gpu-next gpu-api=vulkan gpu-context=moltenvk hwdec=videotoolbox")
-        checkError(mpv_request_log_messages(mpv, "warn"))
+        checkError(mpv_request_log_messages(mpv, "info"))
 
         var layerPointer = Int64(Int(bitPattern: Unmanaged.passUnretained(metalLayer).toOpaque()))
         checkError(mpv_set_option(mpv, "wid", MPV_FORMAT_INT64, &layerPointer))
@@ -842,6 +857,9 @@ final class MPVPlayerViewController: UIViewController {
         setSetupOption("hdr-compute-peak", "yes")
         setSetupOption("demuxer-max-bytes", "\(Self.isMemoryConstrained ? Self.constrainedDemuxerMaxBytes : Self.demuxerMaxBytes)")
         setSetupOption("demuxer-max-back-bytes", "\(Self.isMemoryConstrained ? Self.constrainedDemuxerMaxBackBytes : Self.demuxerMaxBackBytes)")
+        setSetupOption("demuxer-readahead-secs", "30")
+        setSetupOption("cache", "yes")
+        setSetupOption("network-timeout", "5")
         if Self.isMemoryConstrained {
             setSetupOption("linear-downscaling", "no")
             setSetupOption("correct-downscaling", "no")
@@ -963,6 +981,13 @@ final class MPVPlayerViewController: UIViewController {
     @objc private func enterBackground() {
         metalLayer.releasePendingDrawable()
         guard mpv != nil else { return }
+        let currentPos = getDouble("time-pos")
+        if currentPos > 0 {
+            savedPositionBeforeBackground = currentPos
+        } else if positionMs > 0 {
+            savedPositionBeforeBackground = Double(positionMs) / 1000.0
+        }
+        wasPlayingBeforeBackground = isPlayerPlaying
         let coreGeneration = mpvGeneration
         mpvQueue.async { [weak self] in
             guard let self, self.mpvGeneration == coreGeneration, self.mpv != nil else { return }
@@ -1012,8 +1037,35 @@ final class MPVPlayerViewController: UIViewController {
         guard mpv != nil else { return }
         let wasInPictureInPicture = pictureInPictureController?.enteredForeground() == true
         if wasInPictureInPicture { return }
+        lastForegroundUptime = ProcessInfo.processInfo.systemUptime
+        LocalCacheProxyServer.shared.warmup()
         restoreBackgroundVideo()
-        playPlayback()
+
+        let path = getString("path")
+        let isIdle = getFlag("idle-active")
+        let isEof = getFlag("eof-reached") || isPlayerEnded
+        let hasError = !currentErrorMessage.isEmpty
+
+        // If MPV lost the file or dropped connection while in background / screen off:
+        if let request = activeLoadedRequest, (path == nil || path?.isEmpty == true || isIdle || isEof || hasError) {
+            print("[MPV] Recovering playback after screen off / sleep wake at position \(savedPositionBeforeBackground)s...")
+            clearPlaybackError()
+            foregroundReloadCount = 0
+            pendingResumePosition = savedPositionBeforeBackground
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let ready = LocalCacheProxyServer.shared.waitUntilVerifiedReady(timeout: 2.0)
+                LocalCacheProxyLog.shared.log("Player: foreground recovery port verified=\(ready); reloading")
+                DispatchQueue.main.async {
+                    guard let self, self.mpv != nil else { return }
+                    self.startLoad(request)
+                }
+            }
+            return
+        }
+
+        if wasPlayingBeforeBackground {
+            playPlayback()
+        }
     }
 
     @objc private func didBecomeActive() {
@@ -1111,13 +1163,14 @@ final class MPVPlayerViewController: UIViewController {
 
     // MARK: - Playback API
 
-    func loadFile(_ urlString: String, audioUrl: String? = nil, requestHeaders: [String: String] = [:], subtitles: [PluginSubtitle] = []) {
+    func loadFile(_ urlString: String, audioUrl: String? = nil, requestHeaders: [String: String] = [:], subtitles: [PluginSubtitle] = [], startPositionMs: Int64 = 0) {
         let request = PendingLoadRequest(
             urlString: urlString,
             audioUrl: audioUrl,
             requestHeaders: requestHeaders,
             subtitles: subtitles,
-            queuedAtUptime: ProcessInfo.processInfo.systemUptime
+            queuedAtUptime: ProcessInfo.processInfo.systemUptime,
+            startPositionMsSeconds: Double(max(0, startPositionMs)) / 1000.0
         )
 
         if Thread.isMainThread {
@@ -1155,6 +1208,7 @@ final class MPVPlayerViewController: UIViewController {
 
     private func startLoad(_ request: PendingLoadRequest) {
         guard mpv != nil else { return }
+        activeLoadedRequest = request
         layoutPlayerSurfaces()
         clearPlaybackError()
         let sanitizedHeaders = sanitizeRequestHeaders(request.requestHeaders)
@@ -1169,12 +1223,39 @@ final class MPVPlayerViewController: UIViewController {
         playbackStateGeneration &+= 1
         invalidateMediaInfoCache()
         isFileLoaded = false
+
+        if request.startPositionMsSeconds > 0, pendingResumePosition == nil {
+            pendingResumePosition = request.startPositionMsSeconds
+            print("[MPV] Queued initial resume position \(request.startPositionMsSeconds)s")
+        }
+        applyDemuxerCacheProfile(for: request.urlString)
+        let loadAudioFlag = request.audioUrl == nil ? "none" : "yes"
+        PlaybackTrace.shared.add(
+            source: "player",
+            "load \(PlaybackTrace.describe(url: request.urlString)) headers=[\(PlaybackTrace.describe(headers: sanitizedHeaders))] audio=\(loadAudioFlag) subs=\(request.subtitles.count) resume=\(String(format: "%.1f", request.startPositionMsSeconds))s"
+        )
+
         startupSubtitles = request.subtitles
         command("loadfile", args: [request.urlString, "replace"])
         if let audioUrl = request.audioUrl, !audioUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
                 self?.command("audio-add", args: [audioUrl, "select"], checkForErrors: false)
             }
+        }
+    }
+
+    private func applyDemuxerCacheProfile(for urlString: String) {
+        guard mpv != nil else { return }
+        let lower = urlString.lowercased()
+        let isAdaptive = lower.contains(".m3u8") || lower.contains(".mpd") || lower.contains("/playlist")
+        if isAdaptive {
+            setStringProperty("demuxer-max-bytes", "268435456")    // 256 MB ahead
+            setStringProperty("demuxer-max-back-bytes", "134217728") // 128 MB rewind
+            setStringProperty("demuxer-readahead-secs", "120")     // 2 min ahead
+            print("[MPV] HLS/DASH demuxer profile: 256 MB / 120 s readahead")
+        } else {
+            setStringProperty("demuxer-max-bytes", "67108864")
+            setStringProperty("demuxer-readahead-secs", "30")
         }
     }
 
@@ -1582,7 +1663,9 @@ final class MPVPlayerViewController: UIViewController {
             let pos = self.getDouble("time-pos")
             self.command("loadfile", args: [path, "replace"])
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                self?.command("seek", args: [String(format: "%.3f", pos), "absolute"])
+                if pos > 0.5 {
+                    self?.command("seek", args: [String(format: "%.3f", pos), "absolute"])
+                }
             }
         }
     }
@@ -2188,6 +2271,7 @@ final class MPVPlayerViewController: UIViewController {
         let durationMs: Int64
         let positionMs: Int64
         let bufferedMs: Int64
+        let streamPos: Int64
         let speed: Float
         let networkSpeedBytesPerSecond: Int64
     }
@@ -2233,6 +2317,7 @@ final class MPVPlayerViewController: UIViewController {
         let seeking = getFlag("seeking")
         let bufferingCache = getFlag("paused-for-cache")
         let cacheSpeed = getCacheSpeedBytesPerSecond()
+        let streamPos = getInt64("stream-pos")
 
         return PlaybackStateSnapshot(
             isLoading: (idle && !paused && !eofReached) || seeking || bufferingCache,
@@ -2241,6 +2326,7 @@ final class MPVPlayerViewController: UIViewController {
             durationMs: Int64(duration * 1000),
             positionMs: Int64(max(position, 0) * 1000),
             bufferedMs: Int64(max(position + cached, 0) * 1000),
+            streamPos: max(streamPos, 0),
             speed: Float(speed > 0 ? speed : 1.0),
             networkSpeedBytesPerSecond: cacheSpeed
         )
@@ -2263,6 +2349,7 @@ final class MPVPlayerViewController: UIViewController {
         durationMs = snapshot.durationMs
         positionMs = snapshot.positionMs
         bufferedMs = snapshot.bufferedMs
+        streamPosBytes = snapshot.streamPos
         currentSpeed = snapshot.speed
         networkSpeedBytesPerSecond = snapshot.networkSpeedBytesPerSecond
 
@@ -2654,6 +2741,8 @@ final class MPVPlayerViewController: UIViewController {
                     }
                 case MPV_EVENT_FILE_LOADED:
                     DispatchQueue.main.async {
+                        PlaybackTrace.shared.add(source: "player", "FILE_LOADED \(PlaybackTrace.describe(url: self.activeLoadedRequest?.urlString ?? "?")) pos=\(String(format: "%.1f", Double(self.positionMs) / 1000.0))s dur=\(String(format: "%.1f", Double(self.durationMs) / 1000.0))s")
+                        self.foregroundReloadCount = 0
                         self.clearPlaybackError()
                         self.isPlayerLoading = false
                         self.playbackStateGeneration &+= 1
@@ -2662,6 +2751,16 @@ final class MPVPlayerViewController: UIViewController {
                         let subtitles = self.startupSubtitles
                         self.startupSubtitles = []
                         subtitles.forEach { self.addSubtitle($0, mode: "auto") }
+                        if let resumePos = self.pendingResumePosition {
+                            self.pendingResumePosition = nil
+                            if resumePos > 0.5 {
+                                print("[MPV] File loaded -> seeking immediately to resume position \(resumePos)s")
+                                self.command("seek", args: [String(format: "%.3f", resumePos), "absolute"])
+                            }
+                            if self.wasPlayingBeforeBackground {
+                                self.playPlayback()
+                            }
+                        }
                         if let url = self.pendingSubtitleUrl {
                             self.pendingSubtitleUrl = nil
                             self.addSubtitleUrl(url)
@@ -2684,12 +2783,46 @@ final class MPVPlayerViewController: UIViewController {
                 case MPV_EVENT_END_FILE:
                     if let data = eventPtr.pointee.data {
                         let endFile = UnsafePointer<mpv_event_end_file>(OpaquePointer(data)).pointee
-                        if endFile.reason == MPV_END_FILE_REASON_ERROR {
-                            let errorText = String(cString: mpv_error_string(endFile.error))
-                            DispatchQueue.main.async { self.cancelPendingDeviceLossResume() }
-                            self.setPlaybackError("[mpv] \(errorText)")
-                            InAppLogBridge.shared.error(tag: "MPV/iOS", message: "End file error: \(errorText)")
-                            print("[MPV] End file error: \(errorText)")
+                        let reason = endFile.reason
+                        let errorCode = endFile.error
+                        DispatchQueue.main.async {
+                            let now = ProcessInfo.processInfo.systemUptime
+                            let isRecentForeground = (now - self.lastForegroundUptime) < 5.0
+                            let isPremature = self.durationMs > 10000 && self.positionMs < (self.durationMs - 10000)
+                            let isLoopback = self.activeLoadedRequest?.urlString.contains("127.0.0.1") == true
+                            PlaybackTrace.shared.add(source: "player", "END_FILE reason=\(reason) error=\(errorCode) (\(String(cString: mpv_error_string(errorCode)))) loopback=\(isLoopback) pos=\(String(format: "%.1f", Double(self.positionMs) / 1000.0))s dur=\(String(format: "%.1f", Double(self.durationMs) / 1000.0))s loading=\(self.isPlayerLoading) reloads=\(self.foregroundReloadCount)")
+
+                            if isLoopback && (reason == MPV_END_FILE_REASON_ERROR || (reason == MPV_END_FILE_REASON_EOF && (isRecentForeground || isPremature))) {
+                                if self.foregroundReloadCount < 3 {
+                                    self.foregroundReloadCount += 1
+                                    let resumePos = max(self.savedPositionBeforeBackground, Double(self.positionMs) / 1000.0)
+                                    print("[MPV] Premature end/error (reason=\(reason), error=\(errorCode)) near foreground or during playback; warming proxy and auto-recovering at \(resumePos)s...")
+                                    self.clearPlaybackError()
+                                    self.pendingResumePosition = resumePos
+                                    LocalCacheProxyServer.shared.recoverListener()
+                                    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                                        LocalCacheProxyLog.shared.log("Player: loopback END_FILE recovery (reason=\(reason), error=\(errorCode)) - waiting for verified port (attempt \(self?.foregroundReloadCount ?? -1))")
+                                        let ready = LocalCacheProxyServer.shared.waitUntilVerifiedReady(timeout: 2.0)
+                                        LocalCacheProxyLog.shared.log("Player: loopback port verified=\(ready); reloading")
+                                        DispatchQueue.main.async {
+                                            guard let self, let req = self.activeLoadedRequest, self.mpv != nil else { return }
+                                            if !ready {
+                                                print("[MPV] Loopback proxy still not serving after 2s; reloading anyway (attempt \(self.foregroundReloadCount))")
+                                            }
+                                            self.startLoad(req)
+                                        }
+                                    }
+                                    return
+                                }
+                            }
+
+                            if reason == MPV_END_FILE_REASON_ERROR {
+                                let errorText = String(cString: mpv_error_string(errorCode))
+                                self.cancelPendingDeviceLossResume()
+                                self.setPlaybackError("[mpv] \(errorText)")
+                                InAppLogBridge.shared.error(tag: "MPV/iOS", message: "End file error: \(errorText)")
+                                print("[MPV] End file error: \(errorText)")
+                            }
                         }
                     }
                 case MPV_EVENT_SHUTDOWN:

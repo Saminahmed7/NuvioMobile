@@ -47,6 +47,7 @@ import com.nuvio.app.features.watchprogress.buildPlaybackVideoId
 import com.nuvio.app.features.watching.application.WatchingState
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import nuvio.composeapp.generated.resources.*
@@ -124,6 +125,9 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         cancelNextEpisodeAutoPlay()
         isScrubbingTimeline = false
         scrubbingPositionMs = null
+        pendingSeekPositionMs = null
+        initialSeekApplied = activeInitialPositionMs <= 0L &&
+            (activeInitialProgressFraction == null || activeInitialProgressFraction!! <= 0f)
         liveGestureFeedback = null
         renderedGestureFeedback = null
         lockedOverlayVisible = false
@@ -171,6 +175,47 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
             tryFallbackToNextSourceAfterError(
                 getString(Res.string.player_error_source_startup_timeout, startupTimeoutSeconds),
             )
+        }
+    }
+
+    // Samin temp mirror: starts only once playback runs smoothly (never
+    // during startup stalls, so it can't steal bandwidth from first frames),
+    // resuming from the current playhead. Skipped for proxied playbacks
+    // (iOS reads from the loopback cache instead). Deleted on player close.
+    // TempPlaybackCache.start is idempotent per launchId.
+    LaunchedEffect(activeSourceUrl, playbackSnapshot.isLoading, playbackSnapshot.durationMs) {
+        val url = activeSourceUrl
+        if (!TempPlaybackCache.shouldMirror(url)) return@LaunchedEffect
+        val lid = args.launchId
+        if (lid != null && TempPlaybackCache.isProxied(lid)) return@LaunchedEffect
+        if (playbackSnapshot.isLoading) return@LaunchedEffect
+        val duration = playbackSnapshot.durationMs.takeIf { it > 0L } ?: return@LaunchedEffect
+        if (lid == null) return@LaunchedEffect
+        TempPlaybackCache.start(
+            launchId = lid,
+            sourceUrl = url,
+            headers = activeSourceHeaders,
+            startPositionMs = playbackSnapshot.positionMs.coerceAtLeast(0L),
+            durationMs = duration,
+        )
+    }
+
+    // Samin proxy ranges: poll cached spans for the gray bar and report the
+    // playhead (throttled) so storage pressure evicts watched data first.
+    LaunchedEffect(activeSourceUrl) {
+        val lid = args.launchId ?: return@LaunchedEffect
+        if (!TempPlaybackCache.isProxied(lid)) return@LaunchedEffect
+        var lastPushedMs = -1L
+        while (isActive) {
+            delay(1000L)
+            TempPlaybackCache.refreshRanges(lid)
+            val pos = playbackSnapshot.positionMs.coerceAtLeast(0L)
+            val dur = playbackSnapshot.durationMs
+            val jumped = lastPushedMs >= 0L && (pos < lastPushedMs - 2000L || pos > lastPushedMs + 10_000L)
+            if (dur > 0L && (lastPushedMs < 0L || jumped || kotlin.math.abs(pos - lastPushedMs) >= 5000L)) {
+                lastPushedMs = pos
+                TempPlaybackCache.pushPlayhead(lid, pos, dur, playbackSnapshot.streamPos, playbackSnapshot.isPlaying)
+            }
         }
     }
 
@@ -1120,7 +1165,15 @@ internal fun PlayerScreenRuntime.tryRefreshExpiredLinkAfterError(message: String
                 return@launch
             }
 
-            playReplacementSource(stream, refreshedUrl, currentVideoId)
+            // Samin: refreshed debrid links must also go through the proxy,
+            // otherwise playback silently leaves the on-disk cache.
+            val (playUrl, playHeaders) = TempPlaybackCache.resolveProxiedSource(
+                launchId = args.launchId,
+                sourceUrl = refreshedUrl,
+                headers = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request),
+            )
+            playReplacementSource(stream, playUrl, currentVideoId)
+            activeSourceHeaders = playHeaders
         } finally {
             PlayerStreamsRepository.stopSourcesLoading()
         }

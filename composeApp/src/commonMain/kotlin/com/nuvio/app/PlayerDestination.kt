@@ -3,6 +3,7 @@ package com.nuvio.app
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
@@ -13,6 +14,7 @@ import com.nuvio.app.features.player.ExternalPlayerPlatform
 import com.nuvio.app.features.player.PlayerLaunch
 import com.nuvio.app.features.player.PlayerLaunchStore
 import com.nuvio.app.features.player.PlayerScreen
+import com.nuvio.app.features.player.TempPlaybackCache
 import com.nuvio.app.features.watchprogress.ResumePromptRepository
 import com.nuvio.app.navigation.DetailRoute
 import com.nuvio.app.navigation.NuvioNavigator
@@ -44,12 +46,29 @@ internal fun PlayerDestination(
     LaunchedEffect(launch.videoId) {
         launch.videoId?.let { ResumePromptRepository.markPlayerEntered(it) }
     }
+    // Samin cache proxy: on platforms with a loopback proxy the player loads
+    // a localhost URL and reads from the on-disk cache (instant replays,
+    // offline survival inside cached ranges). Everywhere else the remote URL
+    // is used with the legacy background mirror. Headers move to the proxy;
+    // the player itself gets none for localhost. External players below keep
+    // using the original remote launch. Everything is deleted here on close.
+    val playUrl = remember(launch) {
+        TempPlaybackCache.resolvePlayUrl(route.launchId, launch.sourceUrl, launch.sourceHeaders)
+    }
+    val playHeaders = remember(launch, playUrl) {
+        if (playUrl != launch.sourceUrl) emptyMap() else launch.sourceHeaders
+    }
+    DisposableEffect(route.launchId) {
+        onDispose {
+            TempPlaybackCache.cancelAndDelete(route.launchId)
+        }
+    }
     PlayerScreen(
         profileId = launch.profileId,
         title = launch.title,
-        sourceUrl = launch.sourceUrl,
+        sourceUrl = playUrl,
         sourceAudioUrl = launch.sourceAudioUrl,
-        sourceHeaders = launch.sourceHeaders,
+        sourceHeaders = playHeaders,
         sourceResponseHeaders = launch.sourceResponseHeaders,
         externalSubtitles = launch.externalSubtitles,
         streamType = launch.streamType,

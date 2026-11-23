@@ -185,6 +185,14 @@ internal class PlayerScreenRuntime(
     var isScrubbingTimeline by mutableStateOf(false)
     var isTouchingTimeline by mutableStateOf(false)
     var scrubbingPositionMs by mutableStateOf<Long?>(null)
+    var pendingSeekPositionMs by mutableStateOf<Long?>(null)
+
+    val effectivePlaybackPositionMs: Long
+        get() = when {
+            isScrubbingTimeline && scrubbingPositionMs != null -> scrubbingPositionMs!!
+            pendingSeekPositionMs != null -> pendingSeekPositionMs!!
+            else -> playbackSnapshot.positionMs
+        }
     var pausedOverlayVisible by mutableStateOf(false)
     var gestureFeedback by mutableStateOf<GestureFeedbackState?>(null)
     var liveGestureFeedback by mutableStateOf<GestureFeedbackState?>(null)

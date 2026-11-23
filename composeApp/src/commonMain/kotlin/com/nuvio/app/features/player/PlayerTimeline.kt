@@ -53,6 +53,9 @@ import com.nuvio.app.core.i18n.localizedEpisodeTitle
 
 internal val PlayerTimelineContentInset = 2.dp
 
+/** Samin: solid neutral gray for saved-to-disk regions (monochrome, distinct). */
+internal val SavedTrackGray = Color(0.72f, 0.72f, 0.75f)
+
 internal val PlayerChapterMarkWidth = 2.dp
 
 internal val PlayerChapterMarkColor = Color.Black.copy(alpha = 0.6f)
@@ -134,12 +137,22 @@ internal fun PlayerTimeline(
     enabled: Boolean = true,
     seekPreview: SeekPreviewController? = null,
     onTouchChange: (Boolean) -> Unit = {},
+    // Samin: saved-to-disk spans (loopback proxy cache or temp mirror),
+    // drawn as solid neutral-gray stretches.
+    cachedRanges: List<TempCacheRange> = emptyList(),
     /** Each chapter after the first gets a mark where it starts. */
     chapters: List<PlayerChapter> = emptyList(),
 ) {
     val durationMs = snapshot.durationMs.coerceAtLeast(0L)
     val rangeEnd = durationMs.coerceAtLeast(1L).toFloat()
     val bufferedFraction = playerBufferedFraction(snapshot.bufferedPositionMs, durationMs)
+    val savedSpans = remember(cachedRanges) {
+        cachedRanges.mapNotNull { span ->
+            val start = span.start.coerceIn(0f, 1f)
+            val end = span.end.coerceIn(0f, 1f)
+            if (end > start) start to end else null
+        }.take(32)
+    }
     val chapterMarks = remember(chapters, durationMs) {
         chapters.chapterMarkFractions(durationMs)
     }
@@ -191,12 +204,19 @@ internal fun PlayerTimeline(
                                     size = Size(size.width, trackHeight),
                                     cornerRadius = radius,
                                 )
-                                drawRoundRect(
-                                    color = PlayerBufferedTrackColor,
-                                    topLeft = trackOrigin,
-                                    size = Size(size.width * bufferedFraction, trackHeight),
-                                    cornerRadius = radius,
-                                )
+                                savedSpans.forEach { (start, end) ->
+                                    // Samin saved-to-disk stretch: solid neutral gray.
+                                    val startX = size.width * start
+                                    val endX = size.width * end
+                                    if (endX > startX) {
+                                        drawRoundRect(
+                                            color = SavedTrackGray,
+                                            topLeft = trackOrigin.copy(x = trackOrigin.x + startX),
+                                            size = Size(endX - startX, trackHeight),
+                                            cornerRadius = radius,
+                                        )
+                                    }
+                                }
                                 drawRoundRect(
                                     brush = accentBrush,
                                     topLeft = trackOrigin,

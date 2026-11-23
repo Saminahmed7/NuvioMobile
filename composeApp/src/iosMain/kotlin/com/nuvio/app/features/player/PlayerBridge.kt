@@ -13,7 +13,8 @@ interface NuvioPlayerBridge {
         videoUrl: String,
         audioUrl: String?,
         headersJson: String?,
-        subtitlesJson: String? = null
+        subtitlesJson: String? = null,
+        startPositionMs: Long = 0L
     )
     fun play()
     fun pause()
@@ -103,6 +104,7 @@ interface NuvioPlayerBridge {
     fun getPositionMs(): Long
     fun networkSpeedBytesPerSecond(): Long
     fun getBufferedMs(): Long
+    fun getStreamPos(): Long
     fun getPlaybackSpeed(): Float
     fun getVideoWidth(): Int
     fun getVideoHeight(): Int

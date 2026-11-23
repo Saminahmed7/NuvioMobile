@@ -72,6 +72,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.layout.onSizeChanged
@@ -182,6 +183,9 @@ internal fun PlayerControlsShell(
     onScrubFinished: (Long) -> Unit,
     horizontalSafePadding: androidx.compose.ui.unit.Dp,
     modifier: Modifier = Modifier,
+    // Samin: temp-cache saved spans, drawn as subtle gray on the timeline.
+    cachedRanges: List<TempCacheRange> = emptyList(),
+    cacheStatus: TempCacheStatus? = null,
     seekPreview: SeekPreviewController? = null,
     onTimelineTouchChange: (Boolean) -> Unit = {},
     foldLayout: Boolean = false,
@@ -414,6 +418,7 @@ internal fun PlayerControlsShell(
                     onQualityClick = onQualityClick,
                     seekPreview = seekPreview,
                     onTimelineTouchChange = onTimelineTouchChange,
+                    cachedRanges = cachedRanges,
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .fillMaxWidth()
@@ -476,6 +481,7 @@ internal fun PlayerControlsShell(
                     PlayerTimeline(
                         snapshot = playbackSnapshot,
                         displayedPositionMs = displayedPositionMs,
+                        cachedRanges = cachedRanges,
                         onScrubChange = onScrubChange,
                         onScrubFinished = {
                             onInteraction()
@@ -488,6 +494,7 @@ internal fun PlayerControlsShell(
                     PlayerControlActions(
                         playbackSnapshot = playbackSnapshot,
                         displayedPositionMs = displayedPositionMs,
+                        cacheStatus = cacheStatus,
                         showRemainingTime = showRemainingTime,
                         onRuntimeClick = onRuntimeClick,
                         metrics = metrics,
@@ -1000,6 +1007,7 @@ private fun ProgressControls(
     onQualityClick: (() -> Unit)? = null,
     seekPreview: SeekPreviewController? = null,
     onTimelineTouchChange: (Boolean) -> Unit = {},
+    cachedRanges: List<TempCacheRange> = emptyList(),
     modifier: Modifier = Modifier,
 ) {
     val aspectRatioPainter = appIconPainter(AppIconResource.PlayerAspectRatio)
@@ -1038,6 +1046,7 @@ private fun ProgressControls(
             onScrubFinished = onScrubFinished,
             seekPreview = seekPreview,
             onTouchChange = onTimelineTouchChange,
+            cachedRanges = cachedRanges,
             showTimeRow = false,
             modifier = Modifier.offset(y = (-13).dp).padding(bottom = 8.dp),
         )
@@ -1253,6 +1262,7 @@ internal fun PlayerSeekBar(
     seekPreview: SeekPreviewController? = null,
     chapters: List<PlayerChapter> = emptyList(),
     onTouchChange: (Boolean) -> Unit = {},
+    cachedRanges: List<TempCacheRange> = emptyList(),
     /** The legacy layout draws the time pills beside its action pill instead. */
     showTimeRow: Boolean = true,
 ) {
@@ -1292,7 +1302,7 @@ internal fun PlayerSeekBar(
                     onValueChangeFinished = { onScrubFinished(displayedPositionMs.coerceIn(0L, seekDurationMs)) },
                     enabled = durationMs > 0L,
                     interactionSource = interactionSource,
-                    track = { sliderState -> PlayerProgressTrack(sliderState, bufferedFraction, chapterMarks) },
+                    track = { sliderState -> PlayerProgressTrack(sliderState, bufferedFraction, chapterMarks, cachedRanges) },
                 )
             }
             SeekPreviewOverlay(
@@ -1354,8 +1364,16 @@ private fun PlayerProgressTrack(
     sliderState: SliderState,
     bufferedFraction: Float,
     chapterMarks: List<Float> = emptyList(),
+    cachedRanges: List<TempCacheRange> = emptyList(),
 ) {
     val palette = MaterialTheme.themePalette
+    val savedSpans = remember(cachedRanges) {
+        cachedRanges.mapNotNull { span ->
+            val start = span.start.coerceIn(0f, 1f)
+            val end = span.end.coerceIn(0f, 1f)
+            if (end > start) start to end else null
+        }.take(32)
+    }
     val inactiveTrackColors = SliderDefaults.colors(
         activeTrackColor = Color.Transparent,
         inactiveTrackColor = PlayerBaseTrackColor,
@@ -1375,6 +1393,29 @@ private fun PlayerProgressTrack(
             colors = inactiveTrackColors,
         )
         PlayerBufferedTrack(bufferedFraction = bufferedFraction)
+        if (savedSpans.isNotEmpty()) {
+            Box(
+                Modifier
+                    .matchParentSize()
+                    .drawBehind {
+                        val trackHeight = 4.dp.toPx()
+                        val trackOrigin = Offset(0f, (size.height - trackHeight) / 2)
+                        val radius = CornerRadius(trackHeight / 2)
+                        savedSpans.forEach { (start, end) ->
+                            val startX = size.width * start
+                            val endX = size.width * end
+                            if (endX > startX) {
+                                drawRoundRect(
+                                    color = SavedTrackGray,
+                                    topLeft = trackOrigin.copy(x = trackOrigin.x + startX),
+                                    size = Size(endX - startX, trackHeight),
+                                    cornerRadius = radius,
+                                )
+                            }
+                        }
+                    },
+            )
+        }
         SliderDefaults.Track(
             sliderState = sliderState,
             modifier = Modifier.gradientMask(palette.accentBrush()),
@@ -1408,6 +1449,7 @@ internal fun LockedPlayerOverlay(
     onUnlock: () -> Unit,
     useLegacyLayout: Boolean = false,
     showRemainingTime: Boolean = false,
+    cachedRanges: List<TempCacheRange> = emptyList(),
     modifier: Modifier = Modifier,
 ) {
     val durationMs = playbackSnapshot.durationMs.coerceAtLeast(1L)
@@ -1534,6 +1576,7 @@ internal fun LockedPlayerOverlay(
                 PlayerTimeline(
                     snapshot = playbackSnapshot,
                     displayedPositionMs = displayedPositionMs,
+                    cachedRanges = cachedRanges,
                     onScrubChange = {},
                     onScrubFinished = {},
                     enabled = false,

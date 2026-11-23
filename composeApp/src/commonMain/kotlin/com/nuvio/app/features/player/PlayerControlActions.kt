@@ -1,6 +1,11 @@
 package com.nuvio.app.features.player
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.font.FontWeight
+import com.nuvio.app.features.p2p.formatP2pSpeed
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -192,6 +197,7 @@ internal fun PlayerControlActions(
     onInfoClick: (() -> Unit)? = null,
     onRateClick: (() -> Unit)? = null,
     userRating: Int? = null,
+    cacheStatus: TempCacheStatus? = null,
     onInteraction: () -> Unit,
 ) {
     val availableActions = buildMap<PlayerToolbarButton, PlayerControlAction> {
@@ -310,6 +316,13 @@ internal fun PlayerControlActions(
     LaunchedEffect(expanded, scrollState.maxValue) {
         if (expanded) scrollState.animateScrollTo(scrollState.maxValue) else scrollState.scrollTo(0)
     }
+    var showDiagnosticsDialog by remember { mutableStateOf(false) }
+    if (showDiagnosticsDialog) {
+        PlayerDiagnosticsDialog(
+            launchId = cacheStatus?.launchId,
+            onDismiss = { showDiagnosticsDialog = false },
+        )
+    }
     CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = PlayerTimelineContentInset),
@@ -356,6 +369,16 @@ internal fun PlayerControlActions(
                         )
                     }
                 }
+            }
+            if (cacheStatus != null) {
+                CacheStatsBadge(
+                    cacheStatus = cacheStatus,
+                    metrics = metrics,
+                    onClick = {
+                        onInteraction()
+                        showDiagnosticsDialog = true
+                    },
+                )
             }
             Box(
                 modifier = Modifier
@@ -503,3 +526,94 @@ internal data class PlayerControlAction(
     val popup: (@Composable () -> Unit)? = null,
     val tint: Color = Color.White,
 )
+
+@Composable
+internal fun CacheStatsBadge(
+    cacheStatus: TempCacheStatus,
+    metrics: PlayerLayoutMetrics,
+    onClick: (() -> Unit)? = null,
+) {
+    val speedBps = cacheStatus.downloadSpeedBps
+    val cached = cacheStatus.totalCachedBytes
+    val total = cacheStatus.totalBytes
+    val isComplete = (cacheStatus.isComplete || (total != null && total > 0L && cached >= total)) && cached > 0L
+
+    val text = when {
+        speedBps > 0L -> {
+            val speedStr = formatP2pSpeed(speedBps)
+            val cachedStr = if (total != null && total > 0L) {
+                "${formatByteSize(cached)} / ${formatByteSize(total)}"
+            } else {
+                formatByteSize(cached)
+            }
+            "↓ $speedStr · $cachedStr"
+        }
+        isComplete -> {
+            "✓ ${formatByteSize(cached)} cached"
+        }
+        cached > 0L -> {
+            val cachedStr = if (total != null && total > 0L) {
+                "${formatByteSize(cached)} / ${formatByteSize(total)}"
+            } else {
+                formatByteSize(cached)
+            }
+            "$cachedStr cached"
+        }
+        else -> "⚡ Cache Active"
+    }
+
+    val badgeShape = RoundedCornerShape(12.dp)
+    Box(
+        modifier = Modifier
+            .padding(horizontal = 4.dp)
+            .background(
+                color = Color.Black.copy(alpha = 0.45f),
+                shape = badgeShape,
+            )
+            .border(
+                width = 0.5.dp,
+                color = Color.White.copy(alpha = 0.2f),
+                shape = badgeShape,
+            )
+            .clip(badgeShape)
+            .then(
+                if (onClick != null) {
+                    Modifier.clickable(role = Role.Button, onClick = onClick)
+                } else Modifier
+            )
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = text,
+            style = MaterialTheme.nuvioTypeScale.labelSm.copy(
+                fontSize = (metrics.timeSize.value).sp,
+                fontWeight = FontWeight.Medium,
+            ),
+            color = when {
+                isComplete && speedBps <= 0L -> Color(0xFF81C784)
+                speedBps > 0L -> Color(0xFF81D4FA)
+                else -> Color.White.copy(alpha = 0.85f)
+            },
+            maxLines = 1,
+        )
+    }
+}
+
+internal fun formatByteSize(bytes: Long): String {
+    if (bytes <= 0L) return "0 MB"
+    val mb = 1024.0 * 1024.0
+    val gb = mb * 1024.0
+    val d = bytes.toDouble()
+    return if (d >= gb) {
+        val rounded = kotlin.math.round(d / gb * 10.0) / 10.0
+        val whole = rounded.toLong()
+        val frac = ((rounded - whole) * 10.0).toInt()
+        "$whole.$frac GB"
+    } else {
+        val rounded = kotlin.math.round(d / mb * 10.0) / 10.0
+        val whole = rounded.toLong()
+        val frac = ((rounded - whole) * 10.0).toInt()
+        "$whole.$frac MB"
+    }
+}

@@ -1,0 +1,390 @@
+﻿name: Nuvio Samin sync and build
+
+# Private "Nuvio Samin" SideStore source: pulls Nuvio Enhanced updates,
+# keeps the Samin temp-playback-cache patch, rebuilds the IPA and
+# prepends it to store-samin.json.
+#
+# SideStore source URL (add in SideStore -> Settings -> Sources):
+#   https://raw.githubusercontent.com/Saminahmed7/NuvioMobile/samin-temp-cache/store-samin.json
+#
+# Build policy:
+#   push             -> always build (you or a merged upstream commit landed)
+#   workflow_dispatch -> respects the skip_build input as before
+#   schedule (cron)  -> build ONLY when something actually changed since the
+#                       last published Samin release:
+#                         • upstream/enhanced has new commits, OR
+#                         • you pushed new commits to samin-temp-cache
+#                       This stops the 8 identical builds per day that
+#                       appeared when nothing changed, while guaranteeing
+#                       upstream changes still ship within 3 hours.
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip_build:
+        description: Sync upstream only, skip IPA build
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: '17 */3 * * *'
+  push:
+    branches:
+      - samin-temp-cache
+    paths-ignore:
+      - 'store-samin.json'
+      - 'Docs/**'
+      - 'README.md'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: samin-sync-and-build
+  # A newer trigger supersedes a stale in-flight build instead of queueing
+  # behind it (a queued run used to wait 30+ min for the old one to finish).
+  cancel-in-progress: true
+
+jobs:
+  sync-build-publish:
+    name: Sync upstream, build Samin IPA, update source
+    runs-on: xcode-27
+    timeout-minutes: 120
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
+      GRADLE_OPTS: -Dfile.encoding=UTF-8
+      IOS_CONFIGURATION: Release
+      KOTLIN_DAEMON_JVMARGS: -Xmx2048M
+      NUVIO_GRADLE_JVMARGS: -Xmx4608M -Dfile.encoding=UTF-8 -XX:MaxMetaspaceSize=768M
+      NUVIO_KOTLIN_NATIVE_JVMARGS: -Xmx8192M
+      RELEASE_PROPERTIES_BASE64: ${{ secrets.NUVIO_LOCAL_PROPERTIES_BASE64 }}
+      BRANCH: samin-temp-cache
+
+    steps:
+      - name: Check out Samin branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Fetch upstream and sync Enhanced releases to store-samin.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/luqmanfadlli/NuvioMobile-Enhanced.git 2>/dev/null || git remote set-url upstream https://github.com/luqmanfadlli/NuvioMobile-Enhanced.git
+          git fetch upstream enhanced
+          python3 scripts/sync-store-samin.py
+          if ! git diff --quiet store-samin.json; then
+            git add store-samin.json
+            git commit -m "chore(store): sync enhanced releases into store-samin.json [skip ci]"
+            git push origin "HEAD:${BRANCH}"
+          fi
+
+      - name: Merge upstream enhanced
+        run: |
+          UPSTREAM_SHA="$(git rev-parse upstream/enhanced)"
+          echo "UPSTREAM_SHA=${UPSTREAM_SHA}" >> "${GITHUB_ENV}"
+          if git merge-base --is-ancestor "${UPSTREAM_SHA}" HEAD; then
+            echo "Already up to date with upstream ${UPSTREAM_SHA}."
+          else
+            git merge --no-edit upstream/enhanced || {
+              echo "::error::Upstream merge has conflicts. Resolve them locally on branch ${BRANCH}."
+              exit 1
+            }
+            git push origin "HEAD:${BRANCH}"
+          fi
+
+      - name: Check whether a build is actually needed
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # ------------------------------------------------------------------
+          # push: the branch just changed (user commit or upstream merge that
+          #       the Merge step above pushed) — always build immediately.
+          # workflow_dispatch: manual run — delegate to skip_build input.
+          # schedule (cron): compare current state against the last release.
+          # ------------------------------------------------------------------
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "Push trigger — build needed."
+            echo "needed=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "Manual dispatch — build needed (skip_build handled by later step conditions)."
+            echo "needed=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # ---- Scheduled cron only from here --------------------------------
+
+          # 1. Upstream SHA recorded in the last Samin release notes.
+          #    Release body contains the line:
+          #      "Enhanced upstream: luqmanfadlli/NuvioMobile-Enhanced@<40-char sha>"
+          LAST_RELEASE_BODY="$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/releases" \
+            --jq '[.[] | select(.tag_name | startswith("samin-v"))] | first | .body // ""' \
+            2>/dev/null || true)"
+          LAST_UPSTREAM_SHA="$(echo "${LAST_RELEASE_BODY}" \
+            | grep -oE '(luqmanfadlli/NuvioMobile-Enhanced|NuvioMedia/NuvioMobile)@[a-f0-9]{40}' \
+            | head -1 | cut -d'@' -f2 || true)"
+
+          # 2. Current upstream HEAD (already fetched by the Merge step).
+          CURRENT_UPSTREAM_SHA="${UPSTREAM_SHA}"
+
+          # 3. Last Samin release tag — baseline for user-commit detection.
+          LAST_TAG="$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/releases" \
+            --jq '[.[] | select(.tag_name | startswith("samin-v"))] | first | .tag_name // ""' \
+            2>/dev/null || true)"
+
+          # 4. New user (non-bot) commits on samin-temp-cache since last release.
+          #    Both bot commit types carry "[skip ci]" in their message:
+          #      chore(store): sync official releases ... [skip ci]
+          #      chore(samin): publish ... [skip ci]
+          #    Real user commits never contain [skip ci], so filtering on that
+          #    string cleanly separates bot noise from genuine changes without
+          #    relying on committer email matching.
+          if [[ -n "${LAST_TAG}" ]]; then
+            USER_COMMITS="$(git log "${LAST_TAG}..HEAD" --oneline \
+              | grep -v '\[skip ci\]' \
+              | wc -l | tr -d ' ')"
+          else
+            # No previous Samin release — this is the very first build ever.
+            USER_COMMITS=1
+          fi
+
+          echo "Last upstream SHA in release : ${LAST_UPSTREAM_SHA:-<none>}"
+          echo "Current upstream SHA         : ${CURRENT_UPSTREAM_SHA}"
+          echo "Last Samin release tag       : ${LAST_TAG:-<none>}"
+          echo "New non-bot commits          : ${USER_COMMITS}"
+
+          if [[ "${CURRENT_UPSTREAM_SHA}" != "${LAST_UPSTREAM_SHA}" ]]; then
+            echo "Upstream changed — build needed."
+            echo "needed=true"  >> "${GITHUB_OUTPUT}"
+          elif [[ "${USER_COMMITS}" -gt 0 ]]; then
+            echo "New commits on Samin branch — build needed."
+            echo "needed=true"  >> "${GITHUB_OUTPUT}"
+          else
+            echo "Nothing changed since last release — skipping build."
+            echo "needed=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Set up Java
+        if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Cache Kotlin Native
+        if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
+        uses: actions/cache@v5
+        with:
+          path: ~/.konan
+          key: konan-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('gradle/libs.versions.toml') }}
+          restore-keys: |
+            konan-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Restore Xcode DerivedData & SwiftPM
+        if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
+        id: xcode-derived
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            build/ios-derived-full-release
+            ~/Library/Caches/org.swift.swiftpm
+          key: xcode-derived-${{ runner.os }}-${{ hashFiles('iosApp/**', 'MPVKit/**') }}
+          restore-keys: |
+            xcode-derived-${{ runner.os }}-
+
+      # The Release Kotlin/Native link is ~50 min of every build. Its inputs are
+      # only Kotlin sources + Gradle config, so cache the Gradle project outputs
+      # and task history keyed on exactly those. A Swift-only change restores an
+      # exact match, Gradle marks the link UP-TO-DATE, and it is skipped.
+      - name: Restore Kotlin build outputs
+        if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
+        id: kotlin-outputs
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            composeApp/build
+            .gradle
+          key: kotlin-outputs-${{ runner.os }}-${{ hashFiles('composeApp/src/**', 'composeApp/*.gradle.kts', '*.gradle.kts', 'gradle/libs.versions.toml', 'gradle.properties', 'gradle/wrapper/gradle-wrapper.properties', 'iosApp/Configuration/Version.xcconfig') }}
+          restore-keys: |
+            kotlin-outputs-${{ runner.os }}-
+
+      - name: Verify Apple toolchain
+        if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Configure runtime properties
+        # generateRuntimeConfigs declares local.properties as an input file,
+        # so it must exist even when the secrets are unavailable (fork builds).
+        run: |
+          if [[ -n "${RELEASE_PROPERTIES_BASE64}" ]]; then
+            printf '%s' "${RELEASE_PROPERTIES_BASE64}" | base64 --decode > local.properties
+            sed -i '' -E '/^[[:space:]]*(sdk\.dir|NUVIO_RELEASE_STORE_FILE)[[:space:]]*=/d' local.properties
+          else
+            touch local.properties
+          fi
+
+      - name: Bump custom build number (ephemeral, not committed)
+        if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION_FILE="iosApp/Configuration/Version.xcconfig"
+          BASE_VERSION="$(sed -nE 's/^[[:space:]]*MARKETING_VERSION[[:space:]]*=[[:space:]]*([^[:space:]#]+).*$/\1/p' "${VERSION_FILE}" | head -n 1)"
+          BASE_BUILD="$(sed -nE 's/^[[:space:]]*CURRENT_PROJECT_VERSION[[:space:]]*=[[:space:]]*([^[:space:]#]+).*$/\1/p' "${VERSION_FILE}" | head -n 1)"
+          if [[ -z "${BASE_VERSION}" || -z "${BASE_BUILD}" ]]; then
+            echo "Could not read version info." >&2
+            exit 1
+          fi
+          # SideStore decides updates by numeric major.minor.patch core only:
+          # "-samin" suffixes parse as pre-releases and rank BELOW the same
+          # stable, and build numbers alone are ignored. So each Samin rebuild
+          # bumps the patch core: upstream 0.5.3 -> 0.5.3001, 0.5.3002, ...;
+          # upstream 0.5.4 -> 0.5.4001, ... Newer upstream always sorts above.
+          # The build number mirrors the patch core: fully deterministic, so
+          # concurrent runs compute the same numbers and collapse idempotently
+          # instead of publishing duplicate builds.
+          SAMIN_REV="$(( $(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" --jq '[.[] | select(.tag_name | startswith("samin-v"))] | length') + 1 ))"
+          PATCH_NUM="$(echo "${BASE_VERSION}" | awk -F. '{print $3 + 0}')"
+          MAJOR_MINOR="$(echo "${BASE_VERSION}" | awk -F. '{print $1 "." $2}')"
+          SAMIN_PATCH="$((PATCH_NUM * 1000 + SAMIN_REV))"
+          SAMIN_VERSION="${MAJOR_MINOR}.${SAMIN_PATCH}"
+          SAMIN_BUILD="${SAMIN_PATCH}"
+          # Do NOT rewrite Version.xcconfig: Gradle bakes it into
+          # AppVersionConfig.kt, so changing it every run forced a full
+          # Kotlin/Native relink (~50 min). XCODE_XCCONFIG_FILE overrides the
+          # bundle version for Xcode only; Kotlin keeps the upstream version.
+          OVERRIDE_XCCONFIG="${RUNNER_TEMP}/samin-version.xcconfig"
+          printf 'MARKETING_VERSION=%s\nCURRENT_PROJECT_VERSION=%s\n' "${SAMIN_VERSION}" "${SAMIN_BUILD}" > "${OVERRIDE_XCCONFIG}"
+          echo "XCODE_XCCONFIG_FILE=${OVERRIDE_XCCONFIG}" >> "${GITHUB_ENV}"
+          echo "MARKETING_VERSION=${SAMIN_VERSION}" >> "${GITHUB_ENV}"
+          echo "SAMIN_BUILD=${SAMIN_BUILD}" >> "${GITHUB_ENV}"
+          echo "Building Nuvio Samin ${SAMIN_VERSION} (${SAMIN_BUILD}) from upstream ${UPSTREAM_SHA}."
+
+      - name: Prepare iOS dependencies
+        if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
+        run: ./scripts/prepare-ios-dependencies.sh
+
+      - name: Fast pre-flight verification
+        if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
+        run: |
+          echo "--> Validating Swift syntax..."
+          xcrun --sdk iphoneos swiftc -parse iosApp/iosApp/Player/LocalCacheProxy.swift
+          xcrun --sdk iphoneos swiftc -parse iosApp/iosApp/Player/MediaIndex.swift
+          xcrun --sdk iphoneos swiftc -parse iosApp/iosApp/Player/MPVPlayerBridge.swift
+          echo "--> Validating Kotlin compilation..."
+          ./gradlew :composeApp:compileKotlinIosArm64 --parallel
+
+      - name: Build unsigned Samin IPA
+        if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
+        run: ./scripts/build-ios-ipa.sh "${MARKETING_VERSION}"
+
+      # Saved even when the Xcode step fails (e.g. a Swift error), so the next
+      # run doesn't redo the finished Kotlin link. Skipped on cancellation.
+      - name: Save Kotlin build outputs
+        if: ${{ !cancelled() && !inputs.skip_build && steps.check.outputs.needed == 'true' && steps.kotlin-outputs.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            composeApp/build
+            .gradle
+          key: ${{ steps.kotlin-outputs.outputs.cache-primary-key }}
+
+      - name: Save Xcode DerivedData & SwiftPM
+        if: ${{ !cancelled() && !inputs.skip_build && steps.check.outputs.needed == 'true' && steps.xcode-derived.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            build/ios-derived-full-release
+            ~/Library/Caches/org.swift.swiftpm
+          key: ${{ steps.xcode-derived.outputs.cache-primary-key }}
+
+      - name: Publish release and update store-samin.json
+        if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          IPA_PATH="$(find build/ios-ipa -maxdepth 1 -type f -name "*-full-release.ipa" -print -quit)"
+          if [[ -z "${IPA_PATH}" ]]; then
+            echo "No IPA was produced." >&2
+            exit 1
+          fi
+          IPA_NAME="nuvio-samin-${MARKETING_VERSION}-full-release.ipa"
+          cp "${IPA_PATH}" "${IPA_NAME}"
+          TAG="samin-v${MARKETING_VERSION}-${SAMIN_BUILD}"
+          RELEASE_EXISTS="false"
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+            echo "Release ${TAG} already exists; reusing its IPA for the source update."
+            RELEASE_EXISTS="true"
+            mkdir -p samin-ipa
+            gh release download "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --pattern "${IPA_NAME}" \
+              --dir samin-ipa \
+              --clobber
+            IPA_PATH="samin-ipa/${IPA_NAME}"
+          else
+            DATE_NOW="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            NOTES_FILE="${RUNNER_TEMP}/samin-notes.md"
+            {
+              echo "Nuvio Samin ${MARKETING_VERSION} (${SAMIN_BUILD})"
+              echo
+              echo "Enhanced upstream: luqmanfadlli/NuvioMobile-Enhanced@${UPSTREAM_SHA}"
+              echo
+              echo "Samin changes on top of Enhanced:"
+              echo "- Temp playback cache: progressive HTTP streams are mirrored to"
+              echo "  app Caches while playing (instant start on slow connections)"
+              echo "  and deleted when the player closes."
+              echo "- Loopback caching proxy with timeline caching indicator."
+              echo "- MPV disk-backed readahead cache for slow connections."
+            } > "${NOTES_FILE}"
+            gh release create "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "Nuvio Samin ${MARKETING_VERSION} (${SAMIN_BUILD})" \
+              --notes-file "${NOTES_FILE}" \
+              "${IPA_NAME}"
+          fi
+          if [[ "${RELEASE_EXISTS}" == "true" ]]; then
+            DATE_NOW="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq '.published_at')"
+            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq '.body // ""' > "${RUNNER_TEMP}/samin-notes.md"
+            NOTES_FILE="${RUNNER_TEMP}/samin-notes.md"
+            IPA_PATH="samin-ipa/${IPA_NAME}"
+          fi
+          DOWNLOAD_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${IPA_NAME}"
+          # store-samin.json forbids two entries with the same version:
+          # drop the official entry this custom build replaces (official
+          # store.json is untouched; older versions stay as fallback).
+          jq --arg v "${MARKETING_VERSION}" '( .apps[] | select(.bundleIdentifier == "com.nuvio.media") | .versions ) |= map(select(.version != $v))' store-samin.json > store-samin.json.tmp && mv store-samin.json.tmp store-samin.json
+          python3 scripts/update-store-source.py \
+            --source store-samin.json \
+            --ipa "${IPA_PATH}" \
+            --release-notes "${NOTES_FILE}" \
+            --release-version "${MARKETING_VERSION}" \
+            --release-date "${DATE_NOW}" \
+            --download-url "${DOWNLOAD_URL}"
+          git checkout -- iosApp/Configuration/Version.xcconfig
+          git add store-samin.json
+          git commit -m "chore(samin): publish ${MARKETING_VERSION} (${SAMIN_BUILD}) [skip ci]" || exit 0
+          git push origin "HEAD:${BRANCH}"
+
+      - name: Summarize
+        if: ${{ !inputs.skip_build && steps.check.outputs.needed == 'true' }}
+        run: |
+          echo "## Nuvio Samin" >> "${GITHUB_STEP_SUMMARY}"
+          echo >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Upstream: ${UPSTREAM_SHA}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Version: ${MARKETING_VERSION} (${SAMIN_BUILD})" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Source URL: https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/samin-temp-cache/store-samin.json" >> "${GITHUB_STEP_SUMMARY}"

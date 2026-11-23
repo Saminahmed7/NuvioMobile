@@ -8,14 +8,20 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.rounded.NewReleases
 import androidx.compose.material.icons.rounded.Policy
+import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.nuvio.app.core.build.AppVersionConfig
+import com.nuvio.app.features.player.PlayerDiagnosticsDialog
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.compose_settings_page_whats_new
 import nuvio.composeapp.generated.resources.whats_new_root_description
@@ -47,6 +53,13 @@ internal fun LazyListScope.aboutSettingsContent(
 ) {
     item {
         val uriHandler = LocalUriHandler.current
+        var showDiagnosticsDialog by remember { mutableStateOf(false) }
+        if (showDiagnosticsDialog) {
+            PlayerDiagnosticsDialog(
+                launchId = null,
+                onDismiss = { showDiagnosticsDialog = false },
+            )
+        }
         SettingsSection(
             title = stringResource(Res.string.compose_settings_root_about_section),
             isTablet = isTablet,
@@ -86,6 +99,14 @@ internal fun LazyListScope.aboutSettingsContent(
                     icon = SettingsPage.LicensesAttributions.icon,
                     isTablet = isTablet,
                     onClick = onLicensesAttributionsClick,
+                )
+                SettingsGroupDivider(isTablet = isTablet)
+                SettingsNavigationRow(
+                    title = "Playback & Cache Diagnostics",
+                    description = "View loopback cache proxy and temporary storage status",
+                    icon = Icons.Rounded.Speed,
+                    isTablet = isTablet,
+                    onClick = { showDiagnosticsDialog = true },
                 )
                 if (onCheckForUpdatesClick != null) {
                     SettingsGroupDivider(isTablet = isTablet)
@@ -128,6 +149,16 @@ internal fun LazyListScope.settingsFooterContent(isTablet: Boolean) {
             )
             androidx.compose.foundation.layout.Spacer(
                 modifier = Modifier.height(if (isTablet) 10.dp else 8.dp),
+            )
+            Text(
+                text = "Nuvio Samin • Temp Playback Cache Engine",
+                modifier = Modifier.fillMaxWidth(),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.primary,
+                textAlign = TextAlign.Center,
+            )
+            androidx.compose.foundation.layout.Spacer(
+                modifier = Modifier.height(4.dp),
             )
             Text(
                 text = stringResource(Res.string.compose_about_made_with),

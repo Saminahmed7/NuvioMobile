@@ -222,6 +222,7 @@ internal fun PlayerScreenRuntime.seekBy(offsetMs: Long) {
         .let { if (playbackSnapshot.durationMs > 0L) it.coerceAtMost(playbackSnapshot.durationMs) else it }
     val targetMs = if (isPartyControlLocked) ownSeekTarget(requestedMs) ?: return else requestedMs
     lastManualSkipSeekPositions = fromMs to targetMs
+    pendingSeekPositionMs = targetMs
     pendingSeekTarget = targetMs to TimeSource.Monotonic.markNow()
     if (isPartySynced) playerController?.seekTo(targetMs) else playerController?.seekBy(offsetMs)
     scheduleProgressSyncAfterSeek()
@@ -264,7 +265,7 @@ internal fun PlayerScreenRuntime.skipStepMs(direction: PlayerSeekDirection): Lon
 
 internal fun PlayerScreenRuntime.handleDoubleTapSeek(direction: PlayerSeekDirection) {
     val stepMs = skipStepMs(direction)
-    val currentPositionMs = playbackSnapshot.positionMs.coerceAtLeast(0L)
+    val currentPositionMs = effectivePlaybackPositionMs.coerceAtLeast(0L)
     val currentSeekState = accumulatedSeekState
     val nextState = if (currentSeekState?.direction == direction) {
         currentSeekState.copy(amountMs = currentSeekState.amountMs + stepMs)
@@ -288,6 +289,7 @@ internal fun PlayerScreenRuntime.handleDoubleTapSeek(direction: PlayerSeekDirect
     val targetPositionMs = if (isPartyControlLocked) ownSeekTarget(requestedPositionMs) ?: return else requestedPositionMs
     accumulatedSeekState = nextState
     lastManualSkipSeekPositions = currentPositionMs to targetPositionMs
+    pendingSeekPositionMs = targetPositionMs
     playerController?.seekTo(targetPositionMs)
     scheduleProgressSyncAfterSeek()
     publishPartyPlayback(positionMs = targetPositionMs)
@@ -448,6 +450,7 @@ internal fun PlayerScreenRuntime.rememberSurfaceGestureCallbacks(): PlayerSurfac
             }
             val fromPositionMs = playbackSnapshot.positionMs.coerceAtLeast(0L)
             lastManualSkipSeekPositions = playbackSnapshot.positionMs to targetPositionMs
+            pendingSeekPositionMs = targetPositionMs
             playerController?.seekTo(targetPositionMs)
             scheduleProgressSyncAfterSeek()
             publishPartyPlayback(positionMs = targetPositionMs)

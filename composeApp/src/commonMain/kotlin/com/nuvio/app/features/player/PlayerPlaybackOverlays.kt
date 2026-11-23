@@ -32,6 +32,7 @@ internal fun BoxScope.PlayerPlaybackOverlays(
     useLegacyLayout: Boolean,
     lockedOverlayVisible: Boolean,
     showRemainingTime: Boolean = false,
+    cachedRanges: List<TempCacheRange> = emptyList(),
     playbackSnapshot: PlayerPlaybackSnapshot,
     displayedPositionMs: Long,
     metrics: PlayerLayoutMetrics,
@@ -101,6 +102,7 @@ internal fun BoxScope.PlayerPlaybackOverlays(
             onUnlock = onUnlock,
             useLegacyLayout = useLegacyLayout,
             showRemainingTime = showRemainingTime,
+            cachedRanges = cachedRanges,
             modifier = Modifier.fillMaxSize(),
         )
     }

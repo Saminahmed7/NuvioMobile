@@ -358,7 +358,9 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
                         if (!active.value || !updatePlaybackSnapshot(snapshot, playbackKey)) return@PlatformPlayerSurface
                         checkAutoSubtitleRewindWatermark(snapshot.positionMs)
                         refreshAudioTracksIfChanged()
-                        if (!snapshot.isLoading) initialLoadCompleted = true
+                        if (!snapshot.isLoading || snapshot.isPlaying || snapshot.positionMs > 0L) {
+                            initialLoadCompleted = true
+                        }
                         if (snapshot.isEnded) {
                             shouldPlay = false
                             controlsVisible = !playerControlsLocked
@@ -536,7 +538,9 @@ private fun PlayerScreenRuntime.RenderPlayerControls(
         val controlsFadingOut = transition.targetState == EnterExitState.PostExit
         val shownBeforeExit = remember { booleanArrayOf(controlsVisible) }
         if (!controlsFadingOut) shownBeforeExit[0] = controlsVisible
-        val displayedPositionMs = scrubbingPositionMs ?: playbackSnapshot.positionMs
+        val displayedPositionMs = effectivePlaybackPositionMs
+        val saminCacheStatus = TempPlaybackCache.status(args.launchId)
+        val saminCachedRanges = saminCacheStatus?.cachedRanges ?: emptyList()
         val orientationToggleSupported = rememberPlayerOrientationToggleSupported()
         val portraitPlayback by PlayerOrientationPreference.portrait.collectAsStateWithLifecycle()
         val pipAvailable = isIos && playerSettingsUiState.miniPlayerEnabled &&
@@ -552,6 +556,8 @@ private fun PlayerScreenRuntime.RenderPlayerControls(
             episodeTitle = activeEpisodeTitle,
             playbackSnapshot = playbackSnapshot,
             displayedPositionMs = displayedPositionMs,
+            cachedRanges = saminCachedRanges,
+            cacheStatus = saminCacheStatus,
             metrics = metrics,
             resizeMode = resizeMode,
             isLocked = playerControlsLocked,
@@ -764,6 +770,7 @@ private fun PlayerScreenRuntime.RenderPlayerControls(
             onScrubChange = { positionMs ->
                 isScrubbingTimeline = true
                 scrubbingPositionMs = positionMs
+                pendingSeekPositionMs = positionMs
             },
             onScrubFinished = { positionMs ->
                 val targetMs = if (isPartyControlLocked) ownSeekTarget(positionMs) else positionMs
@@ -820,7 +827,9 @@ private fun BoxScope.RenderPlaybackOverlays(
         }
         val snapshotIsLoading by remember(runtime) { derivedStateOf { playbackSnapshot.isLoading } }
         val snapshotDurationMs by remember(runtime) { derivedStateOf { playbackSnapshot.durationMs } }
-        val displayedPositionMs = scrubbingPositionMs ?: overlaySnapshot.positionMs
+        val displayedPositionMs = effectivePlaybackPositionMs
+        val saminCacheStatus = TempPlaybackCache.status(args.launchId)
+        val saminCachedRanges = saminCacheStatus?.cachedRanges ?: emptyList()
         val openingOverlayVisible = playerSettingsUiState.showLoadingOverlay && !initialLoadCompleted && errorMessage == null
         val showNetworkSpeed = openingOverlayVisible &&
             playerSettingsUiState.showPlayerLoadingStatus &&
@@ -841,6 +850,7 @@ private fun BoxScope.RenderPlaybackOverlays(
             useLegacyLayout = playerSettingsUiState.useLegacyPlayerLayout,
             lockedOverlayVisible = lockedOverlayVisible && !folded,
             showRemainingTime = showRemainingTime,
+            cachedRanges = saminCachedRanges,
             playbackSnapshot = overlaySnapshot,
         displayedPositionMs = displayedPositionMs,
         metrics = metrics,
@@ -887,6 +897,7 @@ private fun BoxScope.RenderPlaybackOverlays(
                             "postCredits=${action.skipsToPostCredits} " +
                             "startSec=${interval.startTime} endSec=${interval.endTime}",
                     )
+                    pendingSeekPositionMs = seekMs
                     playerController?.seekTo(seekMs)
                     scheduleProgressSyncAfterSeek()
                     publishPartyPlayback(positionMs = seekMs)
@@ -993,9 +1004,9 @@ private fun PlayerScreenRuntime.playbackResolutionLabel(forButton: Boolean): Str
 @Composable
 private fun PlayerScreenRuntime.RenderPlayerModals() {
     val displayedPositionMs = if (showChaptersPanel || showSubmitIntroModal) {
-        scrubbingPositionMs ?: playbackSnapshot.positionMs
+        effectivePlaybackPositionMs
     } else {
-        Snapshot.withoutReadObservation { scrubbingPositionMs ?: playbackSnapshot.positionMs }
+        Snapshot.withoutReadObservation { effectivePlaybackPositionMs }
     }
     val snapshotMediaInfoJson by remember(this) { derivedStateOf { playbackSnapshot.mediaInfoJson } }
     PlayerChaptersPanel(
