@@ -345,12 +345,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          IPA_PATH="$(find build/ios-ipa -maxdepth 1 -type f -name "*-full-release.ipa" -print -quit)"
+          IPA_PATH="$(find build/ios-ipa -maxdepth 1 -type f -name "*.ipa" -print -quit)"
           if [[ -z "${IPA_PATH}" ]]; then
-            echo "No IPA was produced." >&2
+            echo "No IPA was produced in build/ios-ipa." >&2
+            ls -la build/ios-ipa 2>/dev/null || true
             exit 1
           fi
-          IPA_NAME="nuvio-samin-${MARKETING_VERSION}-full-release.ipa"
+          IPA_NAME="nuvio-samin-${MARKETING_VERSION}-enhanced-release.ipa"
           cp "${IPA_PATH}" "${IPA_NAME}"
           TAG="samin-v${MARKETING_VERSION}-${SAMIN_BUILD}"
           RELEASE_EXISTS="false"
