@@ -2804,7 +2804,7 @@ final class MPVPlayerViewController: UIViewController {
                                         LocalCacheProxyLog.shared.log("Player: loopback END_FILE recovery (reason=\(reason), error=\(errorCode)) - waiting for verified port (attempt \(self?.foregroundReloadCount ?? -1))")
                                         let ready = LocalCacheProxyServer.shared.waitUntilVerifiedReady(timeout: 2.0)
                                         LocalCacheProxyLog.shared.log("Player: loopback port verified=\(ready); reloading")
-                                        DispatchQueue.main.async {
+                                        DispatchQueue.main.async { [weak self] in
                                             guard let self, let req = self.activeLoadedRequest, self.mpv != nil else { return }
                                             if !ready {
                                                 print("[MPV] Loopback proxy still not serving after 2s; reloading anyway (attempt \(self.foregroundReloadCount))")
@@ -2965,6 +2965,13 @@ final class MPVPlayerViewController: UIViewController {
         var data = Int64()
         mpv_get_property(ctx, name, MPV_FORMAT_INT64, &data)
         return Int(data)
+    }
+
+    private func getInt64(_ name: String) -> Int64 {
+        guard let ctx = mpv else { return 0 }
+        var data = Int64()
+        let status = mpv_get_property(ctx, name, MPV_FORMAT_INT64, &data)
+        return status >= 0 ? data : 0
     }
 
     private func logCurrentAudioOutput() {
