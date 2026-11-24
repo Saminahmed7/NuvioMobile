@@ -20,6 +20,16 @@
       "category": "entertainment",
       "versions": [
         {
+          "version": "1.1.60",
+          "buildVersion": "60",
+          "date": "2026-11-24T06:31:04Z",
+          "localizedDescription": "Nuvio Samin 1.1.60 (60)\n\nEnhanced upstream: luqmanfadlli/NuvioMobile-Enhanced@7aca5a01896cfdf244f39660dd4d2c7e685b7dbb\n\nSamin changes on top of Enhanced:\n- Temp playback cache: progressive HTTP streams are mirrored to\n  app Caches while playing (instant start on slow connections)\n  and deleted when the player closes.\n- Loopback caching proxy with timeline caching indicator.\n- MPV disk-backed readahead cache for slow connections.\n",
+          "downloadURL": "https://github.com/Saminahmed7/NuvioMobile/releases/download/samin-v1.1.60-60/nuvio-samin-1.1.60-enhanced-release.ipa",
+          "size": 78221728,
+          "sha256": "62c930eb7dff7f5e4ba50ae1dc5655d2bb24ca1a62c67428adc3cdd50d54a578",
+          "minOSVersion": "16.1"
+        },
+        {
           "version": "1.1.0",
           "buildVersion": "158",
           "date": "2026-11-16T08:19:57Z",
@@ -1003,8 +1013,8 @@
       "appPermissions": {
         "entitlements": [],
         "privacy": {
-          "NSLocalNetworkUsageDescription": "Nuvio connects to media servers on your local network.",
-          "NSFaceIDUsageDescription": "Use biometric authentication to unlock your primary Nuvio profile."
+          "NSFaceIDUsageDescription": "Use biometric authentication to unlock your primary Nuvio profile.",
+          "NSLocalNetworkUsageDescription": "Nuvio connects to media servers on your local network."
         }
       }
     }
